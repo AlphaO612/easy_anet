@@ -16,7 +16,7 @@ if [ ! -f install.sh ] || [ ! -f generate-config.sh ] || [ ! -f generate-client-
     unzip i-am-so-lazy.zip
     rm i-am-so-lazy.zip
 fi
-
+chmod +x install.sh generate-config.sh generate-client-config.sh diagnose.sh test-keys-from-keys-file.sh test-client-keys.sh
 ./install.sh
 ./generate-config.sh --clients 2
 ./generate-client-config.sh --server-address $(curl -s https://icanhazip.com):8443
