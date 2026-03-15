@@ -2,15 +2,6 @@ name: "Build Components"
 
 on:
   workflow_call:
-    outputs:
-      auth-artifact:
-        value: ${{ jobs.build-auth.outputs.artifact }}
-      server-artifact:
-        value: ${{ jobs.build-server.outputs.artifact }}
-      keygen-artifact:
-        value: ${{ jobs.build-keygen.outputs.artifact }}
-      client-cli-artifact:
-        value: ${{ jobs.build-client-cli.outputs.artifact }}
 
 jobs:
   build-auth:
@@ -23,11 +14,9 @@ jobs:
         run: "sudo apt-get install -y musl-tools protobuf-compiler"
 
       - name: "Install Rust"
-        uses: "actions-rs/toolchain@v1"
+        uses: "dtolnay/rust-toolchain@stable"
         with:
-          toolchain: "stable"
-          target: "x86_64-unknown-linux-musl"
-          override: "true"
+          targets: "x86_64-unknown-linux-musl"
       
       - name: "Cache Rust dependencies"
         uses: actions/cache@v5
@@ -47,7 +36,7 @@ jobs:
       - uses: "actions/upload-artifact@v6"
         with:
           name: "anet-auth-linux"
-          path: "target/x86_64-unknown-linux-musl/release/anet-auth-linux"
+          path: "target/x86_64-unknown-linux-musl/release/anet-auth"
 
   build-server:
     name: "Build Linux Server"
@@ -59,11 +48,9 @@ jobs:
         run: "sudo apt-get install -y musl-tools protobuf-compiler"
 
       - name: "Install Rust"
-        uses: "actions-rs/toolchain@v1"
+        uses: "dtolnay/rust-toolchain@stable"
         with:
-          toolchain: "stable"
-          target: "x86_64-unknown-linux-musl" 
-          override: "true"
+          targets: "x86_64-unknown-linux-musl"
       
       - name: "Cache Rust dependencies"
         uses: actions/cache@v5
@@ -95,11 +82,9 @@ jobs:
         run: "sudo apt-get install -y musl-tools protobuf-compiler"
 
       - name: "Install Rust"
-        uses: "actions-rs/toolchain@v1"
+        uses: "dtolnay/rust-toolchain@stable"
         with:
-          toolchain: "stable"
-          target: "x86_64-unknown-linux-musl"
-          override: "true"
+          targets: "x86_64-unknown-linux-musl"
       
       - name: "Cache Rust dependencies"
         uses: actions/cache@v5
@@ -131,12 +116,10 @@ jobs:
         run: "sudo apt-get install -y musl-tools protobuf-compiler"
 
       - name: "Install Rust"
-        uses: "actions-rs/toolchain@v1"
+        uses: "dtolnay/rust-toolchain@stable"
         with:
-          toolchain: "stable"
-          target: "x86_64-unknown-linux-musl"
-          override: "true"
-
+          targets: "x86_64-unknown-linux-musl"
+      
       - name: "Cache Rust dependencies"
         uses: actions/cache@v5
         with:
@@ -155,4 +138,4 @@ jobs:
       - uses: "actions/upload-artifact@v6"
         with:
           name: "anet-client-cli-linux"
-          path: "target/x86_64-unknown-linux-musl/release/anet-client-cli"
+          path: "target/x86_64-unknown-linux-musl/release/anet-client"

@@ -23,7 +23,7 @@ jobs:
       - name: "Download all binaries and installer artifacts"
         uses: "actions/download-artifact@v7"
         with:
-          path: "artifacts/*"
+          path: "artifacts"
 
       - name: "Set version from tag"
         run: "echo \"VERSION=${GITHUB_REF#refs/tags/v}\" >> $GITHUB_ENV"
@@ -35,15 +35,13 @@ jobs:
 
       - name: "Prepare files for packaging"
         run: |
-          mkdir -p release_files/server release_files/client-linux release_files/client-windows release_files/client-macos
+          mkdir -p release_files/auth release_files/server release_files/keygen release_files/client-linux
           
           # --- LINUX SERVER & CLIENT ---
-          cp artifacts/anet-auth-linux/anet-auth-linux release_files/auth/
-          cp artifacts/anet-server-linux/anet-server-linux release_files/server/
-          cp artifacts/anet-keygen-linux/anet-keygen-linux release_files/keygen/
-          cp artifacts/anet-client-cli-linux/anet-client-cli release_files/client-linux/
-          
-          
+          cp artifacts/anet-auth-linux/anet-auth release_files/auth/
+          cp artifacts/anet-server-linux/anet-server release_files/server/
+          cp artifacts/anet-keygen-linux/anet-keygen release_files/keygen/
+          cp artifacts/anet-client-cli-linux/anet-client release_files/client-linux/
           
           # --- CONFIGS ---
           cp contrib/config/server.toml release_files/server/
@@ -57,7 +55,7 @@ jobs:
           zip -r "auth_${VERSION}.zip" auth/
           zip -r "server_${VERSION}.zip" server/
           zip -r "keygen_${VERSION}.zip" keygen/
-          zip -r "client-cli-linux_${VERSION}.zip" client-cli-linux/
+          zip -r "client-cli-linux_${VERSION}.zip" client-linux/
           
           cd ..
 
