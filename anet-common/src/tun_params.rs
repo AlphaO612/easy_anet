@@ -11,6 +11,7 @@ pub struct TunParams {
     pub mtu: u16,
 
     pub network: Option<Ipv4Addr>,
+
 }
 
 impl TunParams {

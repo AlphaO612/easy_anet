@@ -12,7 +12,7 @@ pub struct DesktopTunFactory {
 
 impl DesktopTunFactory {
     pub fn new(tun_name: String) -> Self {
-        Self { tun_name }
+        Self { tun_name}
     }
 }
 

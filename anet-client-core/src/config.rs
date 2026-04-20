@@ -8,6 +8,9 @@ pub struct MainConfig {
     pub tun_name: String,
 
     #[serde(default)]
+    pub manual_routing: bool,
+
+    #[serde(default)]
     pub route_for: Vec<String>,
 
     #[serde(default)]
@@ -25,6 +28,7 @@ impl Default for MainConfig {
             route_for: vec![],
             exclude_route_for: vec![],
             dns_server_list: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
+            manual_routing: false,
         }
     }
 }
@@ -59,6 +63,36 @@ impl Default for StatsConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportMode {
+    Quic,
+    Ssh,
+    Vnc,
+}
+
+impl Default for TransportMode {
+    fn default() -> Self {
+        TransportMode::Quic
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransportConfig {
+    #[serde(default)]
+    pub mode: TransportMode,
+    pub ssh_user: Option<String>,
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            mode: TransportMode::Quic,
+            ssh_user: Some("hanyuu".to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreConfig {
     #[serde(default)]
@@ -75,4 +109,7 @@ pub struct CoreConfig {
 
     #[serde(default)]
     pub stealth: StealthConfig,
+
+    #[serde(default)]
+    pub transport: TransportConfig,
 }

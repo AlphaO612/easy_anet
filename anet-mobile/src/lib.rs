@@ -1,10 +1,11 @@
 mod android_impl;
 
-use crate::android_impl::{AndroidCallbackTunFactory, AndroidRouteManager};
+use crate::android_impl::AndroidCallbackTunFactory;
 use android_logger::Config;
-use anet_client_core::AnetClient;
+use anet_client_core::client::AnetClient;
 use anet_client_core::config::CoreConfig;
 use anet_client_core::events::{self, AnetEvent, EventHandler, status};
+use anet_client_core::platform::NoOpRouteManager;
 use jni::objects::{GlobalRef, JClass, JString, JValue};
 use jni::{JNIEnv, JavaVM};
 use log::{LevelFilter, error, info};
@@ -132,7 +133,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
             this_ref.clone(),
             config.clone(),
         ));
-        let route_manager = Box::new(AndroidRouteManager);
+        let route_manager = Box::new(NoOpRouteManager);
 
         let client = Arc::new(AnetClient::new(config, tun_factory, route_manager));
 

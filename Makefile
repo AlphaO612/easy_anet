@@ -1,5 +1,9 @@
-.PHONY: all check test clean musl cert mob macos macos-gui macos-all macos-universal macos-app infra
+.PHONY: all check test clean musl cert mob macos macos-gui macos-all macos-universal macos-app infra win-gui
 .PHONY: docker-help docker-install docker-install-source docker-start docker-stop docker-restart docker-logs docker-diagnose docker-config docker-client docker-clean
+
+
+win-gui:
+	 cargo build --release --target x86_64-pc-windows-gnu --package anet-client-gui
 
 # Default target
 all:
@@ -19,7 +23,7 @@ clean:
 
 # Build static Linux binary (musl)
 musl:
-	RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-musl
+	RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-musl --package anet-server --package anet-client-cli
 
 # Build Android libraries (requires cargo-ndk)
 mob:

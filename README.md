@@ -2,7 +2,7 @@
 
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
 ![Language](https://img.shields.io/badge/rust-1.84%2B-orange)
-![Protocol](https://img.shields.io/badge/protocol-ASTP_v1.0-blue)
+![Protocol](https://img.shields.io/badge/protocol-ASTP_v0.5-blue)
 
 **ANet** — это инструмент для организации приватного, защищенного информационного пространства между близкими людьми. Мы строим цифровые мосты там, где обычные пути недоступны.
 
@@ -21,14 +21,17 @@
 
 Проект написан на Rust и разделен на модули:
 
-*   `anet-server` — Узел координации.
+*   `anet-auth` — Узел координации.
+*   `anet-server` — Сам сервер (может работать без `anet-auth`).
 *   `anet-client-cli` — Консольный клиент для Linux/Headless систем.
 *   `anet-client-gui` — Графический клиент (Windows/Linux) с минималистичным интерфейсом.
 *   `anet-mobile` — Библиотека и JNI-биндинги для Android.
 *   `anet-common` — Реализация протокола ASTP и криптографии.
 *   `anet-keygen` — Утилита для генерации ключей доступа.
 
-## 🚀 Быстрый старт
+Как мог накидал [Документацию](./contrib/docs/anet.ru.md)
+
+## Сборка
 
 Запуск сервера в Docker и подключение клиента за несколько шагов:
 
@@ -112,12 +115,7 @@ make musl             # Статичный бинарник
 - **macOS Client** — `client-macos_X.X.X.zip` (Universal binary)
 - **Android Client** — [anet-android.apk](https://github.com/ZeroTworu/anet/releases)
 
-Support the Chaos
+[TG Channel](https://t.me/anet_org) могу тут писать не трезвым и с ошибками
 
-Если ANet помог тебе — налей автору оригинала!
-
-На водку разрабу: [Donate](https://dalink.to/rventomarika)
-
-На булочки для Ханю: [Donate](https://dalink.to/rventomarika)
 
 На J7: [Donate](https://dalink.to/rventomarika)
