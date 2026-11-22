@@ -25,12 +25,35 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def prepare(bundle, dest, url, ref):
+def prepare_update(stage, commit, tag, source, manifest_file, launcher):
+    asset = "anet-easy-update.tar.gz"
+    update = stage.parent / "update"
+    update.mkdir()
+    archive = update / asset
+    with tarfile.open(archive, "w:gz") as files:
+        for path in (launcher, source):
+            files.add(path, arcname=path.name, recursive=False)
+    url = f"https://github.com/AlphaO612/easy_anet/releases/download/{tag}/{asset}"
+    substitutions = {"UPDATE_URL": shlex.quote(url), "UPDATE_SHA256": sha256(archive),
+                     "MANIFEST_SHA256": sha256(manifest_file), "SOURCE_SHA256": sha256(source),
+                     "INSTALLER_SHA256": sha256(launcher)}
+    template = subprocess.check_output(["git", "show", commit + ":contrib/deploy/distribution/update.sh"],
+                                       cwd=REPO, text=True)
+    script = update / "anet-easy-update.sh"
+    script.write_text(re.sub(r"@(\w+)@", lambda match: substitutions[match[1]], template))
+    script.chmod(0o755)
+    return update
+
+
+def prepare(bundle, dest, url, ref, update_tag=None):
     parsed = urlsplit(url or "")
     if url is not None and (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
             or parsed.password is not None or parsed.query or parsed.fragment
             or any(char.isspace() for char in url)):
         raise ValueError("--base-url requires a public or private HTTPS directory without credentials")
+    if update_tag is not None and (url is not None or
+            not re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9._+-]{0,127}", update_tag)):
+        raise ValueError("select --update with an explicit GitHub release tag, e.g. --tag v1.1.0")
     dest = dest.absolute()
     if dest.exists():
         raise ValueError("choose a new output directory for this release")
@@ -50,8 +73,10 @@ def prepare(bundle, dest, url, ref):
         if not set(SERVICES["anet-easy"]) <= images.keys() or not all(
                 re.fullmatch(r"sha256:[0-9a-f]{64}", image) for image in images.values()):
             raise ValueError("bundle lacks immutable image IDs for the full deployment")
-        archive = stage / "images.tar"
-        shutil.copyfile(bundle / "images.tar", archive)
+        archive = bundle / "images.tar"
+        if update_tag is None:
+            shutil.copyfile(archive, stage / "images.tar")
+            archive = stage / "images.tar"
         images_sum = sha256(archive)
         if images_sum != manifest["sha256"]:
             raise ValueError("images.tar differs from the bundle manifest")
@@ -69,7 +94,10 @@ def prepare(bundle, dest, url, ref):
         launcher = stage / ("install.sh" if url is None else "bootstrap.sh")
         launcher.write_text(rendered)
         launcher.chmod(0o755)
-        if url is None:
+        if update_tag is not None:
+            update = prepare_update(stage, commit, update_tag, source, manifest_file, launcher)
+            update.rename(dest)
+        elif url is None:
             for name in ("send-to-vps.ps1", "send-to-vps.sh", "START-HERE.md"):
                 helper = stage / name
                 with helper.open("wb") as out:
@@ -77,8 +105,12 @@ def prepare(bundle, dest, url, ref):
                                    cwd=REPO, stdout=out, check=True)
                 if name.endswith(".sh"):
                     helper.chmod(0o755)
-        stage.rename(dest)
+        if update_tag is None:
+            stage.rename(dest)
     print(f"Installer commit {commit}")
+    if update_tag is not None:
+        print(f"Attach both files in {dest} to release {update_tag}. Run its anet-easy-update.sh in the old bundle directory.")
+        return
     if url is None:
         print(f"Copy {dest} to the first VPS, then run ./install.sh in the copied directory")
         return
@@ -94,9 +126,13 @@ if __name__ == "__main__":
     delivery = parser.add_mutually_exclusive_group(required=True)
     delivery.add_argument("--base-url", help="HTTPS directory for curl installation")
     delivery.add_argument("--local", action="store_true", help="prepare a self-contained directory for SSH transfer")
+    delivery.add_argument("--update", action="store_true", help="prepare an installer-only update for an existing image bundle")
+    parser.add_argument("--tag", help="target GitHub Release tag for --update")
     parser.add_argument("--ref", default="HEAD", help="installer Git revision (default: HEAD)")
     args = parser.parse_args()
+    if args.update != (args.tag is not None):
+        parser.error("--update and --tag TAG must be used together")
     try:
-        prepare(args.bundle, args.destination, args.base_url, args.ref)
+        prepare(args.bundle, args.destination, args.base_url, args.ref, args.tag)
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as exc:
         sys.exit(str(exc))
