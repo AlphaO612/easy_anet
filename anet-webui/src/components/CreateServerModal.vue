@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
+import NodeInvitationSteps from './NodeInvitationSteps.vue'
 import { useRouter } from 'vue-router'
 import { CreateServer, IssueNodeInvitation } from '@/api/servers'
 import { advanced } from '@/composables/operatorMode'
@@ -51,10 +52,10 @@ function next(pool = false) {
           <v-text-field v-model.trim="form.address" label="Публичный IP или домен VPS" />
           <v-select v-model="role" label="Роль в новом маршруте" :items="[{ title:'Вход — принимает клиентов',value:'entry' },{ title:'Выход — выпускает трафик в интернет',value:'exit' }]" />
           <v-text-field v-model.number="form.quic_port" label="Порт ANet (UDP)" type="number" min="1" max="65535" />
+          <v-text-field v-model.trim="form.ssh_user" label="Пользователь SSH" placeholder="root" />
+          <v-text-field v-model.number="form.ssh_port" label="Порт SSH" type="number" min="1" max="65535" />
           <template v-if="advanced">
             <v-text-field v-model="form.public_key" label="Публичный ключ (узел может сообщить при регистрации)" />
-            <v-text-field v-model="form.ssh_user" label="Пользователь SSH" />
-            <v-text-field v-model.number="form.ssh_port" label="Порт SSH" type="number" />
             <v-text-field v-model.number="form.vnc_port" label="Порт VNC" type="number" />
             <v-text-field v-model="form.websocket_url" label="WebSocket URL" />
             <v-text-field v-model="form.ahttp_url" label="AHTTP URL" />
@@ -63,10 +64,7 @@ function next(pool = false) {
           </template>
         </template>
         <template v-if="invitation">
-          <p class="mb-4">Передайте одноразовое приглашение на VPS по SSH и сохраните в приватном файле с правами 0600. Для установки с параметром --join-panel укажите этот файл и идентификатор узла в настройках присоединения.</p>
-          <v-text-field readonly :model-value="invitation.node_id" label="Идентификатор узла (node_id)" />
-          <v-text-field readonly :model-value="invitation.token" type="password" label="Одноразовое приглашение" @focus="($event.target as HTMLInputElement).select()" />
-          <p>После регистрации настройте проверку связи в разделе «Серверы». Роль вступит в силу при публикации маршрута.</p>
+          <NodeInvitationSteps v-if="server" :server="server" :invitation="invitation" />
         </template>
       </v-card-text>
       <v-card-actions class="flex-wrap">

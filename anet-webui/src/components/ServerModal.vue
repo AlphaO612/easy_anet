@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import NodeInvitationSteps from './NodeInvitationSteps.vue'
 import { useAppMessage } from '@/composables/useAppMessage'
 import { GetNodeCommandStatus, IssueNodeInvitation, RotateNodeCredential, SetNodeAdmission, UpdateServer } from '@/api/servers'
 import type { Server } from '@/models/server'
@@ -326,6 +327,8 @@ const close = () => {
       <v-card-title class="text-h6 pb-4">{{ isInvitation ? 'Одноразовое приглашение' : 'Новый credential ноды' }}</v-card-title>
 
       <v-card-text>
+        <NodeInvitationSteps v-if="isInvitation && issuedCredential && server" :server="server" :invitation="issuedCredential" />
+        <template v-else>
         <v-alert type="warning" variant="tonal" class="mb-4">
           Сохраните token сейчас: повторно панель его не покажет.
         </v-alert>
@@ -341,16 +344,16 @@ const close = () => {
             class="mb-3"
         />
 
-        <p v-if="isInvitation">Передайте токен установщику узла для обмена через POST /api/v1/control/nodes/{{ issuedCredential?.node_id }}/enroll.</p>
-        <v-sheet v-else-if="issuedCredential" color="surface-variant" rounded="lg" border class="pa-4">
+        <v-sheet v-if="issuedCredential" color="surface-variant" rounded="lg" border class="pa-4">
           <pre class="credential-pre">{{ credentialConfig }}</pre>
         </v-sheet>
+        </template>
       </v-card-text>
 
       <v-card-actions class="px-6 pb-4">
         <v-spacer />
-        <v-btn variant="outlined" @click="copyCredential">Скопировать токен</v-btn>
-        <v-btn color="primary" variant="flat" @click="issuedCredential = null">Я сохранил</v-btn>
+        <v-btn v-if="!isInvitation" variant="outlined" @click="copyCredential">Скопировать токен</v-btn>
+        <v-btn color="primary" variant="flat" @click="issuedCredential = null">Готово</v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>
