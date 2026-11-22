@@ -26,6 +26,8 @@ if ! command -v dockerd-rootless-setuptool.sh >/dev/null || ! docker compose ver
     privileged install -m 0644 "$keyfile" /etc/apt/keyrings/anet-docker.asc
     printf 'deb [arch=%s signed-by=/etc/apt/keyrings/anet-docker.asc] https://download.docker.com/linux/%s %s stable\n' \
          "$(dpkg --print-architecture)" "$ID" "$VERSION_CODENAME" | privileged tee /etc/apt/sources.list.d/anet-docker.list >/dev/null
+    # The private installer umask also applies to tee. apt-cache runs as the deployment user.
+    privileged chmod 0644 /etc/apt/sources.list.d/anet-docker.list
     privileged apt-get update
     version=${DOCKER_DEB_VERSION:-$(apt-cache policy docker-ce | awk '/Candidate:/{print $2}')}
     privileged apt-get install -y "docker-ce=$version" "docker-ce-cli=$version" "docker-ce-rootless-extras=$version" docker-buildx-plugin docker-compose-plugin
