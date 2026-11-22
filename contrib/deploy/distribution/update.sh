@@ -23,7 +23,10 @@ apply_update() {
     old=$(pwd -P)
     [[ -f "$old/images.tar" && -f "$old/manifest.json" ]] ||
         fail 'Перейдите командой cd в каталог прежней поставки, где рядом лежат images.tar и manifest.json, затем повторите запуск.'
-    verify_update_file "$old/manifest.json" "$manifest_sum"
+    if [[ $(sha256sum < "$old/manifest.json" | cut -d' ' -f1) != "$manifest_sum" ]]; then
+        printf 'Образы в этом релизе обновились. Выполните на первой VPS для загрузки полной версии со своим сохранённым планом:\n  curl -fL --retry 2 %s/install-release.sh | bash\n' "${url%/*}" >&2
+        return 1
+    fi
     [[ -r "$old/images.tar" ]] || fail 'Проверьте доступ на чтение images.tar в прежнем комплекте.'
     { exec 3<>/dev/tty; } 2>/dev/null || fail 'Откройте обычный SSH-сеанс с терминалом и повторите команду.'
     umask 077

@@ -36,6 +36,12 @@ onBeforeUnmount(() => clearInterval(timer))
       </div>
     </header>
     <v-alert v-if="error" type="warning">{{ error }}</v-alert>
+    <details class="mb-4">
+      <summary>Как обновить панель</summary>
+      <p class="my-2">Откройте SSH на VPS с панелью под той же учётной записью, с которой запускали мастер. Выполните команду, выберите установку и подтвердите обновление.</p>
+      <pre class="pa-3 overflow-x-auto"><code>f=$(mktemp) &amp;&amp; curl -fL --retry 2 -o "$f" https://github.com/AlphaO612/easy_anet/releases/latest/download/panel-update.sh &amp;&amp; bash "$f"</code></pre>
+      <p class="my-2">После сообщения «Панель обновлена» обновите страницу браузера.</p>
+    </details>
     <ProbeLinks :servers="servers" @select-node="selected = $event" />
     <v-card title="Серверы" class="mt-5">
       <v-card-text>
