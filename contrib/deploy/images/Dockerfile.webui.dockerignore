@@ -9,3 +9,7 @@ anet-webui/.env*
 !contrib/deploy/images/
 !contrib/deploy/images/nginx.conf
 !contrib/deploy/images/http-health.rs
+
+!contrib/deploy/images/*.py
+!contrib/deploy/distribution/
+!contrib/deploy/distribution/join-node.sh
