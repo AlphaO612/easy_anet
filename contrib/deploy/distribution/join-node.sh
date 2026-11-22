@@ -42,6 +42,12 @@ PY
 tar -xzf "$stage/source.tar.gz" -C "$stage"
 deploy="$stage/contrib/deploy"
 echo '[2/4] Подготовка rootless Docker'
+if ! python3 -c 'import tomllib' 2>/dev/null && ! python3 -c 'import tomli' 2>/dev/null; then
+    privileged=()
+    if [[ $(id -u) != 0 ]]; then privileged=(sudo); fi
+    "${privileged[@]}" apt-get update
+    "${privileged[@]}" apt-get install -y python3-tomli
+fi
 run=()
 if [[ $(id -u) = 0 ]]; then
     sh "$deploy/scripts/rootless-docker.sh" --wizard-user

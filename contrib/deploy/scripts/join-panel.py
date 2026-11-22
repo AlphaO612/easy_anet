@@ -5,7 +5,10 @@ import os
 from pathlib import Path
 import re
 import tempfile
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Ubuntu 22.04 supplies Python 3.10 and python3-tomli.
+    import tomli as tomllib
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener
 from uuid import UUID
