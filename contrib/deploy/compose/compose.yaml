@@ -1,0 +1,54 @@
+name: anet
+x-runtime: &runtime
+  read_only: true
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  pids_limit: ${ANET_PIDS:-256}
+  restart: unless-stopped
+
+services:
+  network:
+    <<: *runtime
+    image: ${NETNS_IMAGE:?set NETNS_IMAGE}
+    command: [prepare-and-hold]
+    user: "0:0"
+    devices: [/dev/net/tun:/dev/net/tun:rw]
+    cap_add: [NET_ADMIN, SETUID, SETGID, SETPCAP]
+    healthcheck:
+      test: ["CMD","test","-e","/sys/class/net/anet-server/tun_flags"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    environment:
+      IF_NAME: anet-server
+      TUN_UID: "65532"
+      TUN_ADDRESS: ${TUN_ADDRESS:-10.77.0.2/24}
+      TUN_SUBNET: ${TUN_SUBNET:-10.77.0.0/24}
+      TUN_MTU: "1420"
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    ports: ["${VPN_BIND:-0.0.0.0}:${VPN_PORT:-4519}:4519/udp"]
+    networks: [vpn, control]
+    mem_limit: ${NETNS_MEMORY:-32m}
+    cpus: ${NETNS_CPUS:-0.25}
+  server:
+    <<: *runtime
+    image: ${SERVER_IMAGE:?set SERVER_IMAGE}
+    network_mode: service:network
+    devices: [/dev/net/tun:/dev/net/tun:rw]
+    user: "65532:65532"
+    depends_on:
+      network: {condition: service_healthy}
+    environment:
+      ANET_PRECONFIGURED_TUN: "1"
+    volumes:
+      - type: bind
+        source: ${STATE_DIR:?set STATE_DIR}/server.toml
+        target: /etc/anet/server.toml
+        read_only: true
+        bind: {create_host_path: false}
+    mem_limit: ${SERVER_MEMORY:-512m}
+    cpus: ${SERVER_CPUS:-1}
+networks:
+  vpn: {}
+  control: {internal: true}

@@ -1,0 +1,11 @@
+**
+!anet-webui/
+!anet-webui/**
+anet-webui/node_modules/
+anet-webui/dist/
+anet-webui/.env*
+!contrib/
+!contrib/deploy/
+!contrib/deploy/images/
+!contrib/deploy/images/nginx.conf
+!contrib/deploy/images/http-health.rs

@@ -26,8 +26,32 @@ impl TunParams {
         }
     }
 
-    /// Create TUN configuration for Linux
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
+    /// Create TUN configuration for Linux / Android
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn create_config(&self) -> anyhow::Result<Configuration> {
+        let mut config = Configuration::default();
+
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("ANET_PRECONFIGURED_TUN").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            config.tun_name(&self.name);
+            config.platform_config(|platform| {
+                platform.ensure_root_privileges(false);
+            });
+            return Ok(config);
+        }
+
+        config.up();
+        config.tun_name(&self.name);
+        config.address(self.address);
+        config.netmask(self.netmask);
+        config.destination(self.gateway);
+        config.mtu(self.mtu);
+
+        Ok(config)
+    }
+
+    /// Create TUN configuration for Windows (fallback if TunManager is used directly)
+    #[cfg(target_os = "windows")]
     pub fn create_config(&self) -> anyhow::Result<Configuration> {
         let mut config = Configuration::default();
 
@@ -36,7 +60,8 @@ impl TunParams {
         config.address(self.address);
         config.netmask(self.netmask);
         config.destination(self.gateway);
-        config.mtu(self.mtu);
+        // Windows dual-stack Wintun rejects MTU < 1280 via Win32 SetIpInterfaceEntry with ERROR_INVALID_PARAMETER (87)
+        config.mtu(self.mtu.max(1280));
 
         Ok(config)
     }

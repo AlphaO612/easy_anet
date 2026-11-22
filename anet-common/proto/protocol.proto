@@ -2,10 +2,19 @@ syntax = "proto3";
 
 package anet;
 
+enum BillingType {
+    BILLING_TYPE_UNKNOWN = 0;
+    BILLING_TYPE_NO_TARIFF_NO_GROUP = 1;
+    BILLING_TYPE_GROUP = 2;
+    BILLING_TYPE_INDIVIDUAL = 3;
+    BILLING_TYPE_GROUP_AND_INDIVIDUAL = 4;
+}
+
 message DHClientExchange {
     bytes public_key = 1;
     bytes client_signed_dh_key = 2;  // Подпись клиентом своего DH ключа
     bytes client_public_key = 3;     // Публичный ключ клиента для верификации
+    string resume_session_id = 4;
 }
 
 message DHServerExchange {
@@ -25,6 +34,8 @@ message EncryptedAuthResponse {
 
 message AuthRequest {
     string client_id = 1;
+    // Existing logical VPN session requested after a transport rotation.
+    string resume_session_id = 2;
 }
 
 message AuthResponse {
@@ -35,6 +46,19 @@ message AuthResponse {
     string session_id = 5;
     bytes nonce_prefix = 6;
     bytes quic_cert = 7;
+
+    BillingType billing_type = 8;
+
+    optional string group_name = 9;
+    optional int64 traffic_limit = 10;
+    optional int64 traffic_consumed = 11;
+
+    // Сессии (активные и разрешенные)
+    int32 active_sessions = 12;
+    int32 allowed_sessions = 13;
+
+    optional int32 speed_limit_kbps = 14;  // Лимит скорости в Кбит/с
+    optional string expires_at = 15;       // Дата окончания доступа (YYYY-MM-DD HH:MM)
 }
 
 message Message {
@@ -45,6 +69,31 @@ message Message {
         EncryptedAuthResponse encrypted_auth_response = 4;
         AuthRequest auth_request = 5;
         AuthResponse auth_response = 6;
+        AuthDenyNotification auth_error = 7;
+        TransportProbeRequest transport_probe_request = 9;
+        TransportProbeResponse transport_probe_response = 10;
     }
-    bytes padding = 7;
+    bytes padding = 8;
+}
+
+message TransportProbeRequest {
+    uint64 timestamp_micros = 1;
+    bytes nonce = 2;
+}
+
+message TransportProbeResponse {
+    uint64 timestamp_micros = 1;
+    bytes echo_nonce = 2;
+    bool accepting_connections = 3;
+}
+
+enum DenyReason {
+    UNKNOWN = 0;
+    SESSIONS_LIMIT_REACHED = 1;
+    SUBSCRIPTION_EXPIRED = 2;
+    BANNED = 3;
+}
+
+message AuthDenyNotification {
+    string message = 1;
 }

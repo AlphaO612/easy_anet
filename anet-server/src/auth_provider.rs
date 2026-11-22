@@ -1,16 +1,29 @@
-use log::{error, info, warn};
-use reqwest::Client as HttpClient;
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 
-#[derive(Serialize)]
-struct CheckAccessRequest {
-    fingerprint: String,
-}
+use log::{error, info};
+use reqwest::Client as HttpClient;
 
-#[derive(Deserialize)]
-struct CheckAccessResponse {
-    allowed: bool,
+use anet_common::dto::{
+    BillingType, CheckAccessRequest, CheckAccessResponse,
+};
+use anet_common::http_help::BrowserProfile;
+
+#[derive(Debug, Clone)]
+pub struct AccessGrant {
+    pub static_ip: Option<String>,
+    pub user_id: Option<String>,
+    /// Ограничение скорости в kbps из `rates.speed_limit`, `None` = без
+    /// ограничения. Применяется eBPF-шейпером на TUN-интерфейсе.
+    pub speed_limit_kbps: Option<u32>,
+    pub billing_type: Option<BillingType>,
+    pub group_name: Option<String>,
+    pub traffic_limit: Option<i64>,
+    pub traffic_consumed: Option<i64>,
+
+    pub active_sessions: Option<i32>,
+    pub allowed_sessions: Option<i32>,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Clone)]
@@ -24,8 +37,14 @@ pub struct AuthProvider {
     /// Токен доступа к внешним серверам
     auth_token: String,
 
+    /// Опциональный UUID ноды (из control_plane.node_id) для мгновенной синхронизации сессий при /check_access
+    node_id: Option<String>,
+
     /// HTTP клиент для запросов
     http_client: HttpClient,
+
+    /// Единый профиль браузера для HTTP-запросов
+    profile: BrowserProfile,
 }
 
 impl AuthProvider {
@@ -34,87 +53,109 @@ impl AuthProvider {
         auth_servers: Vec<String>,
         auth_token: String,
     ) -> Self {
-        let http_client = HttpClient::builder()
+        let profile = BrowserProfile::random();
+        let http_client = profile
+            .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))
+            .expect("Failed to initialize BoringSSL TLS connector")
             .timeout(Duration::from_secs(3))
             .build()
-            .unwrap();
+            .expect("Failed to build AuthProvider HTTP client");
 
         Self {
             allowed_clients,
             auth_servers,
             auth_token,
+            node_id: None,
             http_client,
+            profile,
         }
     }
 
+    pub fn with_node_id(mut self, node_id: Option<String>) -> Self {
+        self.node_id = node_id;
+        self
+    }
+
     /// Проверяет, разрешен ли доступ клиенту с данным fingerprint
-    pub async fn is_client_allowed(&self, fingerprint: &str) -> bool {
-        // 1. Сначала проверяем локальный конфиг (самое быстрое и надежное)
+    pub async fn is_client_allowed(
+        &self,
+        fingerprint: &str,
+        node_active_sessions: Option<u32>,
+    ) -> Result<AccessGrant, String> {
+        // 1. Локальный список (VIP) — без ограничения скорости и тарифа.
         if self.allowed_clients.iter().any(|c| c == fingerprint) {
-            return true;
+            return Ok(AccessGrant {
+                static_ip: None,
+                user_id: None,
+                speed_limit_kbps: None,
+                billing_type: Some(BillingType::NoTariffNoGroup),
+                group_name: None,
+                traffic_limit: None,
+                traffic_consumed: None,
+                allowed_sessions: None,
+                active_sessions: None,
+                expires_at: None,
+            });
         }
 
-        // 2. Если локально не нашли, и нет внешних серверов -> отказ
-        if self.auth_servers.is_empty() {
-            warn!(
-                "[Auth] Client {} not found in local config and no auth servers defined",
-                fingerprint
-            );
-            return false;
-        }
-
-        // 3. Стучимся во внешние сервера
+        // 2. Внешние сервера
         let req_body = CheckAccessRequest {
             fingerprint: fingerprint.to_string(),
+            node_id: self.node_id.clone(),
+            node_active_sessions,
         };
-
+        info!("Auth servers: {:?}", self.auth_servers);
         for server_url in &self.auth_servers {
             let url = format!("{}/check_access", server_url);
-
-            let res = self
-                .http_client
-                .post(&url)
+            let req = self
+                .profile
+                .apply_to_reqwest(self.http_client.post(&url), None, None)
                 .header("X-Auth-Key", &self.auth_token)
-                .json(&req_body)
-                .send()
-                .await;
+                .json(&req_body);
+            let res = req.send().await;
 
             match res {
-                Ok(resp) => {
-                    if let Ok(json) = resp.json::<CheckAccessResponse>().await {
-                        if json.allowed {
-                            info!(
-                                "[Auth] Client {} allowed by remote server {}",
-                                fingerprint, server_url
-                            );
-                            return true;
-                        } else {
-                            // Если первый сервер послал на хуй - чё дальше? пока - хз.
-                            warn!(
-                                "[Auth] Client {} rejected by remote server {}",
-                                fingerprint, server_url
-                            );
-                            return false;
+                Ok(resp) => match resp.status() {
+                    reqwest::StatusCode::OK => {
+                        let text = resp.text().await.unwrap_or_default();
+                        match serde_json::from_str::<CheckAccessResponse>(&text) {
+                            Ok(json) => {
+                                info!("Check access response: {:?}", json);
+                                return if json.allowed {
+                                    Ok(AccessGrant {
+                                        static_ip: json.static_ip,
+                                        user_id: json.user_id,
+                                        speed_limit_kbps: Some(
+                                            json.speed_limit_kbps.unwrap_or(0) as u32
+                                        ),
+                                        billing_type: json.billing_type,
+                                        group_name: json.group_name,
+                                        traffic_limit: json.traffic_limit,
+                                        traffic_consumed: json.traffic_consumed,
+                                        allowed_sessions: json.allowed_sessions,
+                                        active_sessions: json.active_sessions,
+                                        expires_at: json.expires_at,
+                                    })
+                                } else {
+                                    Err(json.message)
+                                };
+                            }
+                            Err(e) => {
+                                error!("[Auth] Failed to deserialize CheckAccessResponse: {}. Body was: {}", e, text);
+                                continue;
+                            }
                         }
-                    } else {
-                        error!("[Auth] Failed to parse response from {}", server_url,);
                     }
-                }
+                    _ => {
+                        return Err(resp.text().await.unwrap());
+                    }
+                },
                 Err(e) => {
-                    error!(
-                        "[Auth] Failed to contact {}: {}. Trying next...",
-                        server_url, e
-                    );
-                    // Пробуем следующий сервер
+                    error!("[Auth] Server {} unreachable: {}", server_url, e);
                     continue;
                 }
             }
         }
-
-        warn!(
-            "[Auth] Client {} access denied (all checks failed)",
-            fingerprint
-        );
-        false
+        Err("Все сервера авторизации недоступны".into())
     }
 }

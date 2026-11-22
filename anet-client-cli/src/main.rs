@@ -1,51 +1,38 @@
 include!(concat!(env!("OUT_DIR"), "/built.rs"));
 
-use anet_client_cli::tun_factory::DesktopTunFactory;
 use anet_client_core::client::AnetClient;
 use anet_client_core::config::CoreConfig;
-use anet_client_core::platform::{create_route_manager, requires_elevated_privileges};
+use anet_client_core::platform::{DesktopTunFactory, create_route_manager};
+#[cfg(unix)]
+use anet_client_core::platform::requires_elevated_privileges;
 use anyhow::Result;
 use clap::Parser;
-use log::{error, info, warn};
+use log::{error, info};
 use std::process::exit;
+use std::sync::Arc;
 use tokio::fs::read_to_string;
 use tokio::signal;
 
-
-/// Check if the current process has elevated privileges (root/admin)
-fn check_privileges() -> bool {
-    #[cfg(unix)]
-    {
-        // On Unix systems, check if running as root (UID 0)
-        unsafe { libc::geteuid() == 0 }
-    }
-
-    #[cfg(windows)]
-    {
-        // On Windows, we don't require elevation for wintun
-        // The driver handles privilege escalation
-        true
+fn format_banner_row(label: &str, value: &str) -> String {
+    let prefix = format!("║                   {:<13}", label);
+    let total_content_width: usize = 63;
+    let prefix_len = prefix.chars().count() - 1; // excluding '║'
+    let val_space = total_content_width.saturating_sub(prefix_len);
+    let val_chars_count = value.chars().count();
+    if val_chars_count > val_space {
+        let truncated: String = value.chars().take(val_space.saturating_sub(3)).collect();
+        format!("{}{:<width$}║", prefix, format!("{}...", truncated), width = val_space)
+    } else {
+        let pad = val_space - val_chars_count;
+        format!("{}{}{}║", prefix, value, " ".repeat(pad))
     }
 }
 
-
-fn generate_ascii_art(build_type: &str, commit_hash: &str, build_time: &str) -> String {
-    // Обрезаем строки до нужной длины, чтобы они помещались в рамку
-    let build_type_display = if build_type.len() > 10 {
-        &build_type[..10]
-    } else {
-        build_type
-    };
-    let commit_hash_display = if commit_hash.len() > 7 {
-        &commit_hash[..7]
-    } else {
-        commit_hash
-    };
-    let build_time_display = if build_time.len() > 19 {
-        &build_time[..19]
-    } else {
-        build_time
-    };
+fn generate_ascii_art(tag: &str, build_type: &str, commit_hash: &str, build_time: &str) -> String {
+    let row_version = format_banner_row("Version:", tag);
+    let row_build_type = format_banner_row("Build Type:", build_type);
+    let row_commit_hash = format_banner_row("Commit Hash:", commit_hash);
+    let row_build_time = format_banner_row("Build Time:", build_time);
 
     format!(
         r#"
@@ -59,82 +46,78 @@ fn generate_ascii_art(build_type: &str, commit_hash: &str, build_time: &str) -> 
                     ║                 ╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝              ║
                     ╠═══════════════════════════════════════════════════════════════╣
                     ║                                                               ║
-                    ║                   Build Type: {:<16}                ║
-                    ║                   Commit Hash: {:<16}               ║
-                    ║                   Build Time:  {:<19}            ║
-                    ║                                                               ║
+                    {}
+                    {}
+                    {}
+                    {}
                     ║                                                               ║
                     ╚═══════════════════════════════════════════════════════════════╝
 "#,
-        build_type_display, commit_hash_display, build_time_display
+        row_version, row_build_type, row_commit_hash, row_build_time
     )
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info,rtc::peer_connection::handler=error"),
+    )
+    .init();
 
-    // Check for elevated privileges on platforms that require it
-    if requires_elevated_privileges() && !check_privileges() {
-        error!("This program requires elevated privileges (root/sudo).");
-        error!("Please run with: sudo ./anet-client -c <config.toml>");
-        #[cfg(target_os = "macos")]
-        error!("On macOS, you need root access to create TUN interfaces and modify routes.");
-        #[cfg(target_os = "linux")]
-        error!("On Linux, you need root access to create TUN interfaces and modify routes.");
+    // Проверка прав
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() != 0 } && requires_elevated_privileges() {
+        error!("ALCO-NET требует прав root (sudo).");
         exit(1);
     }
 
-    if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
-        warn!("Failed to install default crypto provider: {:?}", e);
-        // Продолжаем, так как Quinn может использовать свой
-    }
     let config = load().await?;
 
-    let ascii_art = generate_ascii_art(BUILD_TYPE, COMMIT_HASH, BUILD_TIME);
-    println!("{}", ascii_art);
+    // Вывод арта с тегом
+    println!("{}", generate_ascii_art(GIT_TAG, BUILD_TYPE, COMMIT_HASH, BUILD_TIME));
 
     let route_mgr = create_route_manager(config.main.manual_routing)?;
-    let cfg = config.clone();
-    let tun_fac = Box::new(DesktopTunFactory::new(
-        config.main.tun_name,
-    ));
-    let client = AnetClient::new(cfg, tun_fac, route_mgr);
+    let tun_fac = Box::new(
+        DesktopTunFactory::new(
+            config.main.tun_name.clone(),
+            config.main.is_per_app_active(),
+        ));
+    let client = Arc::new(AnetClient::new(config, tun_fac, route_mgr));
 
-    client.start().await?;
+
+    let client_for_task = client.clone();
+    let mut run_task = tokio::spawn(async move {
+        if let Err(e) = client_for_task.start().await {
+            error!("VPN connection loop exited with error: {}", e);
+        }
+    });
 
     info!("VPN Running. Press Ctrl+C to stop.");
-    signal::ctrl_c().await?;
-    info!("Received Ctrl+C. Shutting down...");
 
-    client.stop().await?;
+    tokio::select! {
+        res = &mut run_task => {
+            // Цикл подключения завершился сам по себе (например, ошибка
+            // конфигурации ещё до первого коннекта) — ждать Ctrl+C уже нечего.
+            if let Err(e) = res {
+                error!("VPN task panicked: {}", e);
+            }
+            exit(1);
+        }
+        ctrlc_result = signal::ctrl_c() => {
+            ctrlc_result?;
+            info!("Ctrl+C received. Stopping VPN and restoring system state...");
+            client.stop().await?;
+            let _ = run_task.await;
+        }
+    }
 
     Ok(())
 }
 
 #[derive(Debug, Parser)]
-pub struct Opt {
-    #[clap(short, long, default_value = "./client.toml")]
-    cfg: String,
-}
+pub struct Opt { #[clap(short, long, default_value = "./client.toml")] cfg: String }
 async fn load() -> anyhow::Result<CoreConfig> {
     let opt = Opt::parse();
-    let toml_str = read_to_string(&opt.cfg).await;
-
-    match toml_str {
-        Ok(toml_str) => {
-            let cfg: CoreConfig = toml::from_str(&toml_str)?;
-            Ok(cfg)
-        }
-        Err(_) => {
-            warn!(
-                "\n\
-                Cannot find client config file in {}, use '-c' or '--cfg' \n\
-                './anet-client -c /home/anet/anet/config.toml' for example,
-                ",
-                opt.cfg,
-            );
-            exit(-1)
-        }
-    }
+    let toml_str = read_to_string(&opt.cfg).await?;
+    Ok(toml::from_str(&toml_str)?)
 }

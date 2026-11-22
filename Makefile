@@ -1,20 +1,28 @@
 .PHONY: all check test clean musl cert mob macos macos-gui macos-all macos-universal macos-app infra win-gui
-.PHONY: docker-help docker-install docker-install-source docker-start docker-stop docker-restart docker-logs docker-diagnose docker-config docker-client docker-clean
 
 
 win-gui:
-	 cargo build --release --target x86_64-pc-windows-gnu --package anet-client-gui
+	cargo update -p rtc-turn -p reqwest-boring
+	cargo build --release --target x86_64-pc-windows-gnu --package anet-client-gui
+win-gui-d:
+	cargo update -p rtc-turn -p reqwest-boring
+	cargo build --release --target x86_64-pc-windows-gnu --package anet-client-gui --features per-app --features console
+lin-gui:
+	cargo build --release --package anet-client-gui
 
 # Default target
 all:
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo build --release
 
 # Run all checks (compile check without building)
 check:
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo check --workspace
 
 # Run tests
 test:
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo test --workspace
 
 # Clean build artifacts
@@ -23,18 +31,99 @@ clean:
 
 # Build static Linux binary (musl)
 musl:
-	RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-musl --package anet-server --package anet-client-cli
+	cargo update -p rtc-turn -p reqwest-boring
+	@for d in target/x86_64-unknown-linux-musl/release/build/boring-sys-*/out; do \
+		if [ -d "$$d/build" ]; then \
+			if [ ! -f "$$d/build/ssl/libssl.a" ] && [ ! -f "$$d/build/libssl.a" ]; then \
+				rm -rf "$$d/build"; \
+			elif ! grep -q -- "-fno-exceptions" "$$d/build/CMakeCache.txt" 2>/dev/null; then \
+				rm -rf "$$d/build"; \
+				cargo clean -p boring-sys --release --target x86_64-unknown-linux-musl; \
+			fi; \
+		fi; \
+	done
+	CXX_x86_64_unknown_linux_musl=g++ \
+	CXXFLAGS_x86_64_unknown_linux_musl="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME" \
+	BORING_BSSL_RUST_CPPLIB_x86_64_unknown_linux_musl=c \
+	RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-u,fopen,-u,strtoull,-u,strtol,-u,strtoul,-u,abort,-u,free -C link-arg=-Wl,--defsym=fopen64=fopen -C link-arg=-Wl,--defsym=__isoc23_strtoull=strtoull -C link-arg=-Wl,--defsym=__isoc23_strtol=strtol -C link-arg=-Wl,--defsym=__isoc23_strtoul=strtoul -C link-arg=-Wl,--defsym=__cxa_pure_virtual=abort -C link-arg=-Wl,--defsym=_ZdlPv=free -C link-arg=-Wl,--defsym=_ZdlPvm=free -C link-arg=-Wl,--defsym=_ZSt24__throw_out_of_range_fmtPKcz=abort -C link-arg=-Wl,--defsym=_ZSt20__throw_length_errorPKc=abort -C link-arg=-Wl,--defsym=_ZSt17__throw_bad_allocv=abort -C link-arg=-Wl,--defsym=_ZSt28__throw_bad_array_new_lengthv=abort" \
+	cargo build --release --target x86_64-unknown-linux-musl --package anet-server --package anet-client-cli --package anet-auth --package anet-keygen
 
 # Build Android libraries (requires cargo-ndk)
 mob:
-	cargo ndk -t x86_64-linux-android -t aarch64-linux-android -o ./android-build/jniLibs build --release -p anet-mobile
+	cargo update -p rtc-turn -p reqwest-boring
+	@for t in x86_64-linux-android aarch64-linux-android armv7-linux-androideabi; do \
+		for d in target/$$t/release/build/boring-sys-*/out; do \
+			if [ -d "$$d/build" ]; then \
+				if [ ! -f "$$d/build/ssl/libssl.a" ] && [ ! -f "$$d/build/libssl.a" ]; then \
+					rm -rf "$$d/build"; \
+				elif ! grep -q -- "-fno-exceptions" "$$d/build/CMakeCache.txt" 2>/dev/null; then \
+					rm -rf "$$d/build"; \
+					cargo clean -p boring-sys -p anet-mobile --release --target $$t; \
+				fi; \
+			fi; \
+		done; \
+	done
+	@NDK_HOME_RESOLVED="$${ANDROID_NDK_HOME:-$${ANDROID_NDK_ROOT:-$${ANDROID_NDK_PATH:-$${NDK_HOME:-}}}}"; \
+	if [ -n "$$NDK_HOME_RESOLVED" ] && [ ! -f "$$NDK_HOME_RESOLVED/build/cmake/android.toolchain.cmake" ]; then \
+		SUB_NDK="$$(ls -1d "$$NDK_HOME_RESOLVED"/* 2>/dev/null | sort -V | tail -n 1)"; \
+		if [ -n "$$SUB_NDK" ] && [ -f "$$SUB_NDK/build/cmake/android.toolchain.cmake" ]; then \
+			NDK_HOME_RESOLVED="$$SUB_NDK"; \
+		else \
+			NDK_HOME_RESOLVED=""; \
+		fi; \
+	fi; \
+	if [ -z "$$NDK_HOME_RESOLVED" ] && command -v ndk-build >/dev/null 2>&1; then \
+		NDK_BIN="$$(readlink -f "$$(command -v ndk-build)")"; \
+		if [ -f "$$(dirname "$$NDK_BIN")/build/cmake/android.toolchain.cmake" ]; then \
+			NDK_HOME_RESOLVED="$$(dirname "$$NDK_BIN")"; \
+		fi; \
+	fi; \
+	if [ -z "$$NDK_HOME_RESOLVED" ]; then \
+		SYSROOT="$$(env -u ANDROID_NDK_HOME -u ANDROID_NDK_ROOT -u NDK_HOME cargo ndk env 2>/dev/null | sed -n "s/^export CARGO_NDK_SYSROOT_PATH=['\"]*\([^'\"]*\)['\"]*$$/\1/p" | head -n 1)"; \
+		if [ -n "$$SYSROOT" ]; then \
+			NDK_HOME_RESOLVED="$${SYSROOT%/toolchains/llvm/prebuilt/*}"; \
+		fi; \
+	fi; \
+	if [ -z "$$NDK_HOME_RESOLVED" ]; then \
+		for base in "$${ANDROID_HOME:+$${ANDROID_HOME}/ndk}" "$${ANDROID_SDK_ROOT:+$${ANDROID_SDK_ROOT}/ndk}" "$${ANDROID_SDK_HOME:+$${ANDROID_SDK_HOME}/ndk}" "$$HOME/Android/Sdk/ndk" "$$HOME/Library/Android/sdk/ndk" "/opt/android-sdk/ndk" "/usr/lib/android-sdk/ndk"; do \
+			if [ -n "$$base" ] && [ -d "$$base" ]; then \
+				CAND="$$(ls -1d "$$base"/* 2>/dev/null | sort -V | tail -n 1)"; \
+				if [ -n "$$CAND" ] && [ -f "$$CAND/build/cmake/android.toolchain.cmake" ]; then \
+					NDK_HOME_RESOLVED="$$CAND"; \
+					break; \
+				fi; \
+			fi; \
+		done; \
+	fi; \
+	if [ -z "$$NDK_HOME_RESOLVED" ]; then \
+		for dir in "/opt/android-ndk" "/opt/android-sdk/ndk-bundle" "$$HOME/Android/Sdk/ndk-bundle"; do \
+			if [ -f "$$dir/build/cmake/android.toolchain.cmake" ]; then \
+				NDK_HOME_RESOLVED="$$dir"; \
+				break; \
+			fi; \
+		done; \
+	fi; \
+	if [ -z "$$NDK_HOME_RESOLVED" ]; then \
+		FOUND_CMAKE="$$(find "$$HOME" /opt -maxdepth 5 -path "*/build/cmake/android.toolchain.cmake" 2>/dev/null | sort -V | tail -n 1)"; \
+		if [ -n "$$FOUND_CMAKE" ]; then \
+			NDK_HOME_RESOLVED="$${FOUND_CMAKE%/build/cmake/android.toolchain.cmake}"; \
+		fi; \
+	fi; \
+	if [ -z "$$NDK_HOME_RESOLVED" ]; then \
+		echo "ERROR: Android NDK not found! Install Android NDK (e.g. via Android Studio SDK Manager or 'yay -S android-ndk') or set ANDROID_NDK_HOME=/path/to/ndk"; \
+		exit 1; \
+	fi; \
+	echo "Using ANDROID_NDK_HOME=$$NDK_HOME_RESOLVED"; \
+	ANDROID_NDK_HOME="$$NDK_HOME_RESOLVED" \
+	ANDROID_NDK_ROOT="$$NDK_HOME_RESOLVED" \
+	cargo ndk -t x86_64-linux-android -t aarch64-linux-android -t armv7-linux-androideabi -o ./android-build/jniLibs build --release -p anet-mobile
 
 # run infrastructure
 infra:
 	docker-compose -f contrib/docker/docker-compose.infra.yaml up --remove-orphans
-
 # Build macOS CLI client
 macos:
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo build --release -p anet-client-cli
 	@echo ""
 	@echo "Build complete: target/release/anet-client"
@@ -42,6 +131,7 @@ macos:
 
 # Build macOS GUI client
 macos-gui:
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo build --release -p anet-client-gui
 	@echo ""
 	@echo "Build complete: target/release/anet-gui"
@@ -49,6 +139,7 @@ macos-gui:
 
 # Build both macOS CLI and GUI
 macos-all:
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo build --release -p anet-client-cli -p anet-client-gui
 	@echo ""
 	@echo "Build complete:"
@@ -57,6 +148,7 @@ macos-all:
 
 # Build universal macOS binaries (Intel + Apple Silicon)
 macos-universal:
+	cargo update -p rtc-turn -p reqwest-boring
 	@echo "Building for Apple Silicon (aarch64)..."
 	cargo build --release -p anet-client-cli -p anet-client-gui --target aarch64-apple-darwin
 	@echo "Building for Intel (x86_64)..."
@@ -75,75 +167,4 @@ macos-universal:
 	@echo "  GUI: target/release/universal/anet-gui"
 
 cert:
-	openssl req -x509 -newkey ed25519 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=alco" -addext "subjectAltName = DNS:alco" -addext "basicConstraints=critical,CA:FALSE" -addext "keyUsage=digitalSignature,keyEncipherment"
-
-# ============================================================================
-# Docker Server Deployment
-# ============================================================================
-
-docker-help:
-	@echo "ANet VPN Server — Docker Deployment"
-	@echo "===================================="
-	@echo ""
-	@echo "Setup:"
-	@echo "  make docker-install         Install with prebuilt binaries (fast)"
-	@echo "  make docker-install-source  Install by building from source (slower)"
-	@echo ""
-	@echo "Management:"
-	@echo "  make docker-start           Start server"
-	@echo "  make docker-stop            Stop server"
-	@echo "  make docker-restart         Restart server"
-	@echo "  make docker-logs            View logs"
-	@echo "  make docker-diagnose        Run diagnostics"
-	@echo ""
-	@echo "Configuration:"
-	@echo "  make docker-config          Generate server config"
-	@echo "  make docker-client IP=x.x.x.x  Generate client.toml"
-	@echo ""
-	@echo "Cleanup:"
-	@echo "  make docker-clean           Stop and remove containers"
-
-docker-install:
-	@echo "Installing ANet VPN server (prebuilt binaries)..."
-	chmod +x install.sh generate-config.sh generate-client-config.sh diagnose.sh
-	sudo ./install.sh --clients 2
-
-docker-install-source:
-	@echo "Installing ANet VPN server (build from source)..."
-	chmod +x install.sh generate-config.sh generate-client-config.sh diagnose.sh
-	sudo ./install.sh --build-from-source --clients 2
-
-docker-start:
-	docker compose up -d
-
-docker-stop:
-	docker compose down
-
-docker-restart:
-	docker compose restart anet-server
-
-docker-logs:
-	docker compose logs -f anet-server
-
-docker-diagnose:
-	@chmod +x diagnose.sh
-	@./diagnose.sh
-
-docker-config:
-	@chmod +x generate-config.sh
-	@./generate-config.sh --clients 2 --bind 8443
-
-docker-client:
-ifndef IP
-	@echo "Error: Please specify server IP"
-	@echo "Usage: make docker-client IP=194.41.113.15"
-	@exit 1
-endif
-	@chmod +x generate-client-config.sh
-	@./generate-client-config.sh --server-address $(IP):8443
-	@echo ""
-	@echo "Client config: client-windows/client.toml"
-
-docker-clean:
-	docker compose down
-	@echo "Containers stopped and removed."
+	openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=alco" -addext "subjectAltName = DNS:alco" -addext "basicConstraints=critical,CA:FALSE" -addext "keyUsage=digitalSignature,keyEncipherment"

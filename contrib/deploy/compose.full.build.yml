@@ -1,0 +1,12 @@
+name: anet
+include:
+  - path:
+      - compose/compose.yaml
+      - compose/webui.yaml
+      - compose/chain.yaml
+      - ../chain/ingress.yaml
+      - compose/full-monitoring.yaml
+      - compose/probe-management.yaml
+      - compose/full-build.yaml
+      - compose/build.yaml
+      - compose/webui-build.yaml

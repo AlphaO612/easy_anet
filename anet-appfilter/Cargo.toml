@@ -1,0 +1,39 @@
+[package]
+name = "anet-appfilter"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# По умолчанию per-app split tunneling ВЫКЛЮЧЕН: крейт собирается как заглушка
+# без зависимости от WinDivert. Это позволяет собирать GUI/клиент под Windows
+# (в т.ч. кросс-компиляцией) без WinDivert SDK.
+#
+# Включить реальный per-app: --features windivert (потребует бинарники
+# WinDivert рядом или переменную WINDIVERT_PATH при сборке windivert-sys;
+# либо проброс фичи windivert/vendored для сборки из исходников).
+default = []
+windivert = ["dep:windivert", "dep:windows-sys"]
+# Удобный проброс: собрать WinDivert из C-исходников (нужен clang), чтобы не
+# искать готовые .lib/.dll. Тянет за собой саму фичу windivert.
+vendored = ["windivert", "windivert?/vendored"]
+
+# WinDivert подключается ТОЛЬКО под Windows И только при включённой фиче.
+[target.'cfg(windows)'.dependencies]
+windivert = { version = "0.7.0-beta.4", optional = true }
+windows-sys = { workspace = true, optional = true, features = [
+    "Win32_System_Threading",
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+] }
+
+[dependencies]
+anet-common = { path = "../anet-common" }
+bytes = { workspace = true }
+ipnet = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+log = { workspace = true }
+anyhow = { workspace = true }
+dashmap = { workspace = true }

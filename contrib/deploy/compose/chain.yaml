@@ -1,0 +1,61 @@
+services:
+  network:
+    command: [prepare-chain-and-hold]
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "2"
+      net.ipv4.conf.default.rp_filter: "2"
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+    healthcheck:
+      # The helper switches UID only after both routing and filtering succeed.
+      test: ["CMD-SHELL", "grep -Eq '^Uid:[[:space:]]+65532[[:space:]]' /proc/1/status"]
+  uplink:
+    image: ${CLIENT_IMAGE:?set CLIENT_IMAGE}
+    platform: linux/amd64
+    network_mode: service:network
+    depends_on:
+      network: {condition: service_healthy}
+    devices: [/dev/net/tun:/dev/net/tun:rw]
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    restart: unless-stopped
+    pids_limit: ${ANET_PIDS:-256}
+    mem_limit: ${CLIENT_MEMORY:-256m}
+    cpus: ${CLIENT_CPUS:-1}
+    command: ["-c", "/etc/anet/uplink.toml"]
+    volumes:
+      - type: bind
+        source: ${UPLINK_CONFIG:?set UPLINK_CONFIG}
+        target: /etc/anet/uplink.toml
+        read_only: true
+        bind: {create_host_path: false}
+
+  uplink-route:
+    image: ${NETNS_IMAGE:?set NETNS_IMAGE}
+    network_mode: service:network
+    depends_on:
+      network: {condition: service_healthy}
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    pids_limit: 16
+    mem_limit: 16m
+    cpus: 0.10
+    restart: unless-stopped
+    # Configuring the negotiated peer address cycles the TUN link and Linux
+    # deletes its routes. Keep the terminal unreachable route during reconnect.
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        while :; do
+          if ip -4 -o addr show dev anet-uplink | grep -q ' inet ' &&
+             ! ip -4 route show table 177 | grep -q '^default dev anet-uplink '; then
+            ip -4 route replace default dev anet-uplink metric 10 table 177
+          fi
+          sleep 1
+        done

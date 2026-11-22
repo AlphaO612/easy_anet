@@ -1,5 +1,14 @@
+#![allow(float_literal_f32_fallback)]
+
+include!(concat!(env!("OUT_DIR"), "/built.rs"));
+
+pub mod types;
+pub mod utils;
+pub mod theme;
+pub mod events;
 pub mod app;
-pub(crate) mod config;
-pub mod tun_factory;
+pub mod ui;
 pub mod icons;
-pub(crate) mod tray;
+pub mod config;
+pub mod tray;
+pub mod secure_store;

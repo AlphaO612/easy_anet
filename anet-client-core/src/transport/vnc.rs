@@ -1,23 +1,40 @@
-use super::{ClientTransport, ConnectionResult, MutexVpnStream};
-use crate::config::CoreConfig;
-use crate::auth::{AuthHandler, AuthChannel};
-use anyhow::{Context, Result};
-use async_trait::async_trait;
-use bytes::{BufMut, Bytes};
-use log::{info, warn};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex};
-use std::time::Duration;
-use anet_common::stream_framing::{frame_packet, read_next_packet};
+use super::{ClientTransport, ConnectionResult, ShutdownHook};
+use crate::auth::{AuthChannel, AuthDenyError, AuthHandler};
+use crate::config::{CoreConfig, ServerConfig};
+use anet_common::config::StealthConfig;
+use anet_common::consts::{
+    COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES, MAX_PENDING_JITTER_PACKETS, PADDING_MTU,
+    RFB_HANDSHAKE_TIMEOUT, TRANSPORT_ENVELOPE_OVERHEAD, WRTC_MIN_IP_PACKET_LEN,
+};
+use anet_common::encryption::Cipher;
+use anet_common::handshake_fragmentation::{write_fragmented, FragmentConfig};
 use anet_common::padding_utils::calculate_padding_needed;
-use anet_common::consts::{MAX_PACKET_SIZE, CHANNEL_BUFFER_SIZE};
-
-const RFB_VER: &[u8; 12] = b"RFB 003.008\n";
-const RFB_SEC_TYPES: &[u8; 2] = &[1, 1]; // Security Count = 1, Auth = None
-const RFB_SEC_RESULT: &[u8; 4] = &[0, 0, 0, 0];
+use anet_common::protocol::AuthResponse;
+use anet_common::stream_framing::{frame_packet_into, FrameReader};
+use anet_common::transport::{unwrap_packet_bytes_in_place, wrap_packet};
+use anet_common::vnc::{
+    encode_cut_text, read_cut_text, CLIENT_CUT_TEXT, RFB_VERSION, SECURITY_TYPE_NONE,
+    SERVER_CUT_TEXT,
+};
+use anyhow::{ensure, Context, Result};
+use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
+use log::{info, warn};
+use rand::{rngs::OsRng, rngs::StdRng, Rng, SeedableRng};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
+use tokio::io::{
+    duplex, split, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf,
+};
+use tokio::net::TcpStream;
+use tokio::sync::{oneshot, Mutex};
+use tokio::task::AbortHandle;
+use tokio::time::{sleep, timeout};
 
 struct VncAuthChannel {
     stream: Mutex<TcpStream>,
@@ -25,166 +42,630 @@ struct VncAuthChannel {
 
 #[async_trait]
 impl AuthChannel for VncAuthChannel {
-    async fn send(&self, data: Bytes) -> Result<()> {
+    async fn send(&self, data: Bytes, fragmentation: &FragmentConfig) -> Result<()> {
+        let frame = encode_cut_text(CLIENT_CUT_TEXT, &data)?;
         let mut stream = self.stream.lock().await;
-        let mut framed = bytes::BytesMut::with_capacity(8 + data.len());
-        framed.put_u8(6); // ClientCutText
-        framed.put_slice(&[0, 0, 0]); // Padding
-        framed.put_u32(data.len() as u32);
-        framed.put(data);
-        stream.write_all(&framed).await?;
-        stream.flush().await?;
+        write_fragmented(&mut *stream, &frame, fragmentation).await?;
         Ok(())
     }
 
-    async fn recv(&self, timeout: Duration) -> Result<Bytes> {
+    async fn recv(&self, recv_timeout: Duration) -> Result<Bytes> {
         let mut stream = self.stream.lock().await;
-        let mut header = [0u8; 8];
-        tokio::time::timeout(timeout, stream.read_exact(&mut header)).await??;
-        if header[0] != 3 { anyhow::bail!("Invalid VNC Auth msg type from server: {}", header[0]); }
-
-        let len = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
-        if len > anet_common::consts::MAX_PACKET_SIZE * 2 { anyhow::bail!("VNC Auth packet too large"); }
-
-        let mut payload = vec![0u8; len];
-        tokio::time::timeout(timeout, stream.read_exact(&mut payload)).await??;
-        Ok(Bytes::from(payload))
+        timeout(recv_timeout, read_cut_text(&mut *stream, SERVER_CUT_TEXT))
+            .await
+            .context("timed out waiting for the VNC authentication response")??
+            .context("VNC server closed during authentication")
     }
 }
 
-pub struct VncTransport { config: CoreConfig }
-impl VncTransport { pub fn new(c: CoreConfig) -> Self { Self { config: c } } }
+pub struct VncTransport {
+    config: CoreConfig,
+    server: ServerConfig,
+}
+
+impl VncTransport {
+    pub fn new(config: CoreConfig, server: ServerConfig) -> Self {
+        Self { config, server }
+    }
+}
+
+struct AuthenticatedVncSession {
+    addr: SocketAddr,
+    stream: TcpStream,
+    auth_response: AuthResponse,
+    shared_key: [u8; 32],
+}
+
+async fn connect_authenticated(
+    config: &CoreConfig,
+    server: &ServerConfig,
+    resume_session_id: Option<String>,
+) -> Result<AuthenticatedVncSession> {
+    let addr = resolve_address(&server.endpoint()?)?;
+    info!("[VNC] Connecting to RFB endpoint {addr}");
+
+    let mut stream = timeout(RFB_HANDSHAKE_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .context("timed out connecting to the VNC endpoint")??;
+    stream.set_nodelay(true)?;
+    info!(
+        "[VNC] TCP socket connected to {addr} (local: {:?}, nodelay: true)",
+        stream.local_addr().ok()
+    );
+    timeout(
+        RFB_HANDSHAKE_TIMEOUT,
+        emulate_rfb_client_handshake(&mut stream),
+    )
+    .await
+    .context("timed out during the VNC handshake")??;
+
+    info!("[VNC] RFB handshake complete; starting ASTP authentication");
+    let auth_channel = VncAuthChannel {
+        stream: Mutex::new(stream),
+    };
+    let auth_handler =
+        AuthHandler::new_with_resume(config, server.server_pub_key.as_deref(), resume_session_id)?;
+    let (auth_response, shared_key) = auth_handler.authenticate_once(&auth_channel).await?;
+    info!("[VNC] ASTP authenticated; assigned IP {}", auth_response.ip);
+
+    let stream = auth_channel.stream.into_inner();
+    Ok(AuthenticatedVncSession {
+        addr,
+        stream,
+        auth_response,
+        shared_key,
+    })
+}
+
+fn session_lifetime(server: &ServerConfig) -> Option<Duration> {
+    if server.vnc_min_session_secs == 0 || server.vnc_max_session_secs == 0 {
+        return None;
+    }
+    let min = server.vnc_min_session_secs.max(30);
+    let max = server.vnc_max_session_secs.max(min);
+    Some(Duration::from_secs(OsRng.gen_range(min..=max)))
+}
+
+async fn wait_rotation(duration: Option<Duration>) {
+    match duration {
+        Some(d) => sleep(d).await,
+        None => std::future::pending::<()>().await,
+    }
+}
 
 #[async_trait]
 impl ClientTransport for VncTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
-        let addr: SocketAddr = self.config.main.address.parse().context("Invalid server target")?;
-        info!("[VNC Transport] Probing fake desktop target: {}", addr);
+        let initial = connect_authenticated(&self.config, &self.server, None).await?;
+        let auth_response = initial.auth_response.clone();
+        let remote_ip = initial.addr.ip();
+        let expected_ip = auth_response.ip.clone();
+        let expected_gateway = auth_response.gateway.clone();
+        let logical_session_id = auth_response.session_id.clone();
 
-        let mut stream = TcpStream::connect(addr).await?;
-        let _ = stream.set_nodelay(true);
+        let (client_stream, internal_stream) = duplex(512 * 1024);
+        let (tunnel_reader, tunnel_writer) = split(internal_stream);
 
-        let mut ver = [0u8; 12]; stream.read_exact(&mut ver).await?;
-        info!("-> Read Srv Ban: {:?}", std::str::from_utf8(&ver).unwrap_or(""));
-        if &ver != RFB_VER { anyhow::bail!("Target Server returned unknown protocol (Not RFB3.8)."); }
-        stream.write_all(RFB_VER).await?;
-        stream.flush().await?;
+        let health_pause = Arc::new(AtomicBool::new(false));
+        let supervisor_health_pause = health_pause.clone();
+        let config = self.config.clone();
+        let server = self.server.clone();
+        let worker_aborts: Arc<StdMutex<Vec<AbortHandle>>> = Arc::new(StdMutex::new(Vec::new()));
+        let worker_aborts_sup = worker_aborts.clone();
 
-        let mut sc_types = [0u8; 2]; stream.read_exact(&mut sc_types).await?;
-        if &sc_types != RFB_SEC_TYPES { anyhow::bail!("VNC Security handshake rejection.")}
-        stream.write_all(&[1]).await?;
-        stream.flush().await?;
+        let supervisor_task = tokio::spawn(async move {
+            let mut active = initial;
+            let mut tunnel_reader_opt = Some(tunnel_reader);
+            let mut tunnel_writer_opt = Some(tunnel_writer);
+            let mut frame_reader_opt = Some(FrameReader::new());
 
-        let mut sc_rs = [0u8; 4]; stream.read_exact(&mut sc_rs).await?;
-        if &sc_rs != RFB_SEC_RESULT { anyhow::bail!("VNC Server banned logic.")}
-        stream.write_all(&[1]).await?;
-        stream.flush().await?;
+            'sessions: loop {
+                let Some(t_reader) = tunnel_reader_opt.take() else { break 'sessions; };
+                let Some(t_writer) = tunnel_writer_opt.take() else { break 'sessions; };
+                let f_reader = frame_reader_opt.take().unwrap_or_else(FrameReader::new);
 
-        let mut rfb_desktop = vec![0u8; 28];
-        stream.read_exact(&mut rfb_desktop).await?;
+                let session_start = Instant::now();
+                let cipher = Arc::new(Cipher::new(&active.shared_key));
+                let nonce_prefix: [u8; 4] = match active.auth_response.nonce_prefix.as_slice().try_into() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("[VNC] Server returned invalid nonce prefix");
+                        break 'sessions;
+                    }
+                };
+                let sequence = Arc::new(AtomicU64::new(0));
+                let stealth = config.stealth.clone();
+                let (reader, writer) = split(active.stream);
 
-        info!("[VNC Tunnel Ready]. Securing envelope (Entering ASTP Domain)...");
+                let (stop_out_tx, stop_out_rx) = oneshot::channel::<()>();
+                let (stop_in_tx, stop_in_rx) = oneshot::channel::<()>();
 
-        // ЯДРО СВЯЗИ VPN ЧЕРЕЗ VNC-AUTH-CHANNEL (БЕЗ ARC)
-        let auth_ch = VncAuthChannel { stream: Mutex::new(stream) };
-
-        let ath_ctrl = AuthHandler::new(&self.config)?;
-        let (auth_pack, key) = ath_ctrl.authenticate(&auth_ch).await?;
-        info!("[ASTP over VNC] Encapsulated Layer successful! Bound Local VPN IPv4: {}", auth_pack.ip);
-
-        // Вытаскиваем чистый TCP-сокет обратно из Mutex'а
-        let live_stream = auth_ch.stream.into_inner();
-        let (mut tcp_reader, mut tcp_writer) = tokio::io::split(live_stream);
-
-        // Мост для Core
-        let (client_stream, internal_router) = tokio::io::duplex(MAX_PACKET_SIZE * 10);
-        let (mut tunnel_read, mut tunnel_write) = tokio::io::split(internal_router);
-
-        let cipher_tx = Arc::new(anet_common::encryption::Cipher::new(&key));
-        let cipher_rx = Arc::new(anet_common::encryption::Cipher::new(&key));
-        let sequence_tx = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let nonce_prefix: [u8; 4] = auth_pack.nonce_prefix.clone().as_slice().try_into().unwrap_or([0,0,0,0]);
-        let stealth_cfg = self.config.stealth.clone();
-
-        // -------------------------------------------------------------
-        // ИСХОДЯЩИЙ ТРАФИК (TX - Пишем серверу, Type = 6)
-        // -------------------------------------------------------------
-        let (tx_bridge, mut rx_bridge) = mpsc::channel(CHANNEL_BUFFER_SIZE);
-        tokio::spawn(async move {
-            while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
-                if tx_bridge.send(packet).await.is_err() { break; }
-            }
-        });
-
-        let p_step = stealth_cfg.padding_step;
-        tokio::spawn(async move {
-            let (tx_ready, mut rx_ready) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
-            let dispatch = tokio::spawn(async move {
-                use rand::Rng; let mut r = rand::rngs::OsRng;
-                while let Some(ip) = rx_bridge.recv().await {
-                    let dly = if stealth_cfg.max_jitter_ns > stealth_cfg.min_jitter_ns { r.gen_range(stealth_cfg.min_jitter_ns..=stealth_cfg.max_jitter_ns) } else { 0 };
-                    let st = tx_ready.clone();
-                    tokio::spawn(async move {
-                        if dly > 0 { tokio::time::sleep(std::time::Duration::from_nanos(dly)).await; }
-                        let _ = st.send(ip).await;
-                    });
+                let mut inbound = tokio::spawn(receive_from_server(
+                    reader,
+                    t_writer,
+                    cipher.clone(),
+                    stop_in_rx,
+                ));
+                let mut outbound = tokio::spawn(send_to_server(
+                    t_reader,
+                    f_reader,
+                    writer,
+                    cipher,
+                    sequence,
+                    nonce_prefix,
+                    stealth,
+                    stop_out_rx,
+                ));
+                {
+                    let mut aborts = worker_aborts_sup.lock().unwrap();
+                    aborts.clear();
+                    aborts.push(inbound.abort_handle());
+                    aborts.push(outbound.abort_handle());
                 }
-            });
 
-            while let Some(raw) = rx_ready.recv().await {
-                let seq = sequence_tx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let sz = raw.len() + 38;
-                let pad = calculate_padding_needed(sz, p_step);
-                let sa_pa = if sz+(pad as usize) > anet_common::consts::PADDING_MTU {0} else {pad};
+                let rotation_dur = session_lifetime(&server);
+                let mut need_rotate = false;
+                let mut stop_out_tx = Some(stop_out_tx);
+                let mut stop_in_tx = Some(stop_in_tx);
 
-                if let Ok(crypted) = anet_common::transport::wrap_packet(&cipher_tx, &nonce_prefix, seq, raw, sa_pa) {
-                    let mut framed = bytes::BytesMut::with_capacity(8 + crypted.len());
-                    framed.put_u8(6); // ClientCutText
-                    framed.put_slice(&[0, 0, 0]); // Padding
-                    framed.put_u32(crypted.len() as u32);
-                    framed.put(crypted);
+                tokio::select! {
+                    res_out = &mut outbound => {
+                        if let Some(tx) = stop_in_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        match res_out {
+                            Ok(Ok(Some((r, fr)))) => {
+                                tunnel_reader_opt = Some(r);
+                                frame_reader_opt = Some(fr);
+                            }
+                            Ok(Ok(None)) => {
+                                info!("[VNC] Tunnel closed: client TUN stream closed. Duration: {:.1}s", session_start.elapsed().as_secs_f64());
+                                inbound.abort();
+                                break 'sessions;
+                            }
+                            Ok(Err(e)) => {
+                                warn!("[VNC] Tunnel outbound stopped: {e:#}. Duration: {:.1}s", session_start.elapsed().as_secs_f64());
+                                inbound.abort();
+                                break 'sessions;
+                            }
+                            Err(_) => {
+                                inbound.abort();
+                                break 'sessions;
+                            }
+                        }
+                        match inbound.await {
+                            Ok(Ok(Some(w))) => tunnel_writer_opt = Some(w),
+                            _ => break 'sessions,
+                        }
+                    }
+                    res_in = &mut inbound => {
+                        if let Some(tx) = stop_out_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        match res_in {
+                            Ok(Ok(Some(w))) => tunnel_writer_opt = Some(w),
+                            Ok(Ok(None)) => {
+                                info!(
+                                    "[VNC] Tunnel closed: remote VNC server closed TCP connection (EOF). Duration: {:.1}s ({:.2} min)",
+                                    session_start.elapsed().as_secs_f64(),
+                                    session_start.elapsed().as_secs_f64() / 60.0
+                                );
+                                outbound.abort();
+                                break 'sessions;
+                            }
+                            Ok(Err(e)) => {
+                                warn!("[VNC] Tunnel inbound stopped: {e:#}. Duration: {:.1}s", session_start.elapsed().as_secs_f64());
+                                outbound.abort();
+                                break 'sessions;
+                            }
+                            Err(_) => {
+                                outbound.abort();
+                                break 'sessions;
+                            }
+                        }
+                        match outbound.await {
+                            Ok(Ok(Some((r, fr)))) => {
+                                tunnel_reader_opt = Some(r);
+                                frame_reader_opt = Some(fr);
+                            }
+                            _ => break 'sessions,
+                        }
+                    }
+                    _ = wait_rotation(rotation_dur) => {
+                        need_rotate = true;
+                        supervisor_health_pause.store(true, Ordering::Release);
+                        if let Some(tx) = stop_out_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(tx) = stop_in_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        match outbound.await {
+                            Ok(Ok(Some((r, fr)))) => {
+                                tunnel_reader_opt = Some(r);
+                                frame_reader_opt = Some(fr);
+                            }
+                            _ => {
+                                inbound.abort();
+                                break 'sessions;
+                            }
+                        }
+                        match inbound.await {
+                            Ok(Ok(Some(w))) => tunnel_writer_opt = Some(w),
+                            _ => break 'sessions,
+                        }
+                    }
+                }
 
-                    if tcp_writer.write_all(&framed).await.is_err() || tcp_writer.flush().await.is_err() { break; }
+                if !need_rotate {
+                    break 'sessions;
+                }
+
+                info!("[VNC] Periodic session rotation; reconnecting the same endpoint");
+                let gap_ms = OsRng.gen_range(350..=1200);
+                sleep(Duration::from_millis(gap_ms)).await;
+
+                let deadline = Instant::now() + Duration::from_secs(server.timeout_secs.max(10) * 3);
+                let mut reconnected = None;
+                while Instant::now() < deadline {
+                    match timeout(
+                        Duration::from_secs(server.timeout_secs.max(10)),
+                        connect_authenticated(&config, &server, Some(logical_session_id.clone())),
+                    )
+                    .await
+                    {
+                        Ok(Ok(candidate)) => {
+                            if candidate.auth_response.ip == expected_ip
+                                && candidate.auth_response.gateway == expected_gateway
+                            {
+                                reconnected = Some(candidate);
+                                break;
+                            }
+                            warn!("[VNC] Rotated session received a different tunnel address");
+                        }
+                        Ok(Err(error)) => {
+                            if error.downcast_ref::<AuthDenyError>().is_some() {
+                                warn!("[VNC] Planned reconnect rejected by server: {error}");
+                                break;
+                            }
+                            warn!("[VNC] Planned reconnect attempt failed: {error:#}");
+                        }
+                        Err(_) => warn!("[VNC] Planned reconnect attempt timed out"),
+                    }
+                    let delay_ms = OsRng.gen_range(350..=1400);
+                    sleep(Duration::from_millis(delay_ms)).await;
+                }
+
+                match reconnected {
+                    Some(new_sess) => {
+                        active = new_sess;
+                        supervisor_health_pause.store(false, Ordering::Release);
+                    }
+                    None => break 'sessions,
                 }
             }
-            dispatch.abort(); warn!("[VNC proxy] Inner TX channel stopped.");
+            supervisor_health_pause.store(false, Ordering::Release);
+            info!("[VNC] Transport supervisor stopped");
         });
 
-        // -------------------------------------------------------------
-        // ВХОДЯЩИЙ ТРАФИК (RX - Читаем от сервера, Type = 3)
-        // -------------------------------------------------------------
-        let (tx_in, mut rx_in) = mpsc::channel(CHANNEL_BUFFER_SIZE);
-
-        tokio::spawn(async move {
-            let mut header = [0u8; 8];
-            while let Ok(_) = tcp_reader.read_exact(&mut header).await {
-                if header[0] != 3 { warn!("Invalid VNC MSG from Server: {}", header[0]); break; }
-                let len = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
-                if len > anet_common::consts::MAX_PACKET_SIZE * 2 { break; }
-
-                let mut payload = vec![0u8; len];
-                if tcp_reader.read_exact(&mut payload).await.is_err() { break; }
-
-                if let Ok(tun_data) = anet_common::transport::unwrap_packet(&cipher_rx, &payload) {
-                    if tx_in.send(tun_data).await.is_err() { break; }
+        let supervisor_abort = supervisor_task.abort_handle();
+        let shutdown_hook: ShutdownHook = Box::pin(async move {
+            supervisor_abort.abort();
+            if let Ok(mut aborts) = worker_aborts.lock() {
+                for h in aborts.drain(..) {
+                    h.abort();
                 }
             }
-            info!("[VNC proxy] Outer RX loop terminated");
         });
 
-        tokio::spawn(async move {
-            while let Some(packet) = rx_in.recv().await {
-                let framed = frame_packet(packet);
-                if tokio::io::AsyncWriteExt::write_all(&mut tunnel_write, &framed).await.is_err() { break; }
-            }
-        });
-
-        let output_stream = Arc::new(Mutex::new(client_stream));
         Ok(ConnectionResult {
-            auth_response: auth_pack,
-            vpn_stream: Box::new(MutexVpnStream(output_stream)),
+            auth_response,
+            vpn_stream: Box::new(client_stream),
             endpoint: None,
-            connection: None
+            connection: None,
+            health_pause: Some(health_pause),
+            remote_ip: Some(remote_ip), // Передаем IP в bypass
+            bypass_ips: Vec::new(),
+            effective_mode: None,
+            shutdown_hook: Some(shutdown_hook),
         })
     }
+}
+
+fn resolve_address(address: &str) -> Result<SocketAddr> {
+    address
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve VNC endpoint {address}"))?
+        .next()
+        .with_context(|| format!("VNC endpoint {address} resolved to no addresses"))
+}
+
+async fn emulate_rfb_client_handshake(stream: &mut TcpStream) -> Result<()> {
+    let mut version = [0; 12];
+    stream.read_exact(&mut version).await?;
+    ensure!(&version == RFB_VERSION, "server does not speak RFB 3.8");
+    stream.write_all(RFB_VERSION).await?;
+
+    let security_count = stream.read_u8().await?;
+    ensure!(security_count > 0, "VNC server offered no security types");
+    let mut security_types = vec![0; usize::from(security_count)];
+    stream.read_exact(&mut security_types).await?;
+    ensure!(
+        security_types.contains(&SECURITY_TYPE_NONE),
+        "VNC server did not offer the negotiated security type"
+    );
+    stream.write_u8(SECURITY_TYPE_NONE).await?;
+
+    let security_result = stream.read_u32().await?;
+    ensure!(
+        security_result == 0,
+        "VNC server rejected security negotiation"
+    );
+    stream.write_u8(1).await?;
+
+    read_server_init(stream).await
+}
+
+async fn read_server_init(stream: &mut TcpStream) -> Result<()> {
+    let mut fixed = [0; 24];
+    stream.read_exact(&mut fixed).await?;
+    let width = u16::from_be_bytes(fixed[0..2].try_into().expect("fixed-size field"));
+    let height = u16::from_be_bytes(fixed[2..4].try_into().expect("fixed-size field"));
+    ensure!(
+        width > 0 && height > 0,
+        "VNC server returned an invalid desktop size"
+    );
+
+    let name_len = u32::from_be_bytes(fixed[20..24].try_into().expect("fixed-size field")) as usize;
+    ensure!(name_len <= 1024, "VNC desktop name is too large");
+    let mut name = vec![0; name_len];
+    stream.read_exact(&mut name).await?;
+    Ok(())
+}
+
+async fn send_to_server(
+    mut tunnel_reader: ReadHalf<DuplexStream>,
+    mut frame_reader: FrameReader,
+    mut writer: WriteHalf<TcpStream>,
+    cipher: Arc<Cipher>,
+    sequence: Arc<AtomicU64>,
+    nonce_prefix: [u8; 4],
+    stealth: StealthConfig,
+    mut stop_rx: oneshot::Receiver<()>,
+) -> Result<Option<(ReadHalf<DuplexStream>, FrameReader)>> {
+    let mut rng = StdRng::from_entropy();
+    let jitter_enabled = stealth.max_jitter_ns > stealth.min_jitter_ns;
+    let mut pending = FuturesUnordered::<BoxFuture<'static, Bytes>>::new();
+    let mut input_open = true;
+
+    let mut batch_buf = BytesMut::with_capacity(CRYPTO_COALESCE_BUDGET_BYTES);
+    let mut pkt_count = 0u64;
+    let mut byte_count = 0u64;
+    let start = Instant::now();
+
+    while input_open || !pending.is_empty() {
+        let mut packet = if !jitter_enabled {
+            tokio::select! {
+                biased;
+                _ = &mut stop_rx => {
+                    let _ = writer.shutdown().await;
+                    return Ok(Some((tunnel_reader, frame_reader)));
+                }
+                pkt_res = frame_reader.read_next_packet(&mut tunnel_reader) => {
+                    match pkt_res? {
+                        Some(packet) => packet,
+                        None => return Ok(None),
+                    }
+                }
+            }
+        } else if pending.is_empty() {
+            tokio::select! {
+                biased;
+                _ = &mut stop_rx => {
+                    let _ = writer.shutdown().await;
+                    return Ok(Some((tunnel_reader, frame_reader)));
+                }
+                pkt_res = frame_reader.read_next_packet(&mut tunnel_reader) => {
+                    match pkt_res? {
+                        Some(packet) => {
+                            schedule_with_jitter(&mut pending, packet, &stealth, &mut rng);
+                            while let Some(next_pkt) = frame_reader.try_next_packet()? {
+                                schedule_with_jitter(&mut pending, next_pkt, &stealth, &mut rng);
+                            }
+                            continue;
+                        }
+                        None => {
+                            input_open = false;
+                            continue;
+                        }
+                    }
+                }
+            }
+        } else if !input_open || pending.len() >= MAX_PENDING_JITTER_PACKETS {
+            tokio::select! {
+                biased;
+                _ = &mut stop_rx => {
+                    let _ = writer.shutdown().await;
+                    return Ok(Some((tunnel_reader, frame_reader)));
+                }
+                packet = pending.next() => packet.expect("pending jitter queue is not empty"),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = &mut stop_rx => {
+                    let _ = writer.shutdown().await;
+                    return Ok(Some((tunnel_reader, frame_reader)));
+                }
+                res = frame_reader.read_next_packet(&mut tunnel_reader) => {
+                    match res? {
+                        Some(packet) => {
+                            schedule_with_jitter(&mut pending, packet, &stealth, &mut rng);
+                            while let Some(next_pkt) = frame_reader.try_next_packet()? {
+                                schedule_with_jitter(&mut pending, next_pkt, &stealth, &mut rng);
+                            }
+                            continue;
+                        }
+                        None => {
+                            input_open = false;
+                            continue;
+                        }
+                    }
+                }
+                packet = pending.next() => packet.expect("pending jitter queue is not empty"),
+            }
+        };
+
+        batch_buf.clear();
+
+        loop {
+            if packet.len() >= WRTC_MIN_IP_PACKET_LEN {
+                pkt_count += 1;
+                let seq = sequence.fetch_add(1, Ordering::Relaxed);
+                let total_len = packet.len() + TRANSPORT_ENVELOPE_OVERHEAD;
+                let padding = calculate_padding_needed(total_len, stealth.padding_step);
+                let safe_padding = if total_len + usize::from(padding) > PADDING_MTU {
+                    0
+                } else {
+                    padding
+                };
+
+                let encrypted = wrap_packet(&cipher, &nonce_prefix, seq, packet, safe_padding)?;
+
+                if let Ok(frame) = encode_cut_text(CLIENT_CUT_TEXT, &encrypted) {
+                    batch_buf.extend_from_slice(&frame);
+                }
+            }
+
+            if batch_buf.len() >= CRYPTO_COALESCE_BUDGET_BYTES {
+                break;
+            }
+
+            if !jitter_enabled {
+                match frame_reader.try_next_packet()? {
+                    Some(p) => packet = p,
+                    None => break,
+                }
+            } else {
+                match pending.next().now_or_never().flatten() {
+                    Some(p) => packet = p,
+                    None => break,
+                }
+            }
+        }
+
+        if !batch_buf.is_empty() {
+            byte_count += batch_buf.len() as u64;
+            if let Err(e) = writer.write_all(&batch_buf).await {
+                warn!(
+                    "[VNC/Tx] TCP write failed on batch ({} bytes): {e:#}. Sent so far: {} packets, {} bytes in {:.1}s",
+                    batch_buf.len(),
+                    pkt_count,
+                    byte_count,
+                    start.elapsed().as_secs_f64()
+                );
+                return Err(e.into());
+            }
+        }
+    }
+    info!(
+        "[VNC/Tx] Finished outbound stream. Total sent: {} packets, {} bytes in {:.1}s",
+        pkt_count,
+        byte_count,
+        start.elapsed().as_secs_f64()
+    );
+    writer.shutdown().await?;
+    Ok(None)
+}
+
+fn schedule_with_jitter(
+    pending: &mut FuturesUnordered<BoxFuture<'static, Bytes>>,
+    packet: Bytes,
+    stealth: &StealthConfig,
+    rng: &mut StdRng,
+) {
+    let delay = rng.gen_range(stealth.min_jitter_ns..=stealth.max_jitter_ns);
+    pending.push(
+        async move {
+            if delay > 0 {
+                sleep(Duration::from_nanos(delay)).await;
+            }
+            packet
+        }
+        .boxed(),
+    );
+}
+
+async fn receive_from_server(
+    reader: ReadHalf<TcpStream>,
+    mut tunnel_writer: WriteHalf<DuplexStream>,
+    cipher: Arc<Cipher>,
+    mut stop_rx: oneshot::Receiver<()>,
+) -> Result<Option<WriteHalf<DuplexStream>>> {
+    let mut reader = BufReader::with_capacity(64 * 1024, reader);
+    let mut write_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
+    let mut pkt_count = 0u64;
+    let mut byte_count = 0u64;
+    let start = Instant::now();
+    let mut last_rx = start;
+
+    loop {
+        let encrypted = tokio::select! {
+            biased;
+            _ = &mut stop_rx => {
+                return Ok(Some(tunnel_writer));
+            }
+            pkt_res = read_cut_text(&mut reader, SERVER_CUT_TEXT) => {
+                match pkt_res? {
+                    Some(p) => p,
+                    None => break,
+                }
+            }
+        };
+
+        write_buf.clear();
+        pkt_count += 1;
+        byte_count += encrypted.len() as u64;
+        last_rx = Instant::now();
+
+        let packet = match unwrap_packet_bytes_in_place(&cipher, encrypted) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("[VNC/Rx] Failed to unwrap/decrypt frame #{pkt_count}: {e:#}");
+                return Err(e.into());
+            }
+        };
+        frame_packet_into(&mut write_buf, &packet);
+
+        while !reader.buffer().is_empty() && write_buf.len() < COALESCE_BUDGET_BYTES {
+            match read_cut_text(&mut reader, SERVER_CUT_TEXT).await? {
+                Some(next_enc) => {
+                    pkt_count += 1;
+                    byte_count += next_enc.len() as u64;
+                    last_rx = Instant::now();
+                    let next_pkt = match unwrap_packet_bytes_in_place(&cipher, next_enc) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("[VNC/Rx] Failed to unwrap/decrypt frame #{pkt_count}: {e:#}");
+                            return Err(e.into());
+                        }
+                    };
+                    frame_packet_into(&mut write_buf, &next_pkt);
+                }
+                None => break,
+            }
+        }
+
+        tunnel_writer.write_all(&write_buf).await?;
+    }
+
+    info!(
+        "[VNC/Rx] Server closed RFB connection (clean TCP EOF / FIN). Total received: {} frames, {} bytes in {:.1}s (last frame was {:.3}s ago)",
+        pkt_count,
+        byte_count,
+        start.elapsed().as_secs_f64(),
+        last_rx.elapsed().as_secs_f64()
+    );
+    tunnel_writer.shutdown().await?;
+    Ok(None)
 }

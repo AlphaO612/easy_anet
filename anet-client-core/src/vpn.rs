@@ -1,17 +1,19 @@
 use crate::config::CoreConfig;
 use crate::events::status;
 use crate::socket::AnetUdpSocket;
-use anet_common::consts::MAX_PACKET_SIZE;
+use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::encryption::Cipher;
 use anet_common::jitter::bridge_with_jitter;
 use anet_common::protocol::AuthResponse;
-use anet_common::quic_settings::build_transport_config;
-use anet_common::stream_framing::read_next_packet;
+use anet_common::quic_settings::{
+    QUIC_UDP_SOCKET_BUFFER_SIZE, build_transport_config, tune_udp_socket_buffers,
+};
+use anet_common::stream_framing::FrameReader;
 use anyhow::Result;
 use log::{error, info};
 use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, TokioRuntime};
 use rustls::RootCertStore;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -41,8 +43,16 @@ impl VpnHandler {
             build_transport_config(&self.config.quic_transport, auth_response.mtu as u16)?;
 
         // 2. Создание сокета (AnetUdpSocket)
-        let server_addr: SocketAddr = self.config.main.address.parse()?;
-        let real_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let addr_str = self
+            .config
+            .servers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No servers defined in [[servers]]"))?
+            .endpoint()?;
+        let server_addr: SocketAddr = addr_str.to_socket_addrs()?.next().ok_or(anyhow::anyhow!("Invalid server address"))?;
+        let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+        tune_udp_socket_buffers(&udp_socket, QUIC_UDP_SOCKET_BUFFER_SIZE);
+        let real_socket = Arc::new(udp_socket);
         let cipher = Arc::new(Cipher::new(&shared_key));
         let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into()?;
 
@@ -95,8 +105,11 @@ impl VpnHandler {
         let (send_stream, mut recv_stream) = connection.open_bi().await?;
 
         // Каналы для связи с TUN (Logic <-> TUN)
-        let (tx_to_quic, rx_to_quic) = mpsc::channel(MAX_PACKET_SIZE); // TUN -> QUIC
-        let (tx_from_quic, rx_from_quic) = mpsc::channel(MAX_PACKET_SIZE); // QUIC -> TUN
+        // ИСПРАВЛЕНО: раньше здесь по опечатке стоял MAX_PACKET_SIZE (2048) —
+        // это размер пакета в байтах, а не глубина очереди. Очередь на 2048
+        // пакетов = ~3 MB / ~140 ms bufferbloat'а на 170 Mbit/s.
+        let (tx_to_quic, rx_to_quic) = mpsc::channel(CHANNEL_BUFFER_SIZE); // TUN -> QUIC
+        let (tx_from_quic, rx_from_quic) = mpsc::channel(CHANNEL_BUFFER_SIZE); // QUIC -> TUN
 
         let stealth_config = self.config.stealth.clone();
 
@@ -109,14 +122,10 @@ impl VpnHandler {
 
         // Task: QUIC -> TUN
         tokio::spawn(async move {
-            loop {
-                match read_next_packet(&mut recv_stream).await {
-                    Ok(Some(packet)) => {
-                        if tx_from_quic.send(packet).await.is_err() {
-                            break;
-                        }
-                    }
-                    _ => break,
+            let mut frame_reader = FrameReader::new();
+            while let Ok(Some(packet)) = frame_reader.read_next_packet(&mut recv_stream).await {
+                if tx_from_quic.send(packet).await.is_err() {
+                    break;
                 }
             }
             info!("[Core] QUIC RX finished.");

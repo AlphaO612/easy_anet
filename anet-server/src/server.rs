@@ -2,34 +2,54 @@ use crate::auth_handler::ServerAuthHandler;
 use crate::auth_provider::AuthProvider;
 use crate::client_registry::ClientRegistry;
 use crate::config::Config;
+use crate::control_plane::run_heartbeat;
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::TempDHInfo;
-use crate::servers::{quic, ssh, vnc};
+use crate::servers::{http_stream, imap, quic, ssh, vnc, websocket, wrtc};
+#[cfg(feature = "ebpf-shaper")]
+use crate::shaper::Shaper;
+use crate::utils::extract_ip_dst;
 
 use anet_common::atun::TunManager;
+use anet_common::boring_tls::{set_browser_profiles, set_default_tls_config};
+use anet_common::consts::CHANNEL_BUFFER_SIZE;
+use anet_common::icmp_probe::handle_in_tunnel_icmp_probe;
 use anet_common::tun_params::TunParams;
 use anyhow::Result;
 use base64::prelude::*;
+use bytes::Bytes;
 use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
-use log::error;
+use futures::future::join_all;
+use log::{error, info};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time::sleep;
 
 pub struct ANetServer {
     cfg: Arc<Config>,
     registry: Arc<ClientRegistry>,
-    temp_dh_map: Arc<DashMap<std::net::SocketAddr, TempDHInfo>>,
+    temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
     tun_manager: TunManager,
     auth_handler_core: ServerAuthHandler,
 }
 
 impl ANetServer {
     pub fn new(cfg_ref: &Config) -> Result<Self> {
+        #[cfg(not(feature = "ebpf-shaper"))]
+        if cfg_ref.shaper.enabled {
+            anyhow::bail!("shaper.enabled requires anet-server built with feature ebpf-shaper");
+        }
+        set_default_tls_config(cfg_ref.stealth.to_tls_client_config());
+        if !cfg_ref.browser_profiles.is_empty() {
+            set_browser_profiles(cfg_ref.browser_profiles.clone());
+        }
         let t_prm = TunParams {
             netmask: cfg_ref.network.mask.parse()?, gateway: cfg_ref.network.gateway.parse()?,
             address: cfg_ref.network.self_ip.parse()?, name: cfg_ref.network.if_name.clone(),
-            mtu: cfg_ref.network.mtu, network: Some(cfg_ref.network.net.parse()?),
+            mtu: cfg_ref.network.mtu.max(1420), network: Some(cfg_ref.network.net.parse()?),
         };
 
         let pl = IpPool::new(
@@ -38,21 +58,36 @@ impl ANetServer {
         );
 
         let sk_bytes = BASE64_STANDARD.decode(&cfg_ref.crypto.server_signing_key)?;
-        let sign_key = SigningKey::from_bytes(&sk_bytes.try_into().unwrap());
+        let sign_key = SigningKey::from_bytes(&sk_bytes.try_into().map_err(|_| anyhow::anyhow!("crypto.server_signing_key must decode to 32 bytes"))?);
 
-        let reg = Arc::new(ClientRegistry::new(pl));
+
+        let reg = Arc::new(
+            ClientRegistry::new(pl)
+                .with_resume_window(Duration::from_secs(cfg_ref.websocket.resume_window_secs.max(5))),
+        );
         let dh = Arc::new(DashMap::new());
 
-        let a_prov = Arc::new(AuthProvider::new(
-            cfg_ref.authentication.allowed_clients.clone(),
-            cfg_ref.authentication.auth_servers.clone(),
-            cfg_ref.authentication.auth_server_token.clone(),
-        ));
+        let node_id = (!cfg_ref.control_plane.node_id.trim().is_empty())
+            .then(|| cfg_ref.control_plane.node_id.trim().to_string());
+        let a_prov = Arc::new(
+            AuthProvider::new(
+                cfg_ref.authentication.allowed_clients.clone(),
+                cfg_ref.authentication.auth_servers.clone(),
+                cfg_ref.authentication.auth_server_token.clone(),
+            )
+            .with_node_id(node_id),
+        );
 
+        let wrtc_mtu_cap = (cfg_ref.wrtc.max_video_batch_bytes.clamp(400, 1400) + 30)
+            .max(cfg_ref.wrtc.min_tun_mtu.clamp(576, 1500) as usize)
+            .saturating_add(cfg_ref.wrtc.video_mtu_overhead as usize)
+            .min(u16::MAX as usize) as u16;
         let ac = ServerAuthHandler::new(
             reg.clone(), dh.clone(), a_prov, sign_key,
             cfg_ref.crypto.quic_cert.clone(), cfg_ref.stealth.padding_step,
-        );
+        )
+        .with_wrtc_mtu_cap(wrtc_mtu_cap)
+        .with_resume_allow_fresh_fallback(cfg_ref.websocket.resume_allow_fresh_fallback);
 
         Ok(Self { cfg: Arc::new(cfg_ref.clone()), registry: reg, temp_dh_map: dh, tun_manager: TunManager::new(t_prm)?, auth_handler_core: ac })
     }
@@ -60,31 +95,102 @@ impl ANetServer {
     pub async fn run(&mut self) -> Result<()> {
         let (tx_tun, mut rx_tun) = self.tun_manager.run().await?;
 
+        // eBPF-шейпер (per-user speed_limit) вешается на TUN только после
+        // того, как интерфейс реально поднят — имя может отличаться от
+        // запрошенного (`get_actual_name()`), если ОС его переименовала.
+        #[cfg(feature = "ebpf-shaper")]
+        if self.cfg.shaper.enabled {
+            let iface = self
+                .tun_manager
+                .get_actual_name()
+                .unwrap_or(self.cfg.network.if_name.as_str())
+                .to_string();
+            match Shaper::attach(&iface).await {
+                Ok(shaper) => self.registry.set_shaper(Arc::new(shaper)),
+                Err(e) => error!(
+                    "[Shaper] Failed to attach eBPF shaper to '{}': {}. Speed limits will not be enforced.",
+                    iface, e
+                ),
+            }
+        }
+
+        let control_config = self.cfg.control_plane.clone();
+        let control_registry = self.registry.clone();
+        tokio::spawn(async move {
+            run_heartbeat(control_config, control_registry).await;
+        });
+
         // 1. Дешифратор маршрутов: от ядра ОС к внутренним регистрам UDP/TCP транспорта
         let rx_reg = self.registry.clone();
         tokio::spawn(async move {
-            while let Some(packet) = rx_tun.recv().await {
-                if packet.len() < 20 { continue; }
-                if let Some(dst_ip) = crate::utils::extract_ip_dst(&packet) {
-                    rx_reg.route_packet_to_client(&dst_ip.to_string(), packet).await;
+            while let Some(first_pkt) = rx_tun.recv().await {
+                let mut current_pkt = Some(first_pkt);
+                let mut batch = 0usize;
+                while let Some(packet) = current_pkt.take() {
+                    if packet.len() >= 20 {
+                        if let Some(dst_ip) = extract_ip_dst(&packet) {
+                            rx_reg.route_packet_to_ipv4(dst_ip, packet).await;
+                        }
+                    }
+                    batch += 1;
+                    if batch >= 64 {
+                        break;
+                    }
+                    current_pkt = rx_tun.try_recv().ok();
                 }
             }
         });
 
         // 2. Демон очистки State (Очистка незаконченных DH транзакций по истечении тайминга)
         let gcx = self.temp_dh_map.clone();
+        let gc_registry = self.registry.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                sleep(Duration::from_secs(10)).await;
                 gcx.retain(|_, v| v.created_at.elapsed() <= Duration::from_secs(30));
+                gc_registry.cleanup_suspended().await;
+                gc_registry.cleanup_inactive_clients(30).await;
             }
         });
 
         // 3. Выборочная инъекция транспорта на основании конфигурационного манифеста
+        // Канал входящих пакетов от клиентов (все транспорты шлют сюда).
+        // Перехватываем внутритуннельные ICMP Echo Request зонды в userspace
+        // и мгновенно отправляем ICMP Echo Reply клиенту через registry.route_packet_to_client.
+        // Это гарантирует точный замер сквозного RTT на всех транспортах (WRTC/SSH/VNC/WS/AHTTP/QUIC)
+        // без зависимости от ядра ОС сервера, iptables, rp_filter или совпадения IP TUN.
+        let (client_pkt_tx, mut client_pkt_rx) =
+            mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+
+        let probe_registry = self.registry.clone();
+        let tun_writer = tx_tun.clone();
+        tokio::spawn(async move {
+            while let Some(first_pkt) = client_pkt_rx.recv().await {
+                let mut current_pkt = Some(first_pkt);
+                let mut batch = 0usize;
+                while let Some(packet) = current_pkt.take() {
+                    if let Some(reply) = handle_in_tunnel_icmp_probe(&packet) {
+                        if let Some(dst_ip) = extract_ip_dst(&reply) {
+                            probe_registry
+                                .route_packet_to_ipv4(dst_ip, reply)
+                                .await;
+                        }
+                    } else if tun_writer.send(packet).await.is_err() {
+                        return;
+                    }
+                    batch += 1;
+                    if batch >= 64 {
+                        break;
+                    }
+                    current_pkt = client_pkt_rx.try_recv().ok();
+                }
+            }
+        });
+
         let mut handle_collection = vec![];
 
         if !self.cfg.server.quic_bind_to.trim().is_empty() {
-            let t_tx = tx_tun.clone();
+            let t_tx = client_pkt_tx.clone();
             let auth = self.auth_handler_core.clone();
             let rg = self.registry.clone();
             let c = self.cfg.clone();
@@ -97,7 +203,7 @@ impl ANetServer {
         }
 
         if !self.cfg.server.ssh_bind_to.trim().is_empty() {
-            let t_tx = tx_tun.clone();
+            let t_tx = client_pkt_tx.clone();
             let auth = self.auth_handler_core.clone();
             let rg = self.registry.clone();
             let c = self.cfg.clone();
@@ -112,7 +218,7 @@ impl ANetServer {
         if !bnd_vnc.is_empty() {
             let v_cfg = self.cfg.clone();
             let v_reg = self.registry.clone();
-            let v_tx = tx_tun.clone();
+            let v_tx = client_pkt_tx.clone();
             let v_auth = self.auth_handler_core.clone();
             handle_collection.push(tokio::spawn(async move {
                 if let Err(e) = vnc::run_vnc_server(v_cfg, v_reg, v_tx, v_auth).await {
@@ -121,7 +227,73 @@ impl ANetServer {
             }));
         }
 
-        futures::future::join_all(handle_collection).await;
+        if !self.cfg.server.websocket_bind_to.trim().is_empty() {
+            let c = self.cfg.clone();
+            let rg = self.registry.clone();
+            let tx = client_pkt_tx.clone();
+            let auth = self.auth_handler_core.clone();
+            handle_collection.push(tokio::spawn(async move {
+                if let Err(e) = websocket::run_websocket_server(c, rg, tx, auth).await {
+                    error!("WebSocket interface execution halted: {}", e);
+                }
+            }));
+        }
+
+        if !self.cfg.server.ahttp_bind_to.trim().is_empty() {
+            let c = self.cfg.clone();
+            let rg = self.registry.clone();
+            let tx = client_pkt_tx.clone();
+            let auth = self.auth_handler_core.clone();
+            handle_collection.push(tokio::spawn(async move {
+                if let Err(e) = http_stream::run_http_stream_server(c, rg, tx, auth).await {
+                    error!("Fatal error: [AHTTP-Stream] Server halted: {}", e);
+                }
+            }));
+        }
+
+        if let Some(ref wrtc_url) = self.cfg.server.wrtc_room_url {
+            if !wrtc_url.trim().is_empty() {
+                let c = self.cfg.clone();
+                let rg = self.registry.clone();
+                let tx = client_pkt_tx.clone();
+                let auth = self.auth_handler_core.clone();
+                handle_collection.push(tokio::spawn(async move {
+                    if let Err(e) = wrtc::run_wrtc_server(c, rg, tx, auth).await {
+                        error!("Fatal error: [WRTC] Server halted: {}", e);
+                    }
+                }));
+            }
+        }
+
+        let effective_imap_dsn = self
+            .cfg
+            .server
+            .imap_dsn
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                self.cfg
+                    .imap
+                    .imap_dsn
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+            });
+
+        if effective_imap_dsn.is_some() {
+            let c = self.cfg.clone();
+            let rg = self.registry.clone();
+            let tx = client_pkt_tx.clone();
+            let auth = self.auth_handler_core.clone();
+            handle_collection.push(tokio::spawn(async move {
+                if let Err(e) = imap::run_imap_server(c, rg, tx, auth).await {
+                    error!("Fatal error: [IMAP] Server halted: {}", e);
+                }
+            }));
+        } else {
+            info!("[IMAP Server] IMAP transport is not configured (no imap_dsn in [server] or [imap])");
+        }
+
+        join_all(handle_collection).await;
         Ok(())
     }
 }

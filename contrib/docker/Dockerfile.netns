@@ -1,0 +1,8 @@
+FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f AS packages
+RUN apk add --no-cache --initdb --root /runtime --keys-dir /etc/apk/keys --repositories-file /etc/apk/repositories alpine-baselayout busybox iproute2 iptables nftables setpriv
+FROM scratch
+COPY --from=packages /runtime/ /
+COPY --chmod=0555 contrib/docker/prepare-tun.sh /prepare-tun.sh
+COPY --chmod=0555 contrib/docker/flow-init.sh /flow-init.sh
+USER 65532:65532
+ENTRYPOINT ["/bin/sh", "/prepare-tun.sh"]

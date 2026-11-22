@@ -1,0 +1,712 @@
+use crate::config::ConnectivityConfig;
+use crate::http_help::BrowserProfile;
+use futures::future::join_all;
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Цветовой код линейного индикатора пульса и щита состояния сети.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum PulseColor {
+    /// Красный: отсутствие связи (либо провайдер молчит, либо туннель не пропускает трафик)
+    Red = 0,
+    /// Жёлтый: частичная связность (доступен только внутренний сегмент или только узел туннеля)
+    Yellow = 1,
+    /// Зелёный: полная связность (доступны глобальные контрольные точки)
+    Green = 2,
+}
+
+impl PulseColor {
+    pub fn code(self) -> i32 {
+        self as i32
+    }
+
+    pub fn hex_color(self) -> &'static str {
+        match self {
+            PulseColor::Red => "#EF4444",
+            PulseColor::Yellow => "#F59E0B",
+            PulseColor::Green => "#22C55E",
+        }
+    }
+}
+
+/// Явная матрица из 6 состояний сетевой связности.
+/// Разделяет состояния при выключенном и включённом VPN-туннеле.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum NetworkCondition {
+    /// [0] VPN выключен: недоступны ни внешние, ни локальные контрольные точки.
+    Offline = 0,
+    /// [1] VPN выключен: внешние контрольные точки не отвечают, но локальные ресурсы доступны.
+    DomesticOnly = 1,
+    /// [2] VPN выключен: внешние контрольные точки отвечают напрямую.
+    DirectOnline = 2,
+    /// [3] VPN включён: нет отклика ни от узла туннеля (ICMP), ни от внешних контрольных точек.
+    TunnelLost = 3,
+    /// [4] VPN включён: узел туннеля отвечает (или доступны локальные точки), но внешние маршруты за ним недоступны.
+    TunnelOnlyNoWorld = 4,
+    /// [5] VPN включён: внешние контрольные точки успешно отвечают через туннель.
+    TunnelFullOnline = 5,
+}
+
+impl NetworkCondition {
+    pub fn code(self) -> i32 {
+        self as i32
+    }
+
+    pub fn pulse_color(self) -> PulseColor {
+        match self {
+            NetworkCondition::Offline | NetworkCondition::TunnelLost => PulseColor::Red,
+            NetworkCondition::DomesticOnly | NetworkCondition::TunnelOnlyNoWorld => {
+                PulseColor::Yellow
+            }
+            NetworkCondition::DirectOnline | NetworkCondition::TunnelFullOnline => {
+                PulseColor::Green
+            }
+        }
+    }
+
+    /// Возвращает заголовок и описание для виджета «Щит диагностики сети»
+    /// в нейтральной технической стилистике с лёгкой иронией.
+    pub fn describe(
+        self,
+        domestic_ok: usize,
+        domestic_total: usize,
+        global_ok: usize,
+        global_total: usize,
+    ) -> (String, String) {
+        match self {
+            NetworkCondition::Offline => (
+                "Тишина в эфире".to_string(),
+                "Провайдер ушёл в себя. Не открывается вообще ничего".to_string(),
+            ),
+            NetworkCondition::DomesticOnly => (
+                "Суверенный режим связи".to_string(),
+                format!(
+                    "Внешние маршруты приболели, живы только местные узлы ({}/{}). Включите туннель для стабилизации",
+                    domestic_ok,
+                    domestic_total.max(1)
+                ),
+            ),
+            NetworkCondition::DirectOnline => {
+                let total = global_total.max(1);
+                let subtitle = if global_ok >= total {
+                    format!(
+                        "Прямой канал дышит сам ({}/{}), глобальная сеть отвечает без костылей",
+                        global_ok, total
+                    )
+                } else {
+                    format!(
+                        "Прямой канал живой ({}/{}), основные внешние узлы отвечают",
+                        global_ok, total
+                    )
+                };
+                ("Магистраль в норме".to_string(), subtitle)
+            }
+            NetworkCondition::TunnelLost => (
+                "Канал в коме".to_string(),
+                "Туннель открыт, но пакеты уходят в небытие. Реанимируем…".to_string(),
+            ),
+            NetworkCondition::TunnelOnlyNoWorld => (
+                "Связь только до узла".to_string(),
+                "До сервера достучались, но дальше него жизни пока нет".to_string(),
+            ),
+            NetworkCondition::TunnelFullOnline => {
+                let total = global_total.max(1);
+                let subtitle = if global_ok >= total {
+                    format!(
+                        "Все внешние маршруты в строю ({}/{}). Полёт нормальный",
+                        global_ok, total
+                    )
+                } else {
+                    format!(
+                        "Внешние маршруты на связи ({}/{}). Полёт нормальный",
+                        global_ok, total
+                    )
+                };
+                ("Связь стабилизирована".to_string(), subtitle)
+            }
+        }
+    }
+}
+
+/// Полный снимок состояния связности для отображения линейного пульса и щита диагностики.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectivitySnapshot {
+    pub condition: NetworkCondition,
+    pub pulse_color: PulseColor,
+    pub vpn_connected: bool,
+    /// Итоговый пинг (в мс) для отображения на линейном индикаторе пульса:
+    /// - при активном туннеле: внутритуннельный ICMP RTT (либо HTTP RTT до внешнего узла до первого ICMP-ответа);
+    /// - без туннеля: минимальный HTTP/TCP RTT до доступной контрольной точки.
+    pub display_rtt_ms: Option<u64>,
+    pub tunnel_rtt_ms: Option<u64>,
+    pub global_rtt_ms: Option<u64>,
+    pub domestic_rtt_ms: Option<u64>,
+    pub global_ok: usize,
+    pub global_total: usize,
+    pub domestic_ok: usize,
+    pub domestic_total: usize,
+    pub title: String,
+    pub subtitle: String,
+    pub updated_at_ms: u64,
+}
+
+impl Default for ConnectivitySnapshot {
+    fn default() -> Self {
+        let condition = NetworkCondition::Offline;
+        let (title, subtitle) = condition.describe(0, 3, 0, 3);
+        Self {
+            condition,
+            pulse_color: condition.pulse_color(),
+            vpn_connected: false,
+            display_rtt_ms: None,
+            tunnel_rtt_ms: None,
+            global_rtt_ms: None,
+            domestic_rtt_ms: None,
+            global_ok: 0,
+            global_total: 3,
+            domestic_ok: 0,
+            domestic_total: 3,
+            title,
+            subtitle,
+            updated_at_ms: now_unix_ms(),
+        }
+    }
+}
+
+impl ConnectivitySnapshot {
+    /// Вычисляет состояние сети на основе статуса VPN, внутритуннельного пинга и результатов опроса контрольных точек.
+    pub fn evaluate(
+        vpn_connected: bool,
+        tunnel_rtt_ms: Option<u64>,
+        global_probe: ProbeGroupResult,
+        domestic_probe: ProbeGroupResult,
+    ) -> Self {
+        let condition = if !vpn_connected {
+            if global_probe.ok_count > 0 {
+                NetworkCondition::DirectOnline
+            } else if domestic_probe.ok_count > 0 {
+                NetworkCondition::DomesticOnly
+            } else {
+                NetworkCondition::Offline
+            }
+        } else if global_probe.ok_count > 0 {
+            NetworkCondition::TunnelFullOnline
+        } else if tunnel_rtt_ms.is_some() || domestic_probe.ok_count > 0 {
+            NetworkCondition::TunnelOnlyNoWorld
+        } else {
+            NetworkCondition::TunnelLost
+        };
+
+        let display_rtt_ms = match condition {
+            NetworkCondition::Offline | NetworkCondition::TunnelLost => None,
+            NetworkCondition::DomesticOnly => domestic_probe.min_rtt_ms,
+            NetworkCondition::DirectOnline => global_probe.min_rtt_ms.or(domestic_probe.min_rtt_ms),
+            NetworkCondition::TunnelOnlyNoWorld => {
+                tunnel_rtt_ms.or(domestic_probe.min_rtt_ms)
+            }
+            NetworkCondition::TunnelFullOnline => {
+                tunnel_rtt_ms.or(global_probe.min_rtt_ms)
+            }
+        };
+
+        let (title, subtitle) = condition.describe(
+            domestic_probe.ok_count,
+            domestic_probe.total_count,
+            global_probe.ok_count,
+            global_probe.total_count,
+        );
+
+        Self {
+            condition,
+            pulse_color: condition.pulse_color(),
+            vpn_connected,
+            display_rtt_ms,
+            tunnel_rtt_ms,
+            global_rtt_ms: global_probe.min_rtt_ms,
+            domestic_rtt_ms: domestic_probe.min_rtt_ms,
+            global_ok: global_probe.ok_count,
+            global_total: global_probe.total_count,
+            domestic_ok: domestic_probe.ok_count,
+            domestic_total: domestic_probe.total_count,
+            title,
+            subtitle,
+            updated_at_ms: now_unix_ms(),
+        }
+    }
+
+    /// Быстрое обновление внутритуннельного RTT между циклами HTTP-опроса.
+    pub fn with_updated_tunnel_rtt(&self, vpn_connected: bool, tunnel_rtt_ms: Option<u64>) -> Self {
+        let mut next = self.clone();
+        next.vpn_connected = vpn_connected;
+        next.tunnel_rtt_ms = tunnel_rtt_ms;
+        if vpn_connected {
+            if next.global_ok > 0 {
+                next.condition = NetworkCondition::TunnelFullOnline;
+                next.display_rtt_ms = tunnel_rtt_ms.or(next.global_rtt_ms);
+            } else if tunnel_rtt_ms.is_some() || next.domestic_ok > 0 {
+                next.condition = NetworkCondition::TunnelOnlyNoWorld;
+                next.display_rtt_ms = tunnel_rtt_ms.or(next.domestic_rtt_ms);
+            } else {
+                next.condition = NetworkCondition::TunnelLost;
+                next.display_rtt_ms = None;
+            }
+            next.pulse_color = next.condition.pulse_color();
+            let (title, subtitle) = next.condition.describe(
+                next.domestic_ok,
+                next.domestic_total,
+                next.global_ok,
+                next.global_total,
+            );
+            next.title = title;
+            next.subtitle = subtitle;
+        }
+        next.updated_at_ms = now_unix_ms();
+        next
+    }
+}
+
+/// Результат опроса группы контрольных точек (глобальных или локальных).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeGroupResult {
+    pub ok_count: usize,
+    pub total_count: usize,
+    pub min_rtt_ms: Option<u64>,
+}
+
+/// Кроссплатформенный пробер контрольных точек.
+/// ВАЖНО: намеренно использует обычные системные сокеты без bypass_ips / protect(fd),
+/// чтобы до включения VPN проверять физический канал провайдера, а после включения VPN —
+/// реальную проходимость трафика сквозь поднятый TUN-интерфейс.
+#[derive(Clone)]
+pub struct ConnectivityProber {
+    client: reqwest::Client,
+    profile: BrowserProfile,
+    config: ConnectivityConfig,
+}
+
+impl ConnectivityProber {
+    pub fn new(config: ConnectivityConfig) -> Self {
+        let timeout = Duration::from_millis(config.timeout_ms.clamp(500, 15_000));
+        let mut tls_cfg = crate::boring_tls::get_default_tls_config();
+        tls_cfg.verify_peer = false;
+        let profile = BrowserProfile::with_tls_config(tls_cfg);
+        let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
+
+        let client = profile
+            .build_reqwest_builder(cookie_jar.clone())
+            .and_then(|builder| {
+                Ok(builder
+                    .timeout(timeout)
+                    .connect_timeout(timeout)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .pool_max_idle_per_host(2)
+                    .pool_idle_timeout(Duration::from_secs(30))
+                    .no_proxy()
+                    .build()?)
+            })
+            .unwrap_or_else(|_| {
+                profile
+                    .build_reqwest_builder(cookie_jar)
+                    .expect("Failed to initialize BoringSSL reqwest builder")
+                    .build()
+                    .expect("Failed to build BoringSSL reqwest client")
+            });
+
+        Self {
+            client,
+            profile,
+            config,
+        }
+    }
+
+    pub fn config(&self) -> &ConnectivityConfig {
+        &self.config
+    }
+
+    /// Одновременно опрашивает все глобальные и локальные контрольные точки и возвращает сырые результаты групп.
+    pub async fn probe_groups_raw(&self) -> (ProbeGroupResult, ProbeGroupResult) {
+        tokio::join!(
+            self.probe_group(&self.config.global_targets),
+            self.probe_group(&self.config.domestic_targets),
+        )
+    }
+
+    /// Одновременно опрашивает все глобальные и локальные контрольные точки и формирует снимок состояния.
+    pub async fn probe_once(
+        &self,
+        vpn_connected: bool,
+        tunnel_rtt_ms: Option<u64>,
+    ) -> ConnectivitySnapshot {
+        let (global_res, domestic_res) = self.probe_groups_raw().await;
+
+        ConnectivitySnapshot::evaluate(vpn_connected, tunnel_rtt_ms, global_res, domestic_res)
+    }
+
+    async fn probe_group(&self, targets: &[String]) -> ProbeGroupResult {
+        if targets.is_empty() {
+            return ProbeGroupResult::default();
+        }
+
+        let per_target_timeout = Duration::from_millis(self.config.timeout_ms.clamp(800, 15_000));
+        let hard_cap = per_target_timeout + Duration::from_millis(1500);
+        let futures = targets.iter().map(|url| {
+            let client = &self.client;
+            let profile = &self.profile;
+            async move {
+                tokio::time::timeout(
+                    hard_cap,
+                    probe_single_target(client, profile, url, per_target_timeout),
+                )
+                .await
+                .ok()
+                .flatten()
+            }
+        });
+        let results = join_all(futures).await;
+
+        let mut ok_count = 0usize;
+        let mut min_rtt_ms: Option<u64> = None;
+
+        for rtt in results.into_iter().flatten() {
+            ok_count += 1;
+            min_rtt_ms = Some(match min_rtt_ms {
+                Some(prev) => prev.min(rtt),
+                None => rtt,
+            });
+        }
+
+        ProbeGroupResult {
+            ok_count,
+            total_count: targets.len(),
+            min_rtt_ms,
+        }
+    }
+}
+
+async fn probe_single_target(
+    client: &reqwest::Client,
+    profile: &BrowserProfile,
+    target: &str,
+    timeout: Duration,
+) -> Option<u64> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let primary_timeout = if trimmed.contains("gosuslugi.ru") {
+        Duration::from_millis((timeout.as_millis() as u64 / 2).clamp(900, 2000))
+    } else {
+        timeout
+    };
+
+    if let Some(rtt) = probe_url_once(client, profile, trimmed, primary_timeout).await {
+        return Some(rtt);
+    }
+
+    let fb_timeout = Duration::from_millis(1500);
+    if trimmed.contains("gosuslugi.ru") {
+        if let Some(rtt) = probe_url_once(client, profile, "https://dzen.ru/favicon.ico", fb_timeout).await {
+            return Some(rtt);
+        }
+    } else if trimmed.contains("ya.ru") {
+        if let Some(rtt) = probe_url_once(client, profile, "https://ya.ru/favicon.ico", fb_timeout).await {
+            return Some(rtt);
+        }
+    } else if trimmed.contains("vk.com") {
+        if let Some(rtt) = probe_url_once(client, profile, "https://vk.com/favicon.ico", fb_timeout).await {
+            return Some(rtt);
+        }
+    } else if trimmed.contains("dzen.ru") {
+        if let Some(rtt) = probe_url_once(client, profile, "https://max.ru/favicon.ico", fb_timeout).await {
+            return Some(rtt);
+        }
+    }
+
+    None
+}
+
+async fn probe_url_once(
+    client: &reqwest::Client,
+    profile: &BrowserProfile,
+    url: &str,
+    timeout: Duration,
+) -> Option<u64> {
+    let start = Instant::now();
+    let req = profile.apply_to_reqwest(client.get(url), None, None);
+    let resp = tokio::time::timeout(timeout, req.send()).await.ok()?.ok()?;
+
+    // Любой осмысленный HTTP-ответ от целевого сервера (2xx, 3xx, 401/403/404)
+    // подтверждает успешное прохождение DNS + TCP + TLS хендшейка.
+    // ВАЖНО: НЕ вызываем resp.bytes().await! Выкачивание 200-400 КБ HTML главных страниц
+    // ya.ru / vk.com / dzen.ru на мобильной сети 4G+ съедает весь таймаут и даёт ложный РФ 0/3.
+    let status = resp.status().as_u16();
+    drop(resp);
+    if (100..600).contains(&status) {
+        let first_ms = (start.elapsed().as_millis() as u64).max(1);
+        // Если первый запрос шёл по холодному соединению на быстром канале (90..500 мс),
+        // сразу делаем короткий повторный запрос по уже прогретому keep-alive сокету,
+        // чтобы «Пульс канала» показывал чистый 1-RTT, а не сумму 3×RTT рукопожатий.
+        // На высоколатентных транспортах (IMAP, >= 500 мс) повторный запрос пропускается,
+        // чтобы не удваивать число HTTP-запросов в туннеле.
+        if first_ms > 90 && first_ms < 500 && timeout <= Duration::from_millis(4500) {
+            let warm_started = Instant::now();
+            let warm_req = profile.apply_to_reqwest(client.get(url), None, None);
+            if let Ok(Ok(warm_resp)) =
+                tokio::time::timeout(Duration::from_millis(600), warm_req.send()).await
+            {
+                let warm_status = warm_resp.status().as_u16();
+                drop(warm_resp);
+                if (100..600).contains(&warm_status) {
+                    let warm_ms = (warm_started.elapsed().as_millis() as u64).max(1);
+                    return Some(first_ms.min(warm_ms));
+                }
+            }
+        }
+        Some(first_ms)
+    } else {
+        None
+    }
+}
+
+/// Одна точка замера скорости для построения сглаженного графика (sparkline) в карточке «СКОРОСТЬ / ТРАФИК».
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeedSample {
+    /// Входящая скорость (Download), байт/сек
+    pub rx_bps: u64,
+    /// Исходящая скорость (Upload), байт/сек
+    pub tx_bps: u64,
+}
+
+/// Снимок телеметрии скорости и трафика за сессию, готовый для прямой отрисовки в UI (Android / Desktop / iOS).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TelemetrySnapshot {
+    pub rx_bps: u64,
+    pub tx_bps: u64,
+    pub total_rx_bytes: u64,
+    pub total_tx_bytes: u64,
+    pub rtt_ms: Option<u64>,
+    pub peak_bps: u64,
+    pub rx_speed_str: String,
+    pub tx_speed_str: String,
+    pub total_rx_str: String,
+    pub total_tx_str: String,
+    /// Нормализованные точки кривой Download (`0.0..=1.0`, до 60 точек за последние 60 секунд)
+    pub rx_curve: Vec<f32>,
+    /// Нормализованные точки кривой Upload (`0.0..=1.0`, до 60 точек за последние 60 секунд)
+    pub tx_curve: Vec<f32>,
+}
+
+/// Кольцевой буфер истории скоростей (по умолчанию 60 секунд) с автоматической нормализацией кривых.
+#[derive(Debug, Clone)]
+pub struct TelemetryRingBuffer {
+    capacity: usize,
+    samples: VecDeque<SpeedSample>,
+}
+
+impl Default for TelemetryRingBuffer {
+    fn default() -> Self {
+        Self::new(60)
+    }
+}
+
+impl TelemetryRingBuffer {
+    pub fn new(capacity: usize) -> Self {
+        let cap = capacity.max(2);
+        let mut samples = VecDeque::with_capacity(cap);
+        for _ in 0..cap {
+            samples.push_back(SpeedSample::default());
+        }
+        Self {
+            capacity: cap,
+            samples,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.samples.clear();
+        for _ in 0..self.capacity {
+            self.samples.push_back(SpeedSample::default());
+        }
+    }
+
+    pub fn push_sample(
+        &mut self,
+        rx_bps: u64,
+        tx_bps: u64,
+        total_rx_bytes: u64,
+        total_tx_bytes: u64,
+        rtt_ms: Option<u64>,
+    ) -> TelemetrySnapshot {
+        if self.samples.len() >= self.capacity {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(SpeedSample { rx_bps, tx_bps });
+
+        // Независимая адаптивная нормализация для RX и TX:
+        // - нижний порог 4 КБ/с (чтобы и лёгкий сёрфинг 10–50 КБ/с, и гигабитный Speedtest отображались живо)
+        // - запас по высоте 18% (headroom 1.18x над максимумом окна), чтобы кривая не срезалась в плоский «стол» на уровне 1.0
+        // - мягкая нелинейная компрессия (gamma = 0.62), делающая колебания скорости наглядными во всём диапазоне
+        const MIN_SCALE_BPS: f64 = 4.0 * 1024.0;
+        const HEADROOM_FACTOR: f64 = 1.18;
+        const GAMMA: f64 = 0.62;
+
+        let mut max_rx: u64 = 0;
+        let mut max_tx: u64 = 0;
+        for s in &self.samples {
+            max_rx = max_rx.max(s.rx_bps);
+            max_tx = max_tx.max(s.tx_bps);
+        }
+
+        let peak_bps = max_rx.max(max_tx).max(MIN_SCALE_BPS as u64);
+        let rx_denom = ((max_rx as f64) * HEADROOM_FACTOR).max(MIN_SCALE_BPS);
+        let tx_denom = ((max_tx as f64) * HEADROOM_FACTOR).max(MIN_SCALE_BPS);
+
+        let normalize_point = |bps: u64, denom: f64| -> f32 {
+            if bps == 0 {
+                return 0.0;
+            }
+            let linear = ((bps as f64) / denom).clamp(0.0, 1.0);
+            let shaped = linear.powf(GAMMA) as f32;
+            shaped.clamp(0.02, 0.96)
+        };
+
+        let mut rx_curve = Vec::with_capacity(self.samples.len());
+        let mut tx_curve = Vec::with_capacity(self.samples.len());
+
+        for s in &self.samples {
+            rx_curve.push(normalize_point(s.rx_bps, rx_denom));
+            tx_curve.push(normalize_point(s.tx_bps, tx_denom));
+        }
+
+        TelemetrySnapshot {
+            rx_bps,
+            tx_bps,
+            total_rx_bytes,
+            total_tx_bytes,
+            rtt_ms,
+            peak_bps,
+            rx_speed_str: format_speed_ru(rx_bps),
+            tx_speed_str: format_speed_ru(tx_bps),
+            total_rx_str: format_bytes_ru(total_rx_bytes),
+            total_tx_str: format_bytes_ru(total_tx_bytes),
+            rx_curve,
+            tx_curve,
+        }
+    }
+}
+
+/// Форматирование объёма трафика (Б / КБ / МБ / ГБ).
+pub fn format_bytes_ru(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b < KIB {
+        format!("{} Б", bytes)
+    } else if b < MIB {
+        format!("{:.1} КБ", b / KIB)
+    } else if b < GIB {
+        format!("{:.2} МБ", b / MIB)
+    } else {
+        format!("{:.2} ГБ", b / GIB)
+    }
+}
+
+/// Форматирование скорости передачи данных (Б/с / КБ/с / МБ/с / ГБ/с).
+pub fn format_speed_ru(bytes_per_sec: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let bps = bytes_per_sec as f64;
+    if bps < KIB {
+        format!("{} Б/с", bytes_per_sec)
+    } else if bps < MIB {
+        format!("{:.1} КБ/с", bps / KIB)
+    } else if bps < GIB {
+        format!("{:.1} МБ/с", bps / MIB)
+    } else {
+        format!("{:.2} ГБ/с", bps / GIB)
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_six_state_matrix_evaluation() {
+        let zero = ProbeGroupResult {
+            ok_count: 0,
+            total_count: 5,
+            min_rtt_ms: None,
+        };
+        let dom_ok = ProbeGroupResult {
+            ok_count: 3,
+            total_count: 5,
+            min_rtt_ms: Some(28),
+        };
+        let glob_ok = ProbeGroupResult {
+            ok_count: 4,
+            total_count: 5,
+            min_rtt_ms: Some(64),
+        };
+
+        // 1. Offline (VPN Off, 0 global, 0 domestic)
+        let s0 = ConnectivitySnapshot::evaluate(false, None, zero, zero);
+        assert_eq!(s0.condition, NetworkCondition::Offline);
+        assert_eq!(s0.pulse_color, PulseColor::Red);
+        assert_eq!(s0.display_rtt_ms, None);
+
+        // 2. DomesticOnly (VPN Off, 0 global, >0 domestic)
+        let s1 = ConnectivitySnapshot::evaluate(false, None, zero, dom_ok);
+        assert_eq!(s1.condition, NetworkCondition::DomesticOnly);
+        assert_eq!(s1.pulse_color, PulseColor::Yellow);
+        assert_eq!(s1.display_rtt_ms, Some(28));
+
+        // 3. DirectOnline (VPN Off, >0 global)
+        let s2 = ConnectivitySnapshot::evaluate(false, None, glob_ok, dom_ok);
+        assert_eq!(s2.condition, NetworkCondition::DirectOnline);
+        assert_eq!(s2.pulse_color, PulseColor::Green);
+        assert_eq!(s2.display_rtt_ms, Some(64));
+
+        // 4. TunnelLost (VPN On, tunnel ICMP None, 0 global)
+        let s3 = ConnectivitySnapshot::evaluate(true, None, zero, zero);
+        assert_eq!(s3.condition, NetworkCondition::TunnelLost);
+        assert_eq!(s3.pulse_color, PulseColor::Red);
+        assert_eq!(s3.display_rtt_ms, None);
+
+        // 5. TunnelOnlyNoWorld (VPN On, tunnel ICMP Some(42), 0 global)
+        let s4 = ConnectivitySnapshot::evaluate(true, Some(42), zero, zero);
+        assert_eq!(s4.condition, NetworkCondition::TunnelOnlyNoWorld);
+        assert_eq!(s4.pulse_color, PulseColor::Yellow);
+        assert_eq!(s4.display_rtt_ms, Some(42));
+
+        // 6. TunnelFullOnline (VPN On, tunnel ICMP Some(55), >0 global)
+        let s5 = ConnectivitySnapshot::evaluate(true, Some(55), glob_ok, dom_ok);
+        assert_eq!(s5.condition, NetworkCondition::TunnelFullOnline);
+        assert_eq!(s5.pulse_color, PulseColor::Green);
+        assert_eq!(s5.display_rtt_ms, Some(55));
+    }
+
+    #[test]
+    fn test_telemetry_ring_buffer_normalization() {
+        let mut ring = TelemetryRingBuffer::new(4);
+        let snap = ring.push_sample(1024 * 1024, 512 * 1024, 10_000_000, 5_000_000, Some(45));
+        assert_eq!(snap.rx_curve.len(), 4);
+        assert_eq!(snap.tx_curve.len(), 4);
+        assert!(snap.rx_curve[3] > 0.80 && snap.rx_curve[3] < 0.98);
+        assert!(snap.tx_curve[3] > 0.80 && snap.tx_curve[3] < 0.98);
+    }
+}

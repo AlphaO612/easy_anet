@@ -1,0 +1,9 @@
+services:
+  network:
+    build:
+      context: ../../..
+      dockerfile: contrib/docker/Dockerfile.netns
+  server:
+    build:
+      context: ../../..
+      dockerfile: contrib/docker/Dockerfile.server

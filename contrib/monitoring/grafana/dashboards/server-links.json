@@ -1,0 +1,213 @@
+{
+  "title": "Связность серверов ANet",
+  "uid": "anet-server-links",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 4,
+      "title": "Направления межсерверных проверок",
+      "type": "nodeGraph",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "anet-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "edges",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "expr": "label_join(anet:link_available{source_node=~\"$source_node\",target_node=~\"$target_node\",module=~\"$module\",instance=~\"$instance\"} and present_over_time(probe_success{job=\"server-link\",source_node=~\"$source_node\",target_node=~\"$target_node\",module=~\"$module\",instance=~\"$instance\"}[45s]), \"id\", \"|\", \"source_node\", \"target_node\", \"module\", \"instance\")"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "source_node": "source",
+              "target_node": "target",
+              "Value": "mainstat",
+              "module": "detail__probe",
+              "instance": "detail__address"
+            },
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true
+            }
+          }
+        }
+      ],
+      "options": {
+        "edges": {
+          "mainStatUnit": "short"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Состояние связи (1 — доступна, 0 — отказ)",
+      "id": 1,
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "anet-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "anet:link_available{source_node=~\"$source_node\",target_node=~\"$target_node\",module=~\"$module\",instance=~\"$instance\"} and present_over_time(probe_success{job=\"server-link\",source_node=~\"$source_node\",target_node=~\"$target_node\",module=~\"$module\",instance=~\"$instance\"}[45s])",
+          "legendFormat": "{{source_node}} → {{target_node}} · {{module}} · {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Время пробы",
+      "id": 2,
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "anet-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "last_over_time(probe_duration_seconds{job=\"server-link\",source_node=~\"$source_node\",target_node=~\"$target_node\",module=~\"$module\",instance=~\"$instance\"}[45s])",
+          "legendFormat": "{{source_node}} → {{target_node}} · {{module}} · {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Доля неуспешных проб за 5 минут",
+      "id": 3,
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "anet-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - avg_over_time(probe_success{job=\"server-link\",source_node=~\"$source_node\",target_node=~\"$target_node\",module=~\"$module\",instance=~\"$instance\"}[5m])",
+          "legendFormat": "{{source_node}} → {{target_node}} · {{module}} · {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        }
+      }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "source_node",
+        "label": "Источник",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "anet-prometheus"
+        },
+        "query": "label_values(probe_success{job=\"server-link\"}, source_node)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "target_node",
+        "label": "Назначение",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "anet-prometheus"
+        },
+        "query": "label_values(probe_success{job=\"server-link\"}, target_node)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "module",
+        "label": "Модуль",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "anet-prometheus"
+        },
+        "query": "label_values(probe_success{job=\"server-link\"}, module)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "instance",
+        "label": "Адрес",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "anet-prometheus"
+        },
+        "query": "label_values(probe_success{job=\"server-link\"}, instance)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  }
+}

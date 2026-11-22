@@ -1,0 +1,7 @@
+services:
+  prometheus:
+    networks: [default, metrics-read]
+networks:
+  metrics-read:
+    name: ${ANET_METRICS_NETWORK:-anet-metrics-read}
+    internal: true

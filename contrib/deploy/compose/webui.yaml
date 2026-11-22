@@ -1,0 +1,70 @@
+services:
+  db:
+    image: ${POSTGRES_IMAGE:-docker.io/library/postgres:17-alpine@sha256:f9cf3e1f0066f0eb0c48707d864f0ac5941e9ff454a072077d97a4d278d07d73}
+    user: postgres
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      POSTGRES_USER: anet
+      POSTGRES_DB: anet
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    volumes: [db-data:/var/lib/postgresql/data]
+    tmpfs: [/tmp, /var/run/postgresql]
+    networks: [database]
+    mem_limit: ${DB_MEMORY:-512m}
+    cpus: ${DB_CPUS:-1}
+    pids_limit: ${ANET_PIDS:-256}
+    healthcheck:
+      test: ["CMD","pg_isready","-U","anet","-d","anet"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+  auth:
+    image: ${AUTH_IMAGE:?set AUTH_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      db: {condition: service_healthy}
+    volumes:
+      - type: bind
+        source: ${STATE_DIR:?set STATE_DIR}/auth.env
+        target: /opt/anet/.env
+        read_only: true
+        bind: {create_host_path: false}
+    environment:
+      BIND_TO: 0.0.0.0:3000
+      ANET_PUBLIC_URL: ${ANET_PUBLIC_URL:-}
+      PROVIDER_CACHE_DIR: /tmp/providers
+    tmpfs: [/tmp]
+    networks: [control, database, auth-egress]
+    mem_limit: ${AUTH_MEMORY:-512m}
+    cpus: ${AUTH_CPUS:-1}
+    pids_limit: ${ANET_PIDS:-256}
+  webui:
+    image: ${WEBUI_IMAGE:?set WEBUI_IMAGE}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      auth: {condition: service_healthy}
+    ports: ["${PANEL_BIND:-127.0.0.1}:${PANEL_PORT:-8088}:8080"]
+    tmpfs: [/tmp]
+    networks: [panel, control]
+    mem_limit: ${WEBUI_MEMORY:-128m}
+    cpus: ${WEBUI_CPUS:-0.5}
+    pids_limit: ${ANET_PIDS:-256}
+secrets:
+  db_password:
+    file: ${STATE_DIR:?set STATE_DIR}/db-password
+volumes:
+  db-data: {}
+networks:
+  database: {internal: true}
+  panel: {}
+  auth-egress: {}

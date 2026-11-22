@@ -1,0 +1,1304 @@
+use crate::wrtc::colibri::ColibriMessage;
+use crate::wrtc::jingle::{
+    JingleAction, JingleCandidate, JinglePayloadType, JingleSession, JingleTransportInfo,
+    is_valid_jvb_candidate_ip,
+};
+use crate::wrtc::stealth::generate_random_uuid_v4;
+use roxmltree::{Document, Node};
+use serde_json::Value;
+
+pub fn escape_xml_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmppIceServer {
+    pub urls: Vec<String>,
+    pub username: String,
+    pub credential: String,
+    pub host: String,
+    pub port: u16,
+    pub is_turn: bool,
+    pub is_tcp_or_tls: bool,
+    pub resolved_ips: Vec<std::net::IpAddr>,
+}
+
+#[derive(Debug, Clone)]
+pub enum InboundXmpp {
+    Open,
+    SaslMechanisms,
+    SaslSuccess,
+    SaslFailure(String),
+    Features {
+        has_bind: bool,
+        has_sm: bool,
+    },
+    BindResult {
+        id: String,
+        jid: String,
+    },
+    SmEnabled {
+        id: Option<String>,
+        resume: bool,
+    },
+    SmResumed {
+        previd: String,
+        h: u32,
+    },
+    SmRequest,
+    SmAck {
+        h: u32,
+    },
+    SmFailed,
+    Presence {
+        from: String,
+        is_unavailable: bool,
+        is_self_110: bool,
+    },
+    Ping {
+        id: String,
+        from: String,
+    },
+    DiscoInfo {
+        id: String,
+        from: String,
+        node: Option<String>,
+    },
+    JingleAck {
+        id: String,
+        from: String,
+    },
+    Jingle(JingleSession),
+    ExtdiscoServices(Vec<XmppIceServer>),
+    EndpointMessage(ColibriMessage),
+    IqOther,
+    Message,
+    Close,
+    Other,
+}
+
+impl InboundXmpp {
+    /// Возвращает `true`, если элемент является XMPP-станзой (`<iq/>`, `<presence/>`, `<message/>`),
+    /// увеличивающей счётчик входящих станз `h` по стандарту XEP-0198 (`urn:xmpp:sm:3`).
+    pub const fn is_counted_stanza(&self) -> bool {
+        matches!(
+            self,
+            Self::BindResult { .. }
+                | Self::Presence { .. }
+                | Self::Ping { .. }
+                | Self::DiscoInfo { .. }
+                | Self::JingleAck { .. }
+                | Self::Jingle(_)
+                | Self::ExtdiscoServices(_)
+                | Self::EndpointMessage(_)
+                | Self::IqOther
+                | Self::Message
+        )
+    }
+}
+
+pub fn parse_xmpp_stanzas(
+    xml: &str,
+    fallback_ip: &str,
+    fallback_port: u16,
+) -> Vec<InboundXmpp> {
+    let trimmed = xml.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let wrapped = format!(
+        r#"<stream xmlns:stream="http://etherx.jabber.org/streams">{trimmed}</stream>"#
+    );
+    let doc = match Document::parse(&wrapped) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut stanzas = Vec::new();
+    for node in doc.root_element().children().filter(|n| n.is_element()) {
+        if let Some(stanza) = parse_single_element(&node, fallback_ip, fallback_port) {
+            stanzas.push(stanza);
+        }
+    }
+    stanzas
+}
+
+pub fn parse_xmpp_message(
+    xml: &str,
+    fallback_ip: &str,
+    fallback_port: u16,
+) -> Option<InboundXmpp> {
+    parse_xmpp_stanzas(xml, fallback_ip, fallback_port).into_iter().next()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XmppElementTag {
+    Open,
+    Close,
+    Features,
+    Mechanisms,
+    Success,
+    Failure,
+    Enabled,
+    Resumed,
+    SmR,
+    SmA,
+    Failed,
+    Presence,
+    Iq,
+    Message,
+    Other,
+}
+
+impl<'a> From<&'a str> for XmppElementTag {
+    fn from(name: &'a str) -> Self {
+        match name {
+            "open" => Self::Open,
+            "close" => Self::Close,
+            "features" => Self::Features,
+            "mechanisms" => Self::Mechanisms,
+            "success" => Self::Success,
+            "failure" => Self::Failure,
+            "enabled" => Self::Enabled,
+            "resumed" => Self::Resumed,
+            "r" => Self::SmR,
+            "a" => Self::SmA,
+            "failed" => Self::Failed,
+            "presence" => Self::Presence,
+            "iq" => Self::Iq,
+            "message" => Self::Message,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IqType {
+    Get,
+    Set,
+    Result,
+    Error,
+    Other,
+}
+
+impl<'a> From<&'a str> for IqType {
+    fn from(s: &'a str) -> Self {
+        match s {
+            "get" => Self::Get,
+            "set" => Self::Set,
+            "result" => Self::Result,
+            "error" => Self::Error,
+            _ => Self::Other,
+        }
+    }
+}
+
+fn parse_single_element(
+    root: &Node,
+    fallback_ip: &str,
+    fallback_port: u16,
+) -> Option<InboundXmpp> {
+    let tag = XmppElementTag::from(root.tag_name().name());
+
+    match tag {
+        XmppElementTag::Open => Some(InboundXmpp::Open),
+        XmppElementTag::Close => Some(InboundXmpp::Close),
+        XmppElementTag::Mechanisms => Some(InboundXmpp::SaslMechanisms),
+        XmppElementTag::Features => {
+            if root.descendants().any(|n| n.has_tag_name("mechanisms")) {
+                Some(InboundXmpp::SaslMechanisms)
+            } else {
+                let has_bind = root.descendants().any(|n| n.has_tag_name("bind"));
+                let has_sm = root.descendants().any(|n| n.has_tag_name("sm"));
+                Some(InboundXmpp::Features { has_bind, has_sm })
+            }
+        }
+        XmppElementTag::Success => Some(InboundXmpp::SaslSuccess),
+        XmppElementTag::Failure => {
+            Some(InboundXmpp::SaslFailure("SASL authentication failed".to_string()))
+        }
+        XmppElementTag::Enabled => {
+            let id = root.attribute("id").map(|s| s.to_string());
+            let resume = matches!(
+                root.attribute("resume")
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .as_deref(),
+                Some("true" | "1")
+            );
+            Some(InboundXmpp::SmEnabled { id, resume })
+        }
+        XmppElementTag::Resumed => {
+            let previd = root.attribute("previd").unwrap_or_default().to_string();
+            let h = root
+                .attribute("h")
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            Some(InboundXmpp::SmResumed { previd, h })
+        }
+        XmppElementTag::SmR => Some(InboundXmpp::SmRequest),
+        XmppElementTag::SmA => {
+            let h = root
+                .attribute("h")
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            Some(InboundXmpp::SmAck { h })
+        }
+        XmppElementTag::Failed => Some(InboundXmpp::SmFailed),
+        XmppElementTag::Presence => {
+            let from = root.attribute("from").unwrap_or_default().to_string();
+            let p_type = root.attribute("type").unwrap_or_default();
+            let is_unavailable = p_type == "unavailable";
+            let is_self_110 = root.descendants().any(|n| {
+                n.has_tag_name("status") && n.attribute("code") == Some("110")
+            });
+            Some(InboundXmpp::Presence {
+                from,
+                is_unavailable,
+                is_self_110,
+            })
+        }
+        XmppElementTag::Iq => {
+            let iq_id = root.attribute("id").unwrap_or_default().to_string();
+            let from = root.attribute("from").unwrap_or_default().to_string();
+            let iq_type = IqType::from(root.attribute("type").unwrap_or_default());
+
+            if let Some(bind_node) = root.descendants().find(|n| n.has_tag_name("bind")) {
+                if let Some(jid_node) = bind_node.descendants().find(|n| n.has_tag_name("jid")) {
+                    if let Some(jid) = jid_node.text() {
+                        return Some(InboundXmpp::BindResult {
+                            id: iq_id,
+                            jid: jid.to_string(),
+                        });
+                    }
+                }
+            }
+
+            if iq_type == IqType::Get && root.descendants().any(|n| n.has_tag_name("ping")) {
+                return Some(InboundXmpp::Ping { id: iq_id, from });
+            }
+
+            if iq_type == IqType::Get {
+                if let Some(query_node) = root.descendants().find(|n| n.has_tag_name("query")) {
+                    let node = query_node.attribute("node").map(|s| s.to_string());
+                    return Some(InboundXmpp::DiscoInfo {
+                        id: iq_id,
+                        from,
+                        node,
+                    });
+                }
+            }
+
+            if let Some(jingle_node) = root.descendants().find(|n| n.has_tag_name("jingle")) {
+                if let Some(session) =
+                    parse_jingle_node(root, &jingle_node, fallback_ip, fallback_port)
+                {
+                    return Some(InboundXmpp::Jingle(session));
+                }
+            }
+
+            if let Some(services_node) = root.descendants().find(|n| n.has_tag_name("services")) {
+                let mut ice_servers = Vec::new();
+                for svc in services_node.children().filter(|n| n.has_tag_name("service")) {
+                    let svc_type = svc.attribute("type").unwrap_or_default().to_lowercase();
+                    if !matches!(svc_type.as_str(), "stun" | "stuns" | "turn" | "turns") {
+                        continue;
+                    }
+                    let Some(host_raw) = svc.attribute("host") else {
+                        continue;
+                    };
+                    let host = host_raw.trim().to_string();
+                    if host.is_empty() {
+                        continue;
+                    }
+                    let default_port = if svc_type == "turns" || svc_type == "stuns" {
+                        443
+                    } else {
+                        3478
+                    };
+                    let port = svc
+                        .attribute("port")
+                        .and_then(|p| p.trim().parse::<u16>().ok())
+                        .unwrap_or(default_port);
+                    let transport = svc
+                        .attribute("transport")
+                        .unwrap_or("udp")
+                        .trim()
+                        .to_lowercase();
+                    let username = svc.attribute("username").unwrap_or_default().to_string();
+                    let credential = svc.attribute("password").unwrap_or_default().to_string();
+
+                    let (url, is_turn, is_tcp_or_tls) = match svc_type.as_str() {
+                        "stun" => (format!("stun:{host}:{port}"), false, transport == "tcp"),
+                        "stuns" => (format!("stuns:{host}:{port}"), false, true),
+                        "turn" => {
+                            if transport == "tcp" {
+                                (format!("turn:{host}:{port}?transport=tcp"), true, true)
+                            } else {
+                                (format!("turn:{host}:{port}"), true, false)
+                            }
+                        }
+                        "turns" => {
+                            if transport == "tcp" {
+                                (format!("turns:{host}:{port}?transport=tcp"), true, true)
+                            } else {
+                                (format!("turns:{host}:{port}"), true, true)
+                            }
+                        }
+                        _ => continue,
+                    };
+
+                    let resolved_ips = host
+                        .parse::<std::net::IpAddr>()
+                        .map(|ip| vec![ip])
+                        .unwrap_or_default();
+                    ice_servers.push(XmppIceServer {
+                        urls: vec![url],
+                        username,
+                        credential,
+                        host,
+                        port,
+                        is_turn,
+                        is_tcp_or_tls,
+                        resolved_ips,
+                    });
+                }
+                if !ice_servers.is_empty() {
+                    return Some(InboundXmpp::ExtdiscoServices(ice_servers));
+                }
+            }
+
+            if iq_type == IqType::Result
+                && !iq_id.starts_with("ping_")
+                && !iq_id.starts_with("extdisco_")
+                && !iq_id.starts_with("conf_alloc_")
+                && !iq_id.starts_with("conf_post_")
+                && (iq_id.starts_with("conf_pre_")
+                    || iq_id.starts_with("accept_")
+                    || iq_id.starts_with("src_add_")
+                    || iq_id.starts_with("src_rm_")
+                    || iq_id.starts_with("term_")
+                    || from.contains("/focus"))
+            {
+                return Some(InboundXmpp::JingleAck { id: iq_id, from });
+            }
+
+            Some(InboundXmpp::IqOther)
+        }
+        XmppElementTag::Message => {
+            let from = root.attribute("from").unwrap_or_default();
+            let sender_occupant = from
+                .split_once('/')
+                .map(|(_, occ)| occ.trim().to_string())
+                .filter(|s| !s.is_empty() && s != "focus");
+            if let Some(json_node) = root
+                .children()
+                .find(|n| n.has_tag_name("json-message"))
+            {
+                if let Some(txt) = json_node.text() {
+                    let trimmed = txt.trim();
+                    if let Ok(mut c_msg) = serde_json::from_str::<ColibriMessage>(trimmed) {
+                        if c_msg.from.as_deref().unwrap_or("").is_empty() {
+                            c_msg.from = sender_occupant;
+                        }
+                        return Some(InboundXmpp::EndpointMessage(c_msg));
+                    }
+                }
+            }
+            Some(InboundXmpp::Message)
+        }
+        XmppElementTag::Other => Some(InboundXmpp::Other),
+    }
+}
+
+pub fn parse_jingle_node(
+    iq_node: &Node,
+    jingle_node: &Node,
+    fallback_ip: &str,
+    fallback_port: u16,
+) -> Option<JingleSession> {
+    let sid = jingle_node.attribute("sid")?.to_string();
+    let action = jingle_node.attribute("action")?.to_string();
+    let iq_id = iq_node.attribute("id").map(|s| s.to_string());
+    let from = iq_node.attribute("from").unwrap_or_default().to_string();
+
+    // Фильтруем Jingle-станции только от контроллера конференции Jicofo (`focus`),
+    // игнорируя P2P Jingle-офферы от обычных браузерных участников в публичных комнатах Jitsi.
+    if !from.is_empty() && !from.to_ascii_lowercase().contains("focus") {
+        log::debug!(
+            "[XMPP XML] Ignoring non-focus Jingle stanza (action={}, from={})",
+            action,
+            from
+        );
+        return None;
+    }
+
+    let reason = jingle_node
+        .children()
+        .find(|n| n.has_tag_name("reason"))
+        .map(|r_node| {
+            let text_opt = r_node
+                .children()
+                .find(|c| c.has_tag_name("text"))
+                .and_then(|t| t.text())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let code_opt = r_node
+                .children()
+                .find(|c| c.is_element() && !c.has_tag_name("text"))
+                .map(|c| c.tag_name().name().to_string());
+            match (code_opt, text_opt) {
+                (Some(code), Some(txt)) => format!("{code}: {txt}"),
+                (Some(code), None) => code,
+                (None, Some(txt)) => txt,
+                (None, None) => "unknown".to_string(),
+            }
+        });
+
+    let mut transport_info = JingleTransportInfo::default();
+    let mut sources = Vec::new();
+    let mut video_sources = Vec::new();
+    let mut video_source_owners = Vec::new();
+    let mut video_payload_type: u8 = 100;
+    let mut audio_payload_types: Vec<JinglePayloadType> = Vec::new();
+    let mut video_payload_types: Vec<JinglePayloadType> = Vec::new();
+    let mut rtx_pairs: Vec<(u32, u32)> = Vec::new();
+    let mut secondary_repair_ssrcs: Vec<u32> = Vec::new();
+    let mut has_data_channel = false;
+    let mut has_video = false;
+    let mut vp8_pt_found = false;
+
+    for content in jingle_node.children().filter(|n| n.has_tag_name("content")) {
+        let content_name = content.attribute("name").unwrap_or_default();
+        let is_video = content_name == "video";
+        let is_data = content_name == "data" || content_name == "application";
+        if is_data {
+            has_data_channel = true;
+        }
+        if is_video {
+            has_video = true;
+        }
+
+        for desc in content.children().filter(|n| n.has_tag_name("description")) {
+            if desc.tag_name().namespace() == Some("urn:xmpp:jingle:apps:sctp:1") {
+                has_data_channel = true;
+            }
+            let desc_media = desc.attribute("media").unwrap_or_default();
+            let content_is_video = is_video || desc_media == "video";
+            let content_is_audio = content_name == "audio" || desc_media == "audio";
+            if content_is_video {
+                has_video = true;
+            }
+
+            if content_is_video || content_is_audio {
+                for pt in desc.children().filter(|n| n.has_tag_name("payload-type")) {
+                    let Some(id) = pt.attribute("id").and_then(|s| s.trim().parse::<u8>().ok())
+                    else {
+                        continue;
+                    };
+                    if id == 0 {
+                        continue;
+                    }
+                    let Some(name_raw) = pt.attribute("name") else {
+                        continue;
+                    };
+                    let name = name_raw.trim().to_string();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let clock_rate = pt
+                        .attribute("clockrate")
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .unwrap_or(if content_is_video { 90000 } else { 48000 });
+                    let channels = pt
+                        .attribute("channels")
+                        .and_then(|s| s.trim().parse::<u16>().ok())
+                        .unwrap_or(if content_is_audio && name.eq_ignore_ascii_case("opus") {
+                            2
+                        } else {
+                            0
+                        });
+                    let apt = pt
+                        .children()
+                        .filter(|c| c.has_tag_name("parameter"))
+                        .find(|c| {
+                            c.attribute("name")
+                                .map(|n| n.eq_ignore_ascii_case("apt"))
+                                .unwrap_or(false)
+                        })
+                        .and_then(|c| c.attribute("value"))
+                        .and_then(|v| v.trim().parse::<u8>().ok());
+                    let mut fmtp_parts: Vec<String> = Vec::new();
+                    for c in pt.children().filter(|c| c.has_tag_name("parameter")) {
+                        let Some(p_name) = c
+                            .attribute("name")
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        else {
+                            continue;
+                        };
+                        if p_name.eq_ignore_ascii_case("apt") {
+                            continue;
+                        }
+                        let p_val = c
+                            .attribute("value")
+                            .map(|v| v.trim().trim_matches(';').trim())
+                            .unwrap_or("");
+                        if p_val.is_empty() {
+                            fmtp_parts.push(p_name.to_string());
+                        } else {
+                            fmtp_parts.push(format!("{p_name}={p_val}"));
+                        }
+                    }
+                    let fmtp = fmtp_parts.join(";");
+                    let parsed_pt = JinglePayloadType {
+                        id,
+                        name: name.clone(),
+                        clock_rate,
+                        channels,
+                        apt,
+                        fmtp,
+                    };
+                    if content_is_video {
+                        if name.eq_ignore_ascii_case("vp8") && !vp8_pt_found {
+                            video_payload_type = id;
+                            vp8_pt_found = true;
+                        }
+                        if !video_payload_types.iter().any(|p| p.id == id) {
+                            video_payload_types.push(parsed_pt);
+                        }
+                    } else if content_is_audio && !audio_payload_types.iter().any(|p| p.id == id) {
+                        audio_payload_types.push(parsed_pt);
+                    }
+                }
+            }
+
+            for grp in desc.children().filter(|n| n.has_tag_name("ssrc-group")) {
+                let semantics = grp.attribute("semantics").unwrap_or_default().trim();
+                let is_repair_group = semantics.eq_ignore_ascii_case("FID")
+                    || semantics.eq_ignore_ascii_case("FEC")
+                    || semantics.eq_ignore_ascii_case("FEC-FR");
+                if !is_repair_group {
+                    continue;
+                }
+                let grp_ssrcs: Vec<u32> = grp
+                    .children()
+                    .filter(|c| c.has_tag_name("source"))
+                    .filter_map(|c| c.attribute("ssrc")?.trim().parse::<u32>().ok())
+                    .filter(|&s| s != 0)
+                    .collect();
+                if grp_ssrcs.len() >= 2 {
+                    let primary = grp_ssrcs[0];
+                    for &repair in &grp_ssrcs[1..] {
+                        if !secondary_repair_ssrcs.contains(&repair) {
+                            secondary_repair_ssrcs.push(repair);
+                        }
+                        if semantics.eq_ignore_ascii_case("FID")
+                            && !rtx_pairs.iter().any(|&(p, r)| p == primary && r == repair)
+                        {
+                            rtx_pairs.push((primary, repair));
+                        }
+                    }
+                }
+            }
+
+            for src in desc.children().filter(|n| n.has_tag_name("source")) {
+                if let Some(ssrc_str) = src.attribute("ssrc") {
+                    if let Ok(ssrc) = ssrc_str.parse::<u32>() {
+                        if content_is_video {
+                            if !video_sources.contains(&ssrc) {
+                                video_sources.push(ssrc);
+                            }
+                            let owner_ep = src
+                                .attribute("name")
+                                .and_then(|n| n.strip_suffix("-v0"))
+                                .map(|s| s.trim().to_string())
+                                .or_else(|| {
+                                    src.children()
+                                        .find(|c| c.has_tag_name("ssrc-info"))
+                                        .and_then(|c| c.attribute("owner"))
+                                        .and_then(|o| o.rsplit('/').next())
+                                        .map(|s| s.trim().to_string())
+                                })
+                                .filter(|s| !s.is_empty() && s != "focus" && s != "jvb");
+                            if let Some(ep) = owner_ep {
+                                if !video_source_owners.iter().any(|(s, _)| *s == ssrc) {
+                                    video_source_owners.push((ssrc, ep));
+                                }
+                            }
+                        } else if !sources.contains(&ssrc) {
+                            sources.push(ssrc);
+                        }
+                    }
+                }
+            }
+        }
+
+        for transport in content.children().filter(|n| n.has_tag_name("transport")) {
+            if let Some(ufrag) = transport.attribute("ufrag") {
+                transport_info.ufrag = ufrag.to_string();
+            }
+            if let Some(pwd) = transport.attribute("pwd") {
+                transport_info.pwd = pwd.to_string();
+            }
+
+            for child in transport.children() {
+                if child.has_tag_name("fingerprint") {
+                    transport_info.fingerprint = child.text().map(|s| s.trim().to_string());
+                    transport_info.fingerprint_hash =
+                        child.attribute("hash").map(|s| s.to_string());
+                    transport_info.fingerprint_setup =
+                        child.attribute("setup").map(|s| s.to_string());
+                } else if child.has_tag_name("sctpmap") {
+                    has_data_channel = true;
+                } else if child.has_tag_name("web-socket") {
+                    transport_info.colibri_ws_url =
+                        child.attribute("url").map(|s| s.to_string());
+                } else if child.has_tag_name("candidate") {
+                    if let (Some(ip), Some(port_str)) =
+                        (child.attribute("ip"), child.attribute("port"))
+                    {
+                        if !is_valid_jvb_candidate_ip(ip) {
+                            continue;
+                        }
+                        if let Ok(port) = port_str.parse::<u16>() {
+                            let protocol =
+                                child.attribute("protocol").unwrap_or("udp").to_string();
+                            let candidate_type =
+                                child.attribute("type").unwrap_or("host").to_string();
+                            let priority = child
+                                .attribute("priority")
+                                .and_then(|p| p.parse().ok())
+                                .unwrap_or(2130706431);
+                            let foundation =
+                                child.attribute("foundation").unwrap_or("1").to_string();
+                            let component = child
+                                .attribute("component")
+                                .and_then(|c| c.parse().ok())
+                                .unwrap_or(1);
+                            let rel_addr = child
+                                .attribute("rel-addr")
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty());
+                            let rel_port = child
+                                .attribute("rel-port")
+                                .and_then(|p| p.trim().parse::<u16>().ok());
+                            let already_exists = transport_info.candidates.iter().any(|c| {
+                                c.ip == ip
+                                    && c.port == port
+                                    && c.protocol.eq_ignore_ascii_case(&protocol)
+                                    && c.component == component
+                            });
+                            if !already_exists {
+                                transport_info.candidates.push(JingleCandidate {
+                                    ip: ip.to_string(),
+                                    port,
+                                    protocol,
+                                    candidate_type,
+                                    priority,
+                                    foundation,
+                                    component,
+                                    rel_addr,
+                                    rel_port,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Поддержка http://jitsi.org/json-encoded-sources (Jicofo 1.0.1100+ упаковывает SSRCs в <json-message> внутри <jingle>)
+    for json_node in jingle_node
+        .children()
+        .filter(|n| n.has_tag_name("json-message"))
+    {
+        if let Some(txt) = json_node.text() {
+            if let Ok(val) = serde_json::from_str::<Value>(txt.trim()) {
+                if let Some(sources_obj) = val.get("sources").and_then(|v| v.as_object()) {
+                    for (ep, ep_arr) in sources_obj {
+                        if let Some(arr) = ep_arr.as_array() {
+                            if let Some(v_list) = arr.first().and_then(|v| v.as_array()) {
+                                for item in v_list {
+                                    if let Some(ssrc) = item
+                                        .get("s")
+                                        .and_then(|s| {
+                                            s.as_u64()
+                                                .or_else(|| s.as_str()?.parse::<u64>().ok())
+                                        })
+                                        .map(|s| s as u32)
+                                    {
+                                        if ssrc != 0 && !video_sources.contains(&ssrc) {
+                                            video_sources.push(ssrc);
+                                            has_video = true;
+                                        }
+                                        if ssrc != 0
+                                            && !ep.is_empty()
+                                            && !video_source_owners.iter().any(|(s, _)| *s == ssrc)
+                                        {
+                                            video_source_owners.push((ssrc, ep.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(a_list) = arr.get(2).and_then(|v| v.as_array()) {
+                                for item in a_list {
+                                    if let Some(ssrc) = item
+                                        .get("s")
+                                        .and_then(|s| {
+                                            s.as_u64()
+                                                .or_else(|| s.as_str()?.parse::<u64>().ok())
+                                        })
+                                        .map(|s| s as u32)
+                                    {
+                                        if ssrc != 0 && !sources.contains(&ssrc) {
+                                            sources.push(ssrc);
+                                        }
+                                    }
+                                }
+                            }
+                            for group_idx in [1usize, 3usize] {
+                                if let Some(g_list) =
+                                    arr.get(group_idx).and_then(|v| v.as_array())
+                                {
+                                    for grp in g_list {
+                                        let semantics = grp
+                                            .get("s")
+                                            .or_else(|| grp.get("semantics"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default()
+                                            .trim();
+                                        let is_repair = semantics.eq_ignore_ascii_case("FID")
+                                            || semantics.eq_ignore_ascii_case("FEC")
+                                            || semantics.eq_ignore_ascii_case("FEC-FR");
+                                        if !is_repair {
+                                            continue;
+                                        }
+                                        if let Some(ssrcs_arr) = grp
+                                            .get("ss")
+                                            .or_else(|| grp.get("ssrcs"))
+                                            .and_then(|v| v.as_array())
+                                        {
+                                            let parsed_ssrcs: Vec<u32> = ssrcs_arr
+                                                .iter()
+                                                .filter_map(|v| {
+                                                    v.as_u64()
+                                                        .or_else(|| {
+                                                            v.as_str()?.trim().parse::<u64>().ok()
+                                                        })
+                                                        .map(|n| n as u32)
+                                                })
+                                                .filter(|&s| s != 0)
+                                                .collect();
+                                            if parsed_ssrcs.len() >= 2 {
+                                                let primary = parsed_ssrcs[0];
+                                                for &repair in &parsed_ssrcs[1..] {
+                                                    if !secondary_repair_ssrcs.contains(&repair) {
+                                                        secondary_repair_ssrcs.push(repair);
+                                                    }
+                                                    if semantics.eq_ignore_ascii_case("FID")
+                                                        && !rtx_pairs
+                                                            .iter()
+                                                            .any(|&(p, r)| p == primary && r == repair)
+                                                    {
+                                                        rtx_pairs.push((primary, repair));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !secondary_repair_ssrcs.is_empty() {
+        sources.retain(|s| !secondary_repair_ssrcs.contains(s));
+        video_sources.retain(|s| !secondary_repair_ssrcs.contains(s));
+        video_source_owners.retain(|(s, _)| !secondary_repair_ssrcs.contains(s));
+    }
+
+    if transport_info.candidates.is_empty()
+        && JingleAction::from(action.as_str()) != JingleAction::SessionTerminate
+    {
+        transport_info.candidates.push(JingleCandidate {
+            ip: fallback_ip.to_string(),
+            port: fallback_port,
+            protocol: "udp".to_string(),
+            candidate_type: "host".to_string(),
+            priority: 2130706431,
+            foundation: "1".to_string(),
+            component: 1,
+            rel_addr: None,
+            rel_port: None,
+        });
+    }
+
+    Some(JingleSession {
+        iq_id,
+        sid,
+        from,
+        action,
+        reason,
+        transport: transport_info,
+        sources,
+        video_sources,
+        video_source_owners,
+        video_payload_type,
+        audio_payload_types,
+        video_payload_types,
+        rtx_pairs,
+        has_data_channel,
+        has_video,
+    })
+}
+
+pub struct XmppBuilder;
+
+impl XmppBuilder {
+    pub fn open() -> &'static str {
+        r#"<open to="meet.jitsi" version="1.0" xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>"#
+    }
+
+    pub fn auth_anonymous() -> &'static str {
+        r#"<auth mechanism="ANONYMOUS" xmlns="urn:ietf:params:xml:ns:xmpp-sasl"/>"#
+    }
+
+    pub fn bind_resource(id: &str) -> String {
+        format!(
+            r#"<iq type="set" id="{}" xmlns="jabber:client"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"/></iq>"#,
+            escape_xml_attr(id)
+        )
+    }
+
+    /// Включает XEP-0198 Stream Management (`urn:xmpp:sm:3`) без гибернации отсоединенных сессий (`resume="false"`),
+    /// чтобы Prosody мгновенно освобождал комнату при закрытии сокета и не оставлял неактивных участников.
+    pub fn sm_enable() -> &'static str {
+        r#"<enable xmlns="urn:xmpp:sm:3" resume="false"/>"#
+    }
+
+    /// Возобновляет прерванный XMPP-поток по `previd` и счётчику обработанных станз `h` (XEP-0198).
+    pub fn sm_resume(previd: &str, h: u32) -> String {
+        format!(
+            r#"<resume xmlns="urn:xmpp:sm:3" previd="{}" h="{h}"/>"#,
+            escape_xml_attr(previd)
+        )
+    }
+
+    /// Подтверждает количество принятых от сервера XMPP-станз `h` (XEP-0198 `<a/>`).
+    pub fn sm_ack(h: u32) -> String {
+        format!(r#"<a xmlns="urn:xmpp:sm:3" h="{h}"/>"#)
+    }
+
+    /// Запрашивает у сервера подтверждение доставленных станз (XEP-0198 `<r/>`).
+    pub fn sm_request() -> &'static str {
+        r#"<r xmlns="urn:xmpp:sm:3"/>"#
+    }
+
+    pub fn muc_presence(
+        conference_id: &str,
+        endpoint_id: &str,
+        client_name: &str,
+    ) -> String {
+        Self::muc_presence_ext(conference_id, endpoint_id, client_name, false)
+    }
+
+    pub fn muc_presence_ext(
+        conference_id: &str,
+        endpoint_id: &str,
+        client_name: &str,
+        is_ktalk: bool,
+    ) -> String {
+        let conf_esc = escape_xml_attr(conference_id);
+        let ep_esc = escape_xml_attr(endpoint_id);
+        let name_esc = escape_xml_attr(client_name);
+        // Строго валидные XEP-0115 SHA-1 ver-хэши, соответствующие ответам disco_info_result_ext:
+        // - StandardJitsi (без colibri#websocket, чтобы Jicofo включал SCTP <content name="data">):
+        //   "iq2Xb+PmZO0D5MqzDGVz03QCSB4="
+        // - KonturTalk (с поддержкой colibri#websocket):
+        //   "9A8Bz4n6d14d6299fgc9c3fceb52f9d183f023eb"
+        let caps_ver = if is_ktalk {
+            "9A8Bz4n6d14d6299fgc9c3fceb52f9d183f023eb"
+        } else {
+            "iq2Xb+PmZO0D5MqzDGVz03QCSB4="
+        };
+        format!(
+            r#"<presence to="{conf_esc}@muc.meet.jitsi/{ep_esc}" xmlns="jabber:client"><x xmlns="http://jabber.org/protocol/muc"/><nick xmlns="http://jabber.org/protocol/nick">{name_esc}</nick><c xmlns="http://jabber.org/protocol/caps" hash="sha-1" node="https://jitsi.org/jitsi-meet" ver="{caps_ver}"/><SourceInfo>{{&quot;{ep_esc}-a0&quot;:{{&quot;muted&quot;:false}},&quot;{ep_esc}-v0&quot;:{{&quot;muted&quot;:false}}}}</SourceInfo><audiomuted>false</audiomuted><videomuted>false</videomuted><videoType>camera</videoType><jitsi_participant_id>{ep_esc}</jitsi_participant_id></presence>"#
+        )
+    }
+
+    pub fn muc_leave(conference_id: &str, endpoint_id: &str) -> String {
+        let conf_esc = escape_xml_attr(conference_id);
+        let ep_esc = escape_xml_attr(endpoint_id);
+        format!(
+            r#"<presence to="{conf_esc}@muc.meet.jitsi/{ep_esc}" type="unavailable" xmlns="jabber:client"/>"#
+        )
+    }
+
+    /// Формирует XMPP MUC `<message>` с `<json-message xmlns="http://jitsi.org/jitmeet">`
+    /// для резервной доставки управляющих пакетов (`EndpointMessage`) через сигнализацию,
+    /// когда прямой Colibri WebSocket или SCTP DataChannel недоступен на сервере JVB.
+    pub fn muc_json_message(
+        conference_id: &str,
+        to_occupant: Option<&str>,
+        json_payload: &str,
+    ) -> String {
+        let conf_esc = escape_xml_attr(conference_id);
+        let payload_esc = escape_xml_attr(json_payload);
+        match to_occupant.filter(|s| !s.trim().is_empty()) {
+            Some(target) => {
+                let target_esc = escape_xml_attr(target.trim());
+                format!(
+                    r#"<message to="{conf_esc}@muc.meet.jitsi/{target_esc}" type="chat" xmlns="jabber:client"><json-message xmlns="http://jitsi.org/jitmeet">{payload_esc}</json-message></message>"#
+                )
+            }
+            None => format!(
+                r#"<message to="{conf_esc}@muc.meet.jitsi" type="groupchat" xmlns="jabber:client"><json-message xmlns="http://jitsi.org/jitmeet">{payload_esc}</json-message></message>"#
+            ),
+        }
+    }
+
+    pub fn close() -> &'static str {
+        r#"<close xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>"#
+    }
+
+    pub fn iq_result(to: &str, id: &str) -> String {
+        format!(
+            r#"<iq type="result" to="{}" id="{}" xmlns="jabber:client"/>"#,
+            escape_xml_attr(to),
+            escape_xml_attr(id)
+        )
+    }
+
+    pub fn disco_info_result(to: &str, id: &str, node: Option<&str>) -> String {
+        Self::disco_info_result_ext(to, id, node, false)
+    }
+
+    pub fn disco_info_result_ext(
+        to: &str,
+        id: &str,
+        node: Option<&str>,
+        is_ktalk: bool,
+    ) -> String {
+        let node_attr = match node {
+            Some(n) if !n.is_empty() => format!(r#" node="{}""#, escape_xml_attr(n)),
+            _ => String::new(),
+        };
+        if is_ktalk {
+            format!(
+                r#"<iq type="result" to="{to}" id="{id}" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"{node_attr}><identity category="client" type="web" name="jitsi-meet"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:transports:dtls-sctp:1"/><feature var="urn:xmpp:jingle:apps:sctp:1"/><feature var="http://jitsi.org/protocols/sctp"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="http://jitsi.org/protocols/colibri"/><feature var="http://jitsi.org/protocol/colibri#websocket"/><feature var="http://jitsi.org/receive-multiple-video-streams"/><feature var="http://jitsi.org/remb"/><feature var="http://jitsi.org/source-name"/><feature var="http://jitsi.org/tcc"/><feature var="urn:xmpp:jingle:apps:grouping:0"/><feature var="urn:ietf:rfc:3264"/><feature var="urn:ietf:rfc:4588"/><feature var="urn:ietf:rfc:5576"/><feature var="urn:ietf:rfc:5761"/><feature var="urn:ietf:rfc:5888"/><feature var="http://jabber.org/protocol/caps"/></query></iq>"#,
+                to = escape_xml_attr(to),
+                id = escape_xml_attr(id),
+                node_attr = node_attr
+            )
+        } else {
+            // Строго отсортированный набор фич lib-jitsi-meet (XEP-0115 SHA-1 ver = "iq2Xb+PmZO0D5MqzDGVz03QCSB4=")
+            // без http://jitsi.org/protocol/colibri#websocket и без ssrc-rewriting-1, чтобы стандартный Jicofo
+            // гарантированно включал SCTP DataChannel (<content name="data">) и пробрасывал SSRCs напрямую.
+            format!(
+                r#"<iq type="result" to="{to}" id="{id}" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"{node_attr}><identity category="client" type="web" name="jitsi-meet"/><feature var="http://jabber.org/protocol/caps"/><feature var="http://jabber.org/protocol/disco#info"/><feature var="http://jitsi.org/json-encoded-sources"/><feature var="http://jitsi.org/opus-red"/><feature var="http://jitsi.org/receive-multiple-video-streams"/><feature var="http://jitsi.org/remb"/><feature var="http://jitsi.org/source-name"/><feature var="http://jitsi.org/start-muted-room-metadata"/><feature var="http://jitsi.org/tcc"/><feature var="http://jitsi.org/visitors-1"/><feature var="urn:ietf:rfc:4588"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:transports:dtls-sctp:1"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/></query></iq>"#,
+                to = escape_xml_attr(to),
+                id = escape_xml_attr(id),
+                node_attr = node_attr
+            )
+        }
+    }
+
+    pub fn conference_allocation(
+        conference_id: &str,
+        endpoint_id: &str,
+        iq_id: &str,
+    ) -> String {
+        let conf_room = format!("{}@muc.meet.jitsi", escape_xml_attr(conference_id));
+        let ep_esc = escape_xml_attr(endpoint_id);
+        let id_esc = escape_xml_attr(iq_id);
+        format!(
+            r#"<iq to="focus.meet.jitsi" type="set" id="{id_esc}" xmlns="jabber:client"><conference xmlns="http://jitsi.org/protocol/focus" room="{conf_room}" machine-uid="{ep_esc}"/></iq>"#
+        )
+    }
+
+    /// Строит XML-элемент `<candidate xmlns="urn:xmpp:jingle:transports:ice-udp:1" .../>`.
+    pub fn jingle_candidate(
+        component: &str,
+        foundation: &str,
+        id: &str,
+        ip: &str,
+        port: &str,
+        priority: &str,
+        protocol: &str,
+        c_type: &str,
+        rel_addr: Option<&str>,
+        rel_port: Option<&str>,
+    ) -> String {
+        let mut rel_attr = String::new();
+        if let Some(raddr) = rel_addr {
+            rel_attr.push_str(&format!(r#" rel-addr="{}""#, escape_xml_attr(raddr)));
+        }
+        if let Some(rport) = rel_port {
+            rel_attr.push_str(&format!(r#" rel-port="{}""#, escape_xml_attr(rport)));
+        }
+        format!(
+            r#"<candidate component="{}" foundation="{}" generation="0" id="{}" ip="{}" port="{}" priority="{}" protocol="{}" type="{}"{rel_attr} network="0"/>"#,
+            escape_xml_attr(component),
+            escape_xml_attr(foundation),
+            escape_xml_attr(id),
+            escape_xml_attr(ip),
+            escape_xml_attr(port),
+            escape_xml_attr(priority),
+            escape_xml_attr(protocol),
+            escape_xml_attr(c_type)
+        )
+    }
+
+    pub fn jingle_session_accept(
+        focus_jid: &str,
+        req_id: &str,
+        my_jid: &str,
+        sid: &str,
+        ssrc: u32,
+        video_ssrc: u32,
+        video_payload_type: u8,
+        cname: &str,
+        msid: &str,
+        ufrag: &str,
+        pwd: &str,
+        fingerprint_hash: &str,
+        fingerprint: &str,
+        candidate_xml: &str,
+        include_data_content: bool,
+        include_video_content: bool,
+    ) -> String {
+        Self::jingle_session_accept_with_endpoint(
+            focus_jid,
+            req_id,
+            my_jid,
+            "",
+            sid,
+            ssrc,
+            video_ssrc,
+            video_payload_type,
+            cname,
+            msid,
+            ufrag,
+            pwd,
+            fingerprint_hash,
+            fingerprint,
+            candidate_xml,
+            include_data_content,
+            include_video_content,
+        )
+    }
+
+    pub fn jingle_session_accept_with_endpoint(
+        focus_jid: &str,
+        req_id: &str,
+        my_jid: &str,
+        endpoint_id: &str,
+        sid: &str,
+        ssrc: u32,
+        video_ssrc: u32,
+        video_payload_type: u8,
+        cname: &str,
+        msid: &str,
+        ufrag: &str,
+        pwd: &str,
+        fingerprint_hash: &str,
+        fingerprint: &str,
+        candidate_xml: &str,
+        include_data_content: bool,
+        include_video_content: bool,
+    ) -> String {
+        let vtrack_id = generate_random_uuid_v4();
+        let atrack_id = generate_random_uuid_v4();
+        let ep_clean = if !endpoint_id.trim().is_empty() {
+            escape_xml_attr(endpoint_id.trim())
+        } else {
+            escape_xml_attr(
+                my_jid
+                    .split('@')
+                    .next()
+                    .and_then(|u| u.split('-').next())
+                    .unwrap_or("peer"),
+            )
+        };
+        let audio_src_name_attr = format!(r#" name="{ep_clean}-a0""#);
+        let video_src_name_attr = format!(r#" name="{ep_clean}-v0" videoType="camera""#);
+
+        let video_section = if include_video_content && video_ssrc != 0 {
+            let pt = if video_payload_type != 0 {
+                video_payload_type
+            } else {
+                100
+            };
+            let rtcp_fb = r#"<rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="goog-remb"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="ccm" subtype="fir"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="nack"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="nack" subtype="pli"/>"#;
+            format!(
+                r#"<content creator="initiator" name="video" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="video"><payload-type id="{pt}" name="VP8" clockrate="90000">{rtcp_fb}</payload-type><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{video_ssrc}"{video_src_name_attr}><ssrc-info xmlns="http://jitsi.org/jitmeet" owner="{ep_clean}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} {vtrack_id}"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content>"#,
+                ufrag = escape_xml_attr(ufrag),
+                pwd = escape_xml_attr(pwd),
+                fingerprint_hash = escape_xml_attr(fingerprint_hash),
+                fingerprint = escape_xml_attr(fingerprint),
+                candidate_xml = candidate_xml,
+                video_ssrc = video_ssrc,
+                video_src_name_attr = video_src_name_attr,
+                ep_clean = ep_clean,
+                cname = escape_xml_attr(cname),
+                msid = escape_xml_attr(msid),
+                vtrack_id = vtrack_id,
+                pt = pt,
+                rtcp_fb = rtcp_fb,
+            )
+        } else {
+            String::new()
+        };
+
+        let data_section = if include_data_content {
+            format!(
+                r#"<content creator="initiator" name="data" senders="both"><description xmlns="urn:xmpp:jingle:apps:sctp:1"><payload-type id="5000"/></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint><sctpmap xmlns="urn:xmpp:jingle:transports:dtls-sctp:1" number="5000" protocol="webrtc-datachannel" streams="1024"/>{candidate_xml}</transport></content>"#,
+                ufrag = escape_xml_attr(ufrag),
+                pwd = escape_xml_attr(pwd),
+                fingerprint_hash = escape_xml_attr(fingerprint_hash),
+                fingerprint = escape_xml_attr(fingerprint),
+                candidate_xml = candidate_xml
+            )
+        } else {
+            String::new()
+        };
+
+        let mut group_contents = String::from(r#"<content name="audio"/>"#);
+        if include_video_content && video_ssrc != 0 {
+            group_contents.push_str(r#"<content name="video"/>"#);
+        }
+        if include_data_content {
+            group_contents.push_str(r#"<content name="data"/>"#);
+        }
+        let group_section = format!(
+            r#"<group xmlns="urn:xmpp:jingle:apps:grouping:0" semantics="BUNDLE">{group_contents}</group>"#
+        );
+
+        format!(
+            r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" initiator="{init}" responder="{resp}" sid="{sid}">{group_section}<content creator="initiator" name="audio" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><payload-type id="111" name="opus" clockrate="48000" channels="2"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"{audio_src_name_attr}><ssrc-info xmlns="http://jitsi.org/jitmeet" owner="{ep_clean}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} {atrack_id}"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fp_hash}" setup="active">{fp}</fingerprint>{candidate_xml}</transport></content>{video_section}{data_section}</jingle></iq>"#,
+            to = escape_xml_attr(focus_jid),
+            id = escape_xml_attr(req_id),
+            init = escape_xml_attr(focus_jid),
+            resp = escape_xml_attr(my_jid),
+            sid = escape_xml_attr(sid),
+            group_section = group_section,
+            ssrc = ssrc,
+            audio_src_name_attr = audio_src_name_attr,
+            ep_clean = ep_clean,
+            cname = escape_xml_attr(cname),
+            msid = escape_xml_attr(msid),
+            atrack_id = atrack_id,
+            ufrag = escape_xml_attr(ufrag),
+            pwd = escape_xml_attr(pwd),
+            fp_hash = escape_xml_attr(fingerprint_hash),
+            fp = escape_xml_attr(fingerprint),
+            candidate_xml = candidate_xml,
+            video_section = video_section,
+            data_section = data_section
+        )
+    }
+
+    pub fn jingle_source_remove(
+        focus_jid: &str,
+        req_id: &str,
+        my_jid: &str,
+        sid: &str,
+        ssrc: u32,
+        video_ssrc: u32,
+    ) -> String {
+        let audio_content = if ssrc != 0 {
+            format!(
+                r#"<content creator="initiator" name="audio"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"/></description></content>"#
+            )
+        } else {
+            String::new()
+        };
+        let video_content = if video_ssrc != 0 {
+            format!(
+                r#"<content creator="initiator" name="video"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="video"><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{video_ssrc}"/></description></content>"#
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="source-remove" initiator="{init}" responder="{resp}" sid="{sid}">{audio_content}{video_content}</jingle></iq>"#,
+            to = escape_xml_attr(focus_jid),
+            id = escape_xml_attr(req_id),
+            init = escape_xml_attr(focus_jid),
+            resp = escape_xml_attr(my_jid),
+            sid = escape_xml_attr(sid),
+            audio_content = audio_content,
+            video_content = video_content,
+        )
+    }
+
+    pub fn jingle_session_terminate(
+        focus_jid: &str,
+        req_id: &str,
+        my_jid: &str,
+        sid: &str,
+    ) -> String {
+        format!(
+            r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="session-terminate" initiator="{init}" responder="{resp}" sid="{sid}"><reason><success/></reason></jingle></iq>"#,
+            to = escape_xml_attr(focus_jid),
+            id = escape_xml_attr(req_id),
+            init = escape_xml_attr(focus_jid),
+            resp = escape_xml_attr(my_jid),
+            sid = escape_xml_attr(sid),
+        )
+    }
+
+    pub fn jingle_source_add(
+        focus_jid: &str,
+        req_id: &str,
+        sid: &str,
+        ssrc: u32,
+        cname: &str,
+        msid: &str,
+    ) -> String {
+        let atrack_id = generate_random_uuid_v4();
+        format!(
+            r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="source-add" initiator="{init}" sid="{sid}"><content name="audio"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter name="cname" value="{cname}"/><parameter name="msid" value="{msid} {atrack_id}"/></source></description></content></jingle></iq>"#,
+            to = escape_xml_attr(focus_jid),
+            id = escape_xml_attr(req_id),
+            init = escape_xml_attr(focus_jid),
+            sid = escape_xml_attr(sid),
+            ssrc = ssrc,
+            cname = escape_xml_attr(cname),
+            msid = escape_xml_attr(msid),
+            atrack_id = atrack_id
+        )
+    }
+
+    pub fn ping(to: &str, id: &str) -> String {
+        format!(
+            r#"<iq to="{}" type="get" id="{}" xmlns="jabber:client"><ping xmlns="urn:xmpp:ping"/></iq>"#,
+            escape_xml_attr(to),
+            escape_xml_attr(id)
+        )
+    }
+
+    pub fn extdisco_services(id: &str) -> String {
+        format!(
+            r#"<iq to="meet.jitsi" type="get" id="{}" xmlns="jabber:client"><services xmlns="urn:xmpp:extdisco:2"/></iq>"#,
+            escape_xml_attr(id)
+        )
+    }
+}

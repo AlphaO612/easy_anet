@@ -1,0 +1,704 @@
+use std::collections::HashMap;
+use crate::api::api::{generate_node_token, hash_node_token, node_token_is_valid, validate_admin_session};
+use crate::api::dto::{AdminToken, CreateAdmissionCommandRequest, CreateNodeCommandResponse, CreateServerRequest, GetNodeCommandStatusResponse, GetNodeCommandsResponse, GetServersResponse, NodeCommandResultResponse, NodeCommandResultRequest, NodeCommandStatusDto, NodeCredentialDto, RotateNodeCredentialResponse, ServerDto, NodeRuntimeDto, NodeCommand, NodeHeartbeatResponse};
+use crate::entities::{node_commands, node_runtime_states, servers};
+use chrono::{NaiveDateTime, Utc};
+use log::info;
+use poem_openapi::{param::Query, payload::Json, OpenApi};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, Set, QueryFilter, QueryOrder
+};
+use uuid::Uuid;
+use anet_common::dto::NodeHeartbeatRequest;
+
+pub struct ServersApi {
+    pub db: DatabaseConnection,
+}
+
+
+fn validate_server_urls(
+    address: &str,
+    websocket_url: &Option<String>,
+    ahttp_url: &Option<String>,
+    wrtc_url: &Option<String>,
+) -> Result<(), String> {
+    if !address.is_empty() {
+        if !address.is_ascii() {
+            return Err(format!("Адрес '{}' содержит недопустимые (не латинские) символы", address));
+        }
+        let fake_url = format!("http://{}", address);
+        if fake_url.parse::<poem::http::Uri>().is_err() {
+            return Err(format!("Некорректный формат адреса: '{}'", address));
+        }
+    }
+    
+    if let Some(ws) = websocket_url {
+        if !ws.trim().is_empty() {
+            if !ws.is_ascii() {
+                return Err(format!("Websocket URL '{}' содержит недопустимые (не латинские) символы", ws));
+            }
+            let parsed = ws.parse::<poem::http::Uri>().map_err(|e| format!("Некорректный Websocket URL '{}': {}", ws, e))?;
+            let scheme = parsed.scheme_str().unwrap_or("");
+            if scheme != "ws" && scheme != "wss" {
+                return Err(format!("Неподдерживаемый протокол '{}' для Websocket URL. Ожидается ws:// или wss://", scheme));
+            }
+        }
+    }
+
+    if let Some(ahttp) = ahttp_url {
+        if !ahttp.trim().is_empty() {
+            if !ahttp.is_ascii() {
+                return Err(format!("AHTTP URL '{}' содержит недопустимые (не латинские) символы", ahttp));
+            }
+            let parsed = ahttp.parse::<poem::http::Uri>().map_err(|e| format!("Некорректный AHTTP URL '{}': {}", ahttp, e))?;
+            let scheme = parsed.scheme_str().unwrap_or("");
+            if scheme != "http" && scheme != "https" {
+                return Err(format!("Неподдерживаемый протокол '{}' для AHTTP URL. Ожидается http:// или https://", scheme));
+            }
+        }
+    }
+
+    if let Some(wrtc) = wrtc_url {
+        if !wrtc.trim().is_empty() {
+            if !wrtc.is_ascii() {
+                return Err(format!("WRTC URL '{}' содержит недопустимые (не латинские) символы", wrtc));
+            }
+            let parsed = wrtc.parse::<poem::http::Uri>().map_err(|e| format!("Некорректный WRTC URL '{}': {}", wrtc, e))?;
+            let scheme = parsed.scheme_str().unwrap_or("");
+            if scheme != "wrtc" && scheme != "http" && scheme != "https" {
+                return Err(format!("Неподдерживаемый протокол '{}' для WRTC URL. Ожидается wrtc://, https:// или http://", scheme));
+            }
+            if parsed.host().is_none() {
+                return Err(format!("WRTC URL '{}' не содержит хост", wrtc));
+            }
+            let path = parsed.path().trim_start_matches('/');
+            if path.is_empty() {
+                return Err(format!("WRTC URL '{}' не содержит имя комнаты (room)", wrtc));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[OpenApi]
+impl ServersApi {
+    /// Регистрация нового физического VPN-сервера (ноды) в системе
+    #[oai(path = "/servers", method = "post")]
+    async fn create_server(
+        &self,
+        auth: AdminToken,
+        req: Json<CreateServerRequest>,
+    ) -> poem::Result<Json<ServerDto>, poem::Error> {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return Err(poem::Error::from_string(
+                err,
+                poem::http::StatusCode::UNAUTHORIZED,
+            ));
+        }
+
+        if let Err(err) = validate_server_urls(&req.0.address, &req.0.websocket_url, &req.0.ahttp_url, &req.0.wrtc_url) {
+            return Err(poem::Error::from_string(
+                err,
+                poem::http::StatusCode::BAD_REQUEST,
+            ));
+        }
+
+        let server_id = Uuid::new_v4();
+        let new_server = servers::ActiveModel {
+            id: Set(server_id),
+            name: Set(req.0.name.clone()),
+            address: Set(req.0.address.clone()),
+            public_key: Set(req.0.public_key.clone()),
+            quic_port: Set(req.0.quic_port),
+            ssh_port: Set(req.0.ssh_port),
+            vnc_port: Set(req.0.vnc_port),
+            websocket_url: Set(req.0.websocket_url.clone()),
+            ahttp_url: Set(req.0.ahttp_url.clone()),
+            wrtc_url: Set(req.0.wrtc_url.clone()),
+            wrtc_mode: Set(req.0.wrtc_mode.clone()),
+            ssh_user: Set(req.0.ssh_user.clone()),
+            is_active: Set(req.0.is_active.unwrap_or(true)),
+            control_token_hash: Set(None),
+            enrollment_token_hash: Set(None),
+            enrollment_expires_at: Set(None),
+            probe_revision: Set(0),
+            probe_manifest: Set(None),
+            probe_applied: Set(0),
+            probe_error: Set(None),
+            created_at: Set(Utc::now().naive_utc()),
+            updated_at: Set(Utc::now().naive_utc()),
+        };
+
+        match new_server.insert(&self.db).await {
+            Ok(saved) => Ok(Json(ServerDto {
+                id: saved.id,
+                name: saved.name,
+                address: saved.address,
+                public_key: saved.public_key,
+                quic_port: saved.quic_port,
+                ssh_port: saved.ssh_port,
+                vnc_port: saved.vnc_port,
+                websocket_url: saved.websocket_url,
+                ahttp_url: saved.ahttp_url,
+                wrtc_url: saved.wrtc_url,
+                wrtc_mode: saved.wrtc_mode,
+                ssh_user: saved.ssh_user,
+                is_active: saved.is_active,
+                has_control_credential: saved.control_token_hash.is_some(),
+                runtime: None,
+            })),
+            Err(e) => Err(poem::error::InternalServerError(e)),
+        }
+    }
+
+    /// Настройки сервера: Обновление параметров, портов и статуса активности (PATCH)
+    #[oai(path = "/servers/:id", method = "patch")]
+    async fn update_server(
+        &self,
+        auth: AdminToken,
+        id: poem_openapi::param::Path<Uuid>,
+        req: Json<crate::api::dto::UpdateServerRequest>,
+    ) -> crate::api::dto::UpdateServerApiResult {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return crate::api::dto::UpdateServerApiResult::Unauthorized(Json(err));
+        }
+
+        let addr = req.0.address.clone().unwrap_or_default();
+        let ws_url = req.0.websocket_url.clone().flatten();
+        let ahttp_url = req.0.ahttp_url.clone().flatten();
+        let wrtc_url = req.0.wrtc_url.clone().flatten();
+        if let Err(err) = validate_server_urls(&addr, &ws_url, &ahttp_url, &wrtc_url) {
+            return crate::api::dto::UpdateServerApiResult::BadRequest(Json(err));
+        }
+
+        let server_model = match servers::Entity::find_by_id(id.0).one(&self.db).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return crate::api::dto::UpdateServerApiResult::NotFound(Json("Сервер не найден".to_string()));
+            }
+            Err(e) => return crate::api::dto::UpdateServerApiResult::Error(Json(e.to_string())),
+        };
+
+        let mut active_model = server_model.clone().into_active_model();
+        let mut changed = false;
+
+        if let Some(name) = req.0.name {
+            active_model.name = Set(name);
+            changed = true;
+        }
+        if let Some(address) = req.0.address {
+            active_model.address = Set(address);
+            changed = true;
+        }
+        if let Some(pub_key) = req.0.public_key {
+            active_model.public_key = Set(pub_key);
+            changed = true;
+        }
+        if let Some(quic_port) = req.0.quic_port {
+            active_model.quic_port = Set(quic_port);
+            changed = true;
+        }
+        if let Some(ssh_port) = req.0.ssh_port {
+            active_model.ssh_port = Set(ssh_port);
+            changed = true;
+        }
+        if let Some(vnc_port) = req.0.vnc_port {
+            active_model.vnc_port = Set(vnc_port);
+            changed = true;
+        }
+        if let Some(websocket_url) = req.0.websocket_url {
+            active_model.websocket_url = Set(websocket_url);
+            changed = true;
+        }
+        if let Some(user) = req.0.ssh_user {
+            active_model.ssh_user = Set(user);
+            changed = true;
+        }
+        if let Some(is_active) = req.0.is_active {
+            active_model.is_active = Set(is_active);
+            changed = true;
+        }
+        if let Some(ahttp_url) = req.0.ahttp_url {
+            active_model.ahttp_url = Set(ahttp_url);
+            changed = true;
+        }
+        if let Some(wrtc_url) = req.0.wrtc_url {
+            active_model.wrtc_url = Set(wrtc_url);
+            changed = true;
+        }
+        if let Some(wrtc_mode) = req.0.wrtc_mode {
+            active_model.wrtc_mode = Set(wrtc_mode);
+            changed = true;
+        }
+
+        if changed {
+            active_model.updated_at = Set(Utc::now().naive_utc());
+            match active_model.update(&self.db).await {
+                Ok(saved) => crate::api::dto::UpdateServerApiResult::Ok(Json(ServerDto {
+                    id: saved.id,
+                    name: saved.name,
+                    address: saved.address,
+                    public_key: saved.public_key,
+                    quic_port: saved.quic_port,
+                    ssh_port: saved.ssh_port,
+                    vnc_port: saved.vnc_port,
+                    websocket_url: saved.websocket_url,
+                    ahttp_url: saved.ahttp_url,
+                    wrtc_url: saved.wrtc_url,
+                    wrtc_mode: saved.wrtc_mode,
+                    ssh_user: saved.ssh_user,
+                    is_active: saved.is_active,
+                    has_control_credential: saved.control_token_hash.is_some(),
+                    runtime: None,
+                })),
+                Err(e) => crate::api::dto::UpdateServerApiResult::Error(Json(e.to_string())),
+            }
+        } else {
+            crate::api::dto::UpdateServerApiResult::Ok(Json(ServerDto {
+                id: server_model.id,
+                name: server_model.name,
+                address: server_model.address,
+                public_key: server_model.public_key,
+                quic_port: server_model.quic_port,
+                ssh_port: server_model.ssh_port,
+                vnc_port: server_model.vnc_port,
+                websocket_url: server_model.websocket_url,
+                ahttp_url: server_model.ahttp_url,
+                wrtc_url: server_model.wrtc_url,
+                wrtc_mode: server_model.wrtc_mode,
+                ssh_user: server_model.ssh_user,
+                is_active: server_model.is_active,
+                has_control_credential: server_model.control_token_hash.is_some(),
+                runtime: None,
+            }))
+        }
+    }
+
+    /// Получить список всех зарегистрированных VPN-нод
+    #[oai(path = "/servers", method = "get")]
+    async fn get_servers(&self, auth: AdminToken) -> GetServersResponse {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return GetServersResponse::Unauthorized(Json(err));
+        }
+
+        match servers::Entity::find().all(&self.db).await {
+            Ok(list) => {
+                let runtime_by_server: HashMap<Uuid, node_runtime_states::Model> =
+                    match node_runtime_states::Entity::find().all(&self.db).await {
+                        Ok(states) => states
+                            .into_iter()
+                            .map(|state| (state.server_id, state))
+                            .collect(),
+                        Err(e) => return GetServersResponse::Error(Json(e.to_string())),
+                    };
+                let now = Utc::now().naive_utc();
+                let dtos = list
+                    .into_iter()
+                    .map(|s| ServerDto {
+                        runtime: runtime_by_server.get(&s.id).map(|state| NodeRuntimeDto {
+                            status: if now.signed_duration_since(state.last_seen_at).num_seconds()
+                                <= 45
+                            {
+                                "online".to_string()
+                            } else {
+                                "offline".to_string()
+                            },
+                            last_seen_at: state.last_seen_at.and_utc().to_rfc3339(),
+                            version: state.version.clone(),
+                            uptime_seconds: state.uptime_seconds.max(0) as i64,
+                            active_connections: state.active_connections.max(0) as i64,
+                            accepting_connections: state.accepting_connections,
+                        }),
+                        id: s.id,
+                        name: s.name,
+                        address: s.address,
+                        public_key: s.public_key,
+                        quic_port: s.quic_port,
+                        ssh_port: s.ssh_port,
+                        vnc_port: s.vnc_port,
+                        websocket_url: s.websocket_url,
+                        ahttp_url: s.ahttp_url,
+                        wrtc_url: s.wrtc_url,
+                        wrtc_mode: s.wrtc_mode,
+                        ssh_user: s.ssh_user,
+                        is_active: s.is_active,
+                        has_control_credential: s.control_token_hash.is_some(),
+                    })
+                    .collect();
+                GetServersResponse::Ok(Json(dtos))
+            }
+            Err(e) => GetServersResponse::Error(Json(e.to_string())),
+        }
+    }
+
+    /// Поставить в очередь команду включения или выключения новых подключений.
+    #[oai(path = "/servers/:id/commands/admission", method = "post")]
+    async fn create_admission_command(
+        &self,
+        auth: AdminToken,
+        id: poem_openapi::param::Path<Uuid>,
+        req: Json<CreateAdmissionCommandRequest>,
+    ) -> CreateNodeCommandResponse {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return CreateNodeCommandResponse::Unauthorized(Json(err));
+        }
+        match servers::Entity::find_by_id(id.0).one(&self.db).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return CreateNodeCommandResponse::NotFound(Json("Node not found".to_string()));
+            }
+            Err(e) => return CreateNodeCommandResponse::Error(Json(e.to_string())),
+        }
+
+        let command_id = Uuid::new_v4();
+        let command = node_commands::ActiveModel {
+            id: Set(command_id),
+            server_id: Set(id.0),
+            command_type: Set("set_accepting_connections".to_string()),
+            accepting_connections: Set(Some(req.0.accepting_connections)),
+            status: Set("pending".to_string()),
+            created_at: Set(Utc::now().naive_utc()),
+            started_at: Set(None),
+            completed_at: Set(None),
+            error: Set(None),
+            target_fingerprint: Set(None),
+        };
+        match command.insert(&self.db).await {
+            Ok(saved) => CreateNodeCommandResponse::Created(Json(NodeCommand {
+                command_id: saved.id.to_string(),
+                command_type: saved.command_type,
+                accepting_connections: saved.accepting_connections,
+                target_fingerprint: saved.target_fingerprint,
+            })),
+            Err(e) => CreateNodeCommandResponse::Error(Json(e.to_string())),
+        }
+    }
+
+    /// Получить состояние ранее поставленной управляющей команды.
+    #[oai(path = "/servers/:server_id/commands/:command_id", method = "get")]
+    async fn get_node_command_status(
+        &self,
+        auth: AdminToken,
+        server_id: poem_openapi::param::Path<Uuid>,
+        command_id: poem_openapi::param::Path<Uuid>,
+    ) -> GetNodeCommandStatusResponse {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return GetNodeCommandStatusResponse::Unauthorized(Json(err));
+        }
+
+        match node_commands::Entity::find_by_id(command_id.0)
+            .one(&self.db)
+            .await
+        {
+            Ok(Some(command)) if command.server_id == server_id.0 => {
+                GetNodeCommandStatusResponse::Ok(Json(NodeCommandStatusDto {
+                    command_id: command.id,
+                    server_id: command.server_id,
+                    command_type: command.command_type,
+                    status: command.status,
+                    accepting_connections: command.accepting_connections,
+                    created_at: command.created_at.and_utc().to_rfc3339(),
+                    started_at: command.started_at.map(|value| value.and_utc().to_rfc3339()),
+                    completed_at: command
+                        .completed_at
+                        .map(|value| value.and_utc().to_rfc3339()),
+                    error: command.error,
+                }))
+            }
+            Ok(Some(_)) | Ok(None) => {
+                GetNodeCommandStatusResponse::NotFound(Json("Command not found".to_string()))
+            }
+            Err(e) => GetNodeCommandStatusResponse::Error(Json(e.to_string())),
+        }
+    }
+
+    /// Выпустить новый индивидуальный credential ноды. Секрет возвращается только один раз.
+    #[oai(path = "/servers/:id/credentials", method = "post")]
+    async fn rotate_node_credential(
+        &self,
+        auth: AdminToken,
+        id: poem_openapi::param::Path<Uuid>,
+    ) -> RotateNodeCredentialResponse {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return RotateNodeCredentialResponse::Unauthorized(Json(err));
+        }
+
+        let node = match servers::Entity::find_by_id(id.0).one(&self.db).await {
+            Ok(Some(node)) => node,
+            Ok(None) => {
+                return RotateNodeCredentialResponse::NotFound(Json("Node not found".to_string()));
+            }
+            Err(e) => return RotateNodeCredentialResponse::Error(Json(e.to_string())),
+        };
+        let token = generate_node_token();
+        let mut active = node.into_active_model();
+        active.control_token_hash = Set(Some(hash_node_token(&token)));
+        active.enrollment_token_hash = Set(None);
+        active.enrollment_expires_at = Set(None);
+        active.updated_at = Set(Utc::now().naive_utc());
+        match active.update(&self.db).await {
+            Ok(_) => RotateNodeCredentialResponse::Ok(Json(NodeCredentialDto {
+                node_id: id.0,
+                token,
+            })),
+            Err(e) => RotateNodeCredentialResponse::Error(Json(e.to_string())),
+        }
+    }
+
+    /// Issue a one-use invitation. A replacement expires the previous invitation.
+    #[oai(path = "/servers/:id/invitations", method = "post")]
+    async fn invite_node(
+        &self,
+        auth: AdminToken,
+        id: poem_openapi::param::Path<Uuid>,
+    ) -> RotateNodeCredentialResponse {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return RotateNodeCredentialResponse::Unauthorized(Json(err));
+        }
+        let token = generate_node_token();
+        let expires_at = Utc::now().naive_utc() + chrono::Duration::minutes(15);
+        let result = servers::Entity::update_many()
+            .col_expr(servers::Column::EnrollmentTokenHash, sea_orm::sea_query::Expr::value(hash_node_token(&token)))
+            .col_expr(servers::Column::EnrollmentExpiresAt, sea_orm::sea_query::Expr::value(expires_at))
+            .filter(servers::Column::Id.eq(id.0))
+            .exec(&self.db)
+            .await;
+        match result {
+            Ok(update) if update.rows_affected == 1 => RotateNodeCredentialResponse::Ok(Json(NodeCredentialDto { node_id: id.0, token })),
+            Ok(_) => RotateNodeCredentialResponse::NotFound(Json("Node not found".into())),
+            Err(err) => RotateNodeCredentialResponse::Error(Json(err.to_string())),
+        }
+    }
+
+    /// Atomically exchange a live invitation for a persistent node credential.
+    #[oai(path = "/control/nodes/:id/enroll", method = "post")]
+    async fn enroll_node(
+        &self,
+        id: poem_openapi::param::Path<Uuid>,
+        #[oai(name = "X-Enrollment-Token")] invitation: poem_openapi::param::Header<String>,
+    ) -> RotateNodeCredentialResponse {
+        let token = generate_node_token();
+        let result = servers::Entity::update_many()
+            .col_expr(servers::Column::ControlTokenHash, sea_orm::sea_query::Expr::value(hash_node_token(&token)))
+            .col_expr(servers::Column::EnrollmentTokenHash, sea_orm::sea_query::Expr::value(Option::<String>::None))
+            .col_expr(servers::Column::EnrollmentExpiresAt, sea_orm::sea_query::Expr::value(Option::<NaiveDateTime>::None))
+            .filter(servers::Column::Id.eq(id.0))
+            .filter(servers::Column::EnrollmentTokenHash.eq(hash_node_token(&invitation.0)))
+            .filter(servers::Column::EnrollmentExpiresAt.gt(Utc::now().naive_utc()))
+            .exec(&self.db)
+            .await;
+        match result {
+            Ok(update) if update.rows_affected == 1 => RotateNodeCredentialResponse::Ok(Json(NodeCredentialDto { node_id: id.0, token })),
+            Ok(_) => RotateNodeCredentialResponse::Unauthorized(Json("Invalid or expired invitation".into())),
+            Err(err) => RotateNodeCredentialResponse::Error(Json(err.to_string())),
+        }
+    }
+
+    /// Принять периодический heartbeat от ноды и обновить её состояние в БД
+    #[oai(path = "/control/nodes/heartbeat", method = "post")]
+    async fn node_heartbeat(
+        &self,
+        #[oai(name = "X-Node-Token")] node_token: poem_openapi::param::Header<String>,
+        req: Json<NodeHeartbeatRequest>,
+    ) -> NodeHeartbeatResponse {
+        let node_id = match Uuid::parse_str(&req.0.node_id) {
+            Ok(id) => id,
+            Err(_) => {
+                return NodeHeartbeatResponse::BadRequest(Json("Invalid node_id".to_string()));
+            }
+        };
+
+        // Проверяем токен ноды
+        match node_token_is_valid(&self.db, node_id, &node_token.0).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return NodeHeartbeatResponse::Unauthorized(Json("Invalid node credential".to_string()));
+            }
+            Err(e) => return NodeHeartbeatResponse::Error(Json(e.to_string())),
+        }
+
+        let now = Utc::now().naive_utc();
+
+        // Ищем существующую запись состояния в БД
+        let existing = match node_runtime_states::Entity::find_by_id(node_id).one(&self.db).await {
+            Ok(state) => state,
+            Err(e) => return NodeHeartbeatResponse::Error(Json(e.to_string())),
+        };
+
+        let result = if let Some(state) = existing {
+            // Обновляем текущее состояние
+            let mut active = state.into_active_model();
+            active.last_seen_at = Set(now);
+            active.version = Set(req.0.version.clone());
+            active.uptime_seconds = Set(req.0.uptime_seconds as i64);
+            active.active_connections = Set(req.0.active_connections as i64);
+            active.accepting_connections = Set(req.0.accepting_connections);
+            active.update(&self.db).await
+        } else {
+            // Создаем новую запись, если нода стучится впервые
+            let new_state = node_runtime_states::ActiveModel {
+                server_id: Set(node_id),
+                last_seen_at: Set(now),
+                version: Set(req.0.version.clone()),
+                uptime_seconds: Set(req.0.uptime_seconds as i64),
+                active_connections: Set(req.0.active_connections as i64),
+                accepting_connections: Set(req.0.accepting_connections),
+            };
+            new_state.insert(&self.db).await
+        };
+
+        match result {
+            Ok(_) => {
+                let live_totals = if req.0.active_connections == 0 {
+                    crate::api::api::update_node_live_sessions(node_id, Vec::new())
+                } else {
+                    crate::api::api::prune_stale_live_sessions().unwrap_or_default()
+                };
+                crate::api::api::sync_active_sessions_db(&self.db, &live_totals).await;
+                NodeHeartbeatResponse::Accepted
+            }
+            Err(e) => NodeHeartbeatResponse::Error(Json(e.to_string())),
+        }
+    }
+
+    /// Забрать следующую ожидающую команду. Вызов выполняется самой нодой.
+    #[oai(path = "/control/nodes/commands", method = "get")]
+    async fn get_node_commands(
+        &self,
+        #[oai(name = "X-Node-Token")] node_token: poem_openapi::param::Header<String>,
+        node_id: Query<String>,
+    ) -> GetNodeCommandsResponse {
+        let node_id = match Uuid::parse_str(&node_id.0) {
+            Ok(id) => id,
+            Err(_) => {
+                return GetNodeCommandsResponse::BadRequest(Json("Invalid node_id".to_string()));
+            }
+        };
+        match node_token_is_valid(&self.db, node_id, &node_token.0).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return GetNodeCommandsResponse::Unauthorized(Json(
+                    "Invalid node credential".to_string(),
+                ));
+            }
+            Err(e) => return GetNodeCommandsResponse::Error(Json(e.to_string())),
+        }
+        match servers::Entity::find_by_id(node_id).one(&self.db).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return GetNodeCommandsResponse::NotFound(Json("Node not found".to_string()));
+            }
+            Err(e) => return GetNodeCommandsResponse::Error(Json(e.to_string())),
+        }
+
+        let stale_before = Utc::now().naive_utc() - chrono::Duration::seconds(60);
+        if let Err(e) = node_commands::Entity::update_many()
+            .col_expr(
+                node_commands::Column::Status,
+                sea_orm::sea_query::Expr::value("pending"),
+            )
+            .col_expr(
+                node_commands::Column::StartedAt,
+                sea_orm::sea_query::Expr::value(Option::<NaiveDateTime>::None),
+            )
+            .filter(node_commands::Column::ServerId.eq(node_id))
+            .filter(node_commands::Column::Status.eq("running"))
+            .filter(node_commands::Column::StartedAt.lt(stale_before))
+            .exec(&self.db)
+            .await
+        {
+            return GetNodeCommandsResponse::Error(Json(e.to_string()));
+        }
+
+        let pending = match node_commands::Entity::find()
+            .filter(node_commands::Column::ServerId.eq(node_id))
+            .filter(node_commands::Column::Status.eq("pending"))
+            .order_by_asc(node_commands::Column::CreatedAt)
+            .one(&self.db)
+            .await
+        {
+            Ok(command) => command,
+            Err(e) => return GetNodeCommandsResponse::Error(Json(e.to_string())),
+        };
+
+        let Some(command) = pending else {
+            return GetNodeCommandsResponse::Ok(Json(Vec::new()));
+        };
+        let mut claimed = command.into_active_model();
+        claimed.status = Set("running".to_string());
+        claimed.started_at = Set(Some(Utc::now().naive_utc()));
+        match claimed.update(&self.db).await {
+            Ok(saved) => {
+                // Добавьте эту строку для диагностики:
+                info!(
+                    "[ControlPlane] Sending command: ID={}, Type={}, Fingerprint={:?}",
+                    saved.id,
+                    saved.command_type,
+                    saved.target_fingerprint
+                );
+
+                GetNodeCommandsResponse::Ok(Json(vec![NodeCommand {
+                    command_id: saved.id.to_string(),
+                    command_type: saved.command_type,
+                    accepting_connections: saved.accepting_connections,
+                    target_fingerprint: saved.target_fingerprint,
+                }]))
+            },
+            Err(e) => GetNodeCommandsResponse::Error(Json(e.to_string())),
+        }
+    }
+
+    /// Зафиксировать результат выполнения команды нодой.
+    #[oai(path = "/control/nodes/commands/:id/result", method = "post")]
+    async fn complete_node_command(
+        &self,
+        #[oai(name = "X-Node-Token")] node_token: poem_openapi::param::Header<String>,
+        id: poem_openapi::param::Path<Uuid>,
+        req: Json<NodeCommandResultRequest>,
+    ) -> NodeCommandResultResponse {
+        let node_id = match Uuid::parse_str(&req.0.node_id) {
+            Ok(id) => id,
+            Err(_) => {
+                return NodeCommandResultResponse::BadRequest(Json("Invalid node_id".to_string()));
+            }
+        };
+        match node_token_is_valid(&self.db, node_id, &node_token.0).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return NodeCommandResultResponse::Unauthorized(Json(
+                    "Invalid node credential".to_string(),
+                ));
+            }
+            Err(e) => return NodeCommandResultResponse::Error(Json(e.to_string())),
+        }
+        let command = match node_commands::Entity::find_by_id(id.0).one(&self.db).await {
+            Ok(Some(command)) => command,
+            Ok(None) => {
+                return NodeCommandResultResponse::NotFound(Json("Command not found".to_string()));
+            }
+            Err(e) => return NodeCommandResultResponse::Error(Json(e.to_string())),
+        };
+        if command.server_id != node_id {
+            return NodeCommandResultResponse::Conflict(Json(
+                "Command belongs to another node".to_string(),
+            ));
+        }
+        if command.status == "succeeded" || command.status == "failed" {
+            return NodeCommandResultResponse::Accepted;
+        }
+
+        let mut completed = command.into_active_model();
+        completed.status = Set(if req.0.succeeded {
+            "succeeded"
+        } else {
+            "failed"
+        }
+            .to_string());
+        completed.completed_at = Set(Some(Utc::now().naive_utc()));
+        completed.error = Set(req.0.error);
+        match completed.update(&self.db).await {
+            Ok(_) => NodeCommandResultResponse::Accepted,
+            Err(e) => NodeCommandResultResponse::Error(Json(e.to_string())),
+        }
+    }
+}

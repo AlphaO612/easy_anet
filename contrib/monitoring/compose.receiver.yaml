@@ -1,0 +1,18 @@
+services:
+  receiver:
+    image: nginxinc/nginx-unprivileged:1.28-alpine@sha256:7377697a821c131a924a7105fafbe7414db4e9fcc77a6f08f776f33f141ec3f8
+    entrypoint: [nginx]
+    command: [-c, /etc/nginx/receiver.conf, -g, "daemon off;"]
+    ports: ["${RECEIVER_BIND:-127.0.0.1}:${RECEIVER_PORT:-9443}:9443"]
+    volumes:
+      - ./receiver.conf:/etc/nginx/receiver.conf:ro
+      - ${RECEIVER_TLS_DIR:?Set RECEIVER_TLS_DIR}:/etc/anet/tls:ro
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    pids_limit: 64
+    mem_limit: ${RECEIVER_MEMORY:-96m}
+    cpus: ${RECEIVER_CPUS:-0.5}
+    depends_on: [prometheus]

@@ -1,0 +1,433 @@
+use crate::consts::{TAG_UNTAGGED, VP8_HEADER_TAIL_MAGIC};
+use anyhow::{Context, Result, anyhow};
+use base64::prelude::*;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::net::Ipv4Addr;
+use std::str::FromStr;
+
+/// Проверяет, начинается ли полезная нагрузка VP8 с валидного заголовка ANet (Keyframe 16p/1080p или Interframe).
+#[inline]
+pub fn is_valid_vp8_frame_header(data: &[u8]) -> bool {
+    data.len() >= 20
+        && (data[0] == 0x30 || data[0] == 0x31)
+        && data[1..6] == [0x01, 0x00, 0x9d, 0x01, 0x2a]
+        && data[10..20] == VP8_HEADER_TAIL_MAGIC
+}
+
+/// Вычисляет уникальный 2-байтный тег клиента из строки с IPv4-адресом.
+/// Для подсетей /16–/24 младшие два байта гарантируют уникальность каждого клиента в пуле.
+pub fn client_tag_from_ip(ip: &str) -> u16 {
+    if let Ok(ipv4) = ip.parse::<Ipv4Addr>() {
+        client_tag_from_ipv4(ipv4)
+    } else {
+        TAG_UNTAGGED
+    }
+}
+
+/// Вычисляет уникальный 2-байтный тег клиента из структуры Ipv4Addr.
+pub fn client_tag_from_ipv4(ip: Ipv4Addr) -> u16 {
+    let octets = ip.octets();
+    u16::from_be_bytes([octets[2], octets[3]])
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoConstraint {
+    #[serde(rename = "maxHeight")]
+    pub max_height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiverVideoConstraints {
+    #[serde(rename = "colibriClass")]
+    pub colibri_class: String,
+    #[serde(rename = "lastN")]
+    pub last_n: i32,
+    #[serde(rename = "assumedBandwidthBps", skip_serializing_if = "Option::is_none")]
+    pub assumed_bandwidth_bps: Option<i64>,
+    #[serde(rename = "defaultConstraints")]
+    pub default_constraints: VideoConstraint,
+    #[serde(rename = "selectedEndpoints", skip_serializing_if = "Option::is_none")]
+    pub selected_endpoints: Option<Vec<String>>,
+    #[serde(rename = "onStageEndpoints", skip_serializing_if = "Option::is_none")]
+    pub on_stage_endpoints: Option<Vec<String>>,
+    #[serde(rename = "selectedSources", skip_serializing_if = "Option::is_none")]
+    pub selected_sources: Option<Vec<String>>,
+    #[serde(rename = "onStageSources", skip_serializing_if = "Option::is_none")]
+    pub on_stage_sources: Option<Vec<String>>,
+    #[serde(rename = "constraints", skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<HashMap<String, VideoConstraint>>,
+}
+
+impl ReceiverVideoConstraints {
+    pub fn new_all(max_height: u32) -> Self {
+        Self {
+            colibri_class: "ReceiverVideoConstraints".to_string(),
+            last_n: if max_height > 0 { -1 } else { 0 },
+            assumed_bandwidth_bps: if max_height > 0 {
+                Some(10_000_000)
+            } else {
+                None
+            },
+            default_constraints: VideoConstraint { max_height },
+            selected_endpoints: None,
+            on_stage_endpoints: None,
+            selected_sources: None,
+            on_stage_sources: None,
+            constraints: None,
+        }
+    }
+
+    pub fn for_endpoint(endpoint: &str, max_height: u32) -> Self {
+        Self::for_endpoints(&[endpoint.to_string()], max_height)
+    }
+
+    pub fn for_endpoints(endpoints: &[String], max_height: u32) -> Self {
+        let mut map = HashMap::new();
+        let mut sources = Vec::with_capacity(endpoints.len());
+        let mut clean_eps = Vec::with_capacity(endpoints.len());
+        for ep in endpoints {
+            let clean_ep = ep.strip_suffix("-v0").unwrap_or(ep.as_str()).to_string();
+            let src_name = format!("{clean_ep}-v0");
+            map.insert(clean_ep.clone(), VideoConstraint { max_height });
+            map.insert(src_name.clone(), VideoConstraint { max_height });
+            if !clean_eps.contains(&clean_ep) {
+                clean_eps.push(clean_ep);
+            }
+            if !sources.contains(&src_name) {
+                sources.push(src_name);
+            }
+        }
+        let active = max_height > 0 && !clean_eps.is_empty();
+        Self {
+            colibri_class: "ReceiverVideoConstraints".to_string(),
+            last_n: if active { clean_eps.len() as i32 } else { 0 },
+            assumed_bandwidth_bps: if active {
+                Some(10_000_000)
+            } else {
+                None
+            },
+            default_constraints: VideoConstraint { max_height: 0 },
+            selected_endpoints: Some(clean_eps.clone()),
+            on_stage_endpoints: Some(clean_eps),
+            selected_sources: Some(sources.clone()),
+            on_stage_sources: Some(sources),
+            constraints: Some(map),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColibriClass {
+    #[serde(rename = "EndpointMessage")]
+    EndpointMessage,
+    #[serde(rename = "DominantSpeakerEndpointChangeEvent")]
+    DominantSpeaker,
+    #[serde(rename = "ReceiverVideoConstraints")]
+    ReceiverVideoConstraints,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Default for ColibriClass {
+    fn default() -> Self {
+        ColibriClass::EndpointMessage
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WrtcMode {
+    Auto,
+    P2pDirect,
+    JvbDatachannel,
+    Ws,
+    MediaVideo,
+}
+
+impl Default for WrtcMode {
+    fn default() -> Self {
+        WrtcMode::Auto
+    }
+}
+
+impl WrtcMode {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            WrtcMode::Auto => "auto",
+            WrtcMode::P2pDirect => "p2p_direct",
+            WrtcMode::JvbDatachannel => "jvb_datachannel",
+            WrtcMode::Ws => "ws",
+            WrtcMode::MediaVideo => "media_video",
+        }
+    }
+}
+
+impl FromStr for WrtcMode {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.trim().to_lowercase().as_str() {
+            "p2p" | "p2p_direct" | "direct" => WrtcMode::P2pDirect,
+            "dc" | "datachannel" | "jvb_dc" | "jvb_datachannel" => WrtcMode::JvbDatachannel,
+            "ws" | "websocket" | "colibri_ws" => WrtcMode::Ws,
+            "media_video" | "video" | "vp8" | "media_rtp" | "media" => WrtcMode::MediaVideo,
+            _ => WrtcMode::Auto,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum WrtcMessage {
+    #[serde(rename = "e2ee-ping", alias = "anet_discover")]
+    Discover {
+        client_nonce: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        video_ssrc: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+    },
+    #[serde(rename = "e2ee-ack", alias = "anet_beacon")]
+    Beacon {
+        server_id: String,
+        client_nonce: String,
+        signature: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        video_ssrc: Option<u32>,
+    },
+    #[serde(rename = "ReceiverAudioSubscription", alias = "astp")]
+    Astp {
+        data: String,
+    },
+    #[serde(rename = "dominant-speaker-stats", alias = "astp_batch")]
+    AstpBatch {
+        data: String,
+    },
+    #[serde(rename = "ice-offer", alias = "anet_p2p_offer")]
+    P2pOffer {
+        sdp: String,
+        candidates: Vec<String>,
+    },
+    #[serde(rename = "ice-answer", alias = "anet_p2p_answer")]
+    P2pAnswer {
+        sdp: String,
+        candidates: Vec<String>,
+    },
+    #[serde(rename = "ice-candidate", alias = "anet_p2p_candidate")]
+    P2pCandidate {
+        candidate: String,
+    },
+    #[serde(rename = "video-rx-stall", alias = "anet_video_stall")]
+    VideoRxStall {
+        stalled: bool,
+    },
+    #[serde(rename = "keepalive", alias = "anet_ping")]
+    Ping,
+    #[serde(rename = "keepalive-ack", alias = "anet_pong")]
+    Pong,
+    #[serde(other)]
+    Unknown,
+}
+
+fn default_wrtc_message() -> WrtcMessage {
+    WrtcMessage::Unknown
+}
+
+/// Вычисляет 2-байтный детерминированный суффикс (4 hex-символа) серверного MUC `endpoint_id`:
+/// `SHA256(server_pub_key_bytes || conference_id)[0..2]`.
+pub fn compute_server_endpoint_suffix(
+    server_pub_key_bytes: &[u8; 32],
+    conference_id: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(server_pub_key_bytes);
+    hasher.update(conference_id.as_bytes());
+    let digest = hasher.finalize();
+    format!("{:02x}{:02x}", digest[0], digest[1])
+}
+
+/// Вычисляет 2-байтный детерминированный суффикс (4 hex-символа) серверного MUC `endpoint_id`
+/// из Base64-кодированного публичного ключа Ed25519 и `conference_id`.
+pub fn compute_server_endpoint_suffix_from_b64(
+    server_pub_key_b64: &str,
+    conference_id: &str,
+) -> Option<String> {
+    let pub_bytes = BASE64_STANDARD.decode(server_pub_key_b64.trim()).ok()?;
+    let pub_array: [u8; 32] = pub_bytes.as_slice().try_into().ok()?;
+    Some(compute_server_endpoint_suffix(&pub_array, conference_id))
+}
+
+/// Генерирует 8-символьный hex `endpoint_id` сервера, в котором старшие 2 байта случайны,
+/// а младшие 2 байта равны `SHA256(server_pub_key_bytes || conference_id)[0..2]`.
+pub fn generate_server_endpoint_id(
+    server_pub_key_bytes: &[u8; 32],
+    conference_id: &str,
+) -> String {
+    let prefix: u16 = rand::random();
+    let suffix = compute_server_endpoint_suffix(server_pub_key_bytes, conference_id);
+    format!("{prefix:04x}{suffix}")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColibriMessage {
+    #[serde(rename = "colibriClass")]
+    pub colibri_class: ColibriClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(rename = "msgPayload", default = "default_wrtc_message")]
+    pub msg_payload: WrtcMessage,
+}
+
+impl ColibriMessage {
+    pub fn new_endpoint_message(to: Option<String>, payload: WrtcMessage) -> Self {
+        Self {
+            colibri_class: ColibriClass::EndpointMessage,
+            to,
+            from: None,
+            msg_payload: payload,
+        }
+    }
+
+    pub fn discover(
+        to: Option<String>,
+        client_nonce: String,
+        video_ssrc: Option<u32>,
+        mode: Option<String>,
+    ) -> Self {
+        Self::new_endpoint_message(
+            to,
+            WrtcMessage::Discover {
+                client_nonce,
+                video_ssrc,
+                mode,
+            },
+        )
+    }
+
+    pub fn beacon(
+        to_client_endpoint: String,
+        server_id: String,
+        client_nonce: String,
+        signature: String,
+        video_ssrc: Option<u32>,
+    ) -> Self {
+        Self::new_endpoint_message(
+            Some(to_client_endpoint),
+            WrtcMessage::Beacon {
+                server_id,
+                client_nonce,
+                signature,
+                video_ssrc,
+            },
+        )
+    }
+
+    pub fn astp(to: String, base64_data: String) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::Astp { data: base64_data },
+        )
+    }
+
+    pub fn astp_batch(to: String, base64_data: String) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::AstpBatch { data: base64_data },
+        )
+    }
+
+    pub fn p2p_offer(to: String, sdp: String, candidates: Vec<String>) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::P2pOffer { sdp, candidates },
+        )
+    }
+
+    pub fn p2p_answer(to: String, sdp: String, candidates: Vec<String>) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::P2pAnswer { sdp, candidates },
+        )
+    }
+
+    pub fn p2p_candidate(to: String, candidate: String) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::P2pCandidate { candidate },
+        )
+    }
+
+    pub fn video_rx_stall(to: String, stalled: bool) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::VideoRxStall { stalled },
+        )
+    }
+
+    pub fn ping(to: String) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::Ping,
+        )
+    }
+
+    pub fn pong(to: String) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::Pong,
+        )
+    }
+}
+
+pub fn sign_beacon(
+    signing_key_bytes: &[u8; 32],
+    client_nonce: &str,
+    server_id: &str,
+) -> String {
+    let signing_key = SigningKey::from_bytes(signing_key_bytes);
+    let mut message = Vec::with_capacity(client_nonce.len() + server_id.len());
+    message.extend_from_slice(client_nonce.as_bytes());
+    message.extend_from_slice(server_id.as_bytes());
+
+    let signature = signing_key.sign(&message);
+    BASE64_STANDARD.encode(signature.to_bytes())
+}
+
+pub fn verify_beacon(
+    server_pub_key_b64: &str,
+    client_nonce: &str,
+    server_id: &str,
+    signature_b64: &str,
+) -> Result<bool> {
+    let pub_bytes = BASE64_STANDARD.decode(server_pub_key_b64.trim())
+        .context("Failed to base64 decode server_pub_key")?;
+    let pub_array: [u8; 32] = pub_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("Invalid server public key length (expected 32 bytes)"))?;
+
+    let verifying_key = VerifyingKey::from_bytes(&pub_array)
+        .map_err(|e| anyhow!("Invalid Ed25519 verifying key: {e}"))?;
+
+    let sig_bytes = BASE64_STANDARD.decode(signature_b64.trim())
+        .context("Failed to base64 decode beacon signature")?;
+    let sig_array: [u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("Invalid signature length (expected 64 bytes)"))?;
+
+    let signature = Signature::from_bytes(&sig_array);
+
+    let mut message = Vec::with_capacity(client_nonce.len() + server_id.len());
+    message.extend_from_slice(client_nonce.as_bytes());
+    message.extend_from_slice(server_id.as_bytes());
+
+    Ok(verifying_key.verify(&message, &signature).is_ok())
+}
+

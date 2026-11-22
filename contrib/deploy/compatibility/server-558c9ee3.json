@@ -1,0 +1,41 @@
+{
+  "format": 1,
+  "server_commit": "1f7cb3216ea665972bbe7b12f57740230a3b8e6f",
+  "server_image_config": "sha256:558c9ee33ea7a71dd7e7c2caa103b15c93a9eeaad9249cff215c820585cb81b9",
+  "server_binary_sha256": "759cbb4d85e38a6d55de8b38e1798d431ce791a5aaecd6a6c8410bdbd49b0b0f",
+  "platforms": [
+    "linux/amd64"
+  ],
+  "verified_clients": [
+    {
+      "client": "anet-client-cli-0.7.2-linux-amd64",
+      "config_schema": "upstream-0.7.2-toml",
+      "transport": "quic"
+    },
+    {
+      "client": "anet-client-cli-0.7.2-linux-amd64",
+      "config_schema": "anet-easy-standalone-toml-v1",
+      "transport": "quic"
+    },
+    {
+      "client": "anet-client-cli-0.7.3-linux-amd64",
+      "config_schema": "upstream-0.7.3-toml",
+      "transport": "quic"
+    },
+    {
+      "client": "anet-client-cli-0.7.3-linux-amd64",
+      "config_schema": "anet-easy-standalone-toml-v1",
+      "transport": "quic"
+    },
+    {
+      "client": "anet-client-cli-sha256-e277b443dffc7be8608ceca0892597d6910b7c7d3b66369fabab87cab5aead0e",
+      "config_schema": "anet-easy-standalone-toml-v1",
+      "transport": "quic"
+    },
+    {
+      "client": "anet-client-cli-sha256-5b5d3d3506bc78f635ec1f5f3e79d91c1c9599f24e51619025a24f74bdff5bce",
+      "config_schema": "anet-easy-standalone-toml-v1",
+      "transport": "quic"
+    }
+  ]
+}

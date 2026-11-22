@@ -1,42 +1,71 @@
-# Build artifacts (if building from source)
-/target
-/anet/target
+# Build outputs and dependency caches
+/target/
+/android-build/
+jniLibs/
+node_modules/
+dist/
+__pycache__/
+*.py[cod]
+/package.json
+/package-lock.json
+/metadata.json
+/bun.lock
 
-# IDE
-.idea
-.vscode
-*.swp
-*.swo
-*~
+# Editor and workstation files
+.idea/
+.vscode/
+.DS_Store
+Desktop.ini
+/process_files.ps1
+/project_report.txt
 
-# Generated configs and keys
-/server/
-/client-windows/client.toml
+# Local operations and deployment artifacts
+/HANDOFF.md
+/private-ios/
+/contexts/
+/releases/
+/.acceptance-*/
+/.verify-amd64-*/
+/.stage4-build-*/
+/.flow-auth-build/
+/.paste-new-user
+/RUGW*.png
+images.tar
+source.tar.gz
+installer-source-*.tar.gz
+*.bundle
+*.log
+
+# Secrets and credentials produced by an installation
+.env
+.env.*
+*.env
+!.env.example*
+!*.env.example
+!contrib/deploy/compose/build.env
+!contrib/deploy/compose/example.env
 *.pem
 *.key
-*.crt
-
-# Temporary files
-*.log
-*.tmp
-.DS_Store
-Thumbs.db
-
-# Environment
-.env
-
-# Android build artifacts (if building mobile)
-android-build/*
-/jniLibs
-
-# anet source (optional dependency)
-/anet/
-
-# Docker volumes (if any)
-.docker/
-
-# Artifacts
-artifacts/
-release_files/
-
-.ignore-git
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+id_ecdsa
+admin-password
+db-password
+grafana-password
+probe-signing/
+.ssh/
+.netrc
+anet-wizard/
+client.toml
+server.toml
+!contrib/config/client.toml
+!contrib/config/server.toml
+uplink.toml
+client.conf
+wg*.conf
+*.uri
+*.ovpn
+*.sqlite
+*.sqlite3

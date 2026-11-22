@@ -1,0 +1,28 @@
+global:
+  scrape_interval: 10s
+  scrape_timeout: 5s
+  external_labels:
+    source_node: replace-with-node-id
+remote_write:
+  - url: https://monitor.example.invalid:9443/api/v1/write
+    tls_config:
+      ca_file: /etc/anet/tls/ca.crt
+      cert_file: /etc/anet/tls/client.crt
+      key_file: /etc/anet/tls/client.key
+scrape_configs:
+  - job_name: server-link
+    metrics_path: /probe
+    file_sd_configs:
+      - files: [/etc/prometheus/targets/targets.yml]
+    relabel_configs:
+      - source_labels: [module]
+        regex: tcp_connect|https_ready|https_capacity
+        action: keep
+      - source_labels: [module]
+        target_label: __param_module
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115

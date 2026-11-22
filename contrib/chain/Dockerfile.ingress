@@ -1,0 +1,7 @@
+ARG XRAY_IMAGE
+FROM ${XRAY_IMAGE} AS xray
+FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f
+RUN apk add --no-cache iproute2 iptables wireguard-tools setpriv
+COPY --from=xray /usr/local/bin/xray /usr/local/bin/xray
+COPY --chmod=0555 ingress.sh /usr/local/bin/anet-ingress
+ENTRYPOINT ["/usr/local/bin/anet-ingress"]

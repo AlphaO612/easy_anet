@@ -4,13 +4,17 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[features]
+default = ["ebpf-shaper"]
+ebpf-shaper = ["dep:anet-ebpf-common", "dep:aya", "dep:aya-log", "dep:aya-build"]
+
 [dependencies]
 tokio = {workspace = true }
 rustls = {workspace = true }
 env_logger = {workspace = true}
 log = {workspace = true}
 anyhow = {workspace = true}
-clap = {workspace = true}
+clap = { workspace = true, features = ["help"] }
 prost = {workspace = true}
 bytes = {workspace = true}
 rustls-pemfile = {workspace = true}
@@ -24,15 +28,38 @@ x25519-dalek = {workspace = true}
 ed25519-dalek = {workspace = true}
 async-trait = { workspace = true }
 futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
+dashmap = { workspace = true }
+reqwest = { workspace = true, features = ["query"] }
+http = { workspace = true }
+russh = { workspace = true }
+rtc = { workspace = true }
+webrtc = { workspace = true }
+sha2 = "0.10"
+urlencoding = "2"
 
-russh = "0.45"
-russh-keys = "0.45"
 
-dashmap = "7.0.0-rc2"
 arc-swap = "1.6"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-anet-common = { path = "../anet-common" }
+# eBPF-шейпер трафика (per-user speed_limit) на TUN-интерфейсе, см. src/shaper.rs
+anet-ebpf-common = { optional = true, path = "../anet-ebpf-common", features = ["user"] }
+aya = { optional = true, workspace = true }
+aya-log = { optional = true, workspace = true }
+
+anet-common = { path = "../anet-common", features = ["poem"] }
+httparse = "1.10.1"
+url = "2.5.7"
+serde_json = "1.0.148"
+
+[dev-dependencies]
+anet-client-core = { path = "../anet-client-core" }
+
+[build-dependencies]
+# Только как путь к манифесту для build.rs/aya-build — Rust-код отсюда не
+# импортируется, крейт anet-ebpf компилируется отдельно под bpfel-unknown-none
+# нужным ему nightly-тулчейном (см. build.rs), стабильный тулчейн, которым
+# собирается сам anet-server, не переключается.
+aya-build = { optional = true, workspace = true }
 
 [[bin]]
 name = "anet-server"

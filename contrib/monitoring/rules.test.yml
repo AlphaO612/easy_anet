@@ -1,0 +1,44 @@
+rule_files: [rules.yml]
+evaluation_interval: 10s
+tests:
+  - interval: 10s
+    input_series:
+      - series: 'probe_success{job="server-link",source_node="a",target_node="b",module="tcp_connect",instance="b:443"}'
+        values: '1 1 1 0 0 0 1 1 1'
+    promql_expr_test:
+      - expr: 'scalar(anet:link_available)'
+        eval_time: 20s
+        exp_samples: [{labels: '{}', value: 1}]
+      - expr: 'scalar(anet:link_available)'
+        eval_time: 40s
+        exp_samples: [{labels: '{}', value: 1}]
+      - expr: 'scalar(anet:link_available)'
+        eval_time: 50s
+        exp_samples: [{labels: '{}', value: 0}]
+      - expr: 'scalar(anet:link_available)'
+        eval_time: 70s
+        exp_samples: [{labels: '{}', value: 0}]
+      - expr: 'scalar(anet:link_available)'
+        eval_time: 80s
+        exp_samples: [{labels: '{}', value: 1}]
+      - expr: 'anet:link_available'
+        eval_time: 130s
+        exp_samples: []
+  - interval: 10s
+    input_series:
+      - series: 'probe_success{job="server-link",module="https_capacity",source_node="a",target_node="b",instance="b"}'
+        values: '1 1 0'
+      - series: 'probe_duration_seconds{job="server-link",module="https_capacity",source_node="a",target_node="b",instance="b"}'
+        values: '0.5 0.5 0.5'
+      - series: 'probe_http_uncompressed_body_length{job="server-link",module="https_capacity",source_node="a",target_node="b",instance="b"}'
+        values: '65536 128 65536'
+    promql_expr_test:
+      - expr: 'scalar(anet_link_capacity_mbps)'
+        eval_time: 0s
+        exp_samples: [{labels: '{}', value: 1.048576}]
+      - expr: 'anet_link_capacity_mbps'
+        eval_time: 10s
+        exp_samples: []
+      - expr: 'anet_link_capacity_mbps'
+        eval_time: 20s
+        exp_samples: []

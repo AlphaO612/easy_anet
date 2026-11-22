@@ -6,6 +6,7 @@ pub mod macos {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod desktop {
     use crate::traits::RouteManager;
+    use crate::events::{status, warn, err};
     use anyhow::Context;
     use anyhow::Result;
     use async_trait::async_trait;
@@ -122,6 +123,7 @@ pub mod desktop {
             };
 
             info!("Backup: Gateway {} on iface {:?}", gateway, ifindex);
+            status(format!("Gateway: {}", gateway));
 
             let mut state = self.state.lock().await;
             state.original_gateway = Some(gateway);
@@ -138,10 +140,29 @@ pub mod desktop {
                 .original_ifindex
                 .context("Interface index not backed up")?;
 
+            if target.is_ipv4() != gateway.is_ipv4() {
+                debug!(
+                    "Skipping BYPASS route for {}/{} (address family mismatch with physical gateway {})",
+                    target, prefix, gateway
+                );
+                return Ok(());
+            }
+
+            if state
+                .added_routes
+                .iter()
+                .any(|r| r.destination == target && r.prefix == prefix)
+            {
+                return Ok(());
+            }
+
             info!(
                 "Adding BYPASS route for {}/{} via physical gateway {}",
                 target, prefix, gateway
             );
+
+            status(format!("Adding BYPASS route for {}/{} via physical gateway {}",
+                           target, prefix, gateway));
 
             let route = Route::new(target, prefix)
                 .with_gateway(gateway)
@@ -151,11 +172,17 @@ pub mod desktop {
             // Удаляем старый если был
             let _ = self.handle.delete(&route).await;
 
+            debug!("Debug route params - target: {}, prefix: {}, gw: {}, ifindex: {}", target, prefix, gateway, ifindex);
+
             // Добавляем
-            self.handle
-                .add(&route)
-                .await
-                .context("Failed to add bypass route")?;
+            match self.handle.add(&route).await {
+                Ok(_) => {},
+                Err(e) => {
+                    error!("Failed to add bypass route: {:?}", e);
+                    err(format!("Failed to add bypass route: {:?}", e));
+                    return Err(anyhow::anyhow!(e).context("Failed to add bypass route"));
+                }
+            }
 
             // Сохраняем в список, чтобы потом удалить при выключении VPN
             // (хотя для server_ip мы раньше использовали отдельное поле,
@@ -168,6 +195,7 @@ pub mod desktop {
         async fn set_default_route(&self, _gateway: &str, interface_name: &str) -> Result<()> {
             let tun_index = Self::get_iface_index(interface_name)?;
             info!("Redirecting ALL traffic to TUN (index: {})", tun_index);
+            status(format!("Redirecting ALL traffic to TUN (index: {})", tun_index));
 
             let routes_to_add = vec![
                 Route::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1)
@@ -182,7 +210,8 @@ pub mod desktop {
             for route in routes_to_add {
                 let _ = self.handle.delete(&route).await;
                 if let Err(e) = self.handle.add(&route).await {
-                    warn!("Failed to add redirect route {:?}: {}", route, e);
+                    warn!("Failed to add redirect route {:?}: {:?}", route, e);
+                    warn(format!("Failed to add redirect route {:?}: {:?}", route, e));
                 } else {
                     state.added_routes.push(route);
                 }
@@ -211,18 +240,21 @@ pub mod desktop {
             match self.handle.add(&route).await {
                 Ok(_) => {
                     info!("Added split-tunnel route: {}/{} via TUN", target, prefix);
+                    status(format!("Added split-tunnel route: {}/{} via TUN", target, prefix));
                     state.added_routes.push(route);
                     Ok(())
                 }
                 Err(e) => {
-                    error!("Failed to add route {}/{}: {}", target, prefix, e);
-                    Err(anyhow::anyhow!(e))
+                    error!("Failed to add route {}/{}: {:?}", target, prefix, e);
+                    err(format!("Failed to add route {}/{}: {:?}", target, prefix, e));
+                    Err(anyhow::anyhow!(e).context(format!("Failed to add route {}/{}", target, prefix)))
                 }
             }
         }
 
         async fn restore_routes(&self) -> Result<()> {
             info!("Restoring original routing...");
+            status("Restoring original routing...");
             let mut state = self.state.lock().await;
 
             // Удаляем все маршруты (Global, Specific, Bypass) в обратном порядке
@@ -232,6 +264,7 @@ pub mod desktop {
             }
 
             info!("Routing restored.");
+            status("Routing restored.");
             Ok(())
         }
     }

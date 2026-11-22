@@ -1,0 +1,33 @@
+modules:
+  tcp_connect:
+    prober: tcp
+    timeout: 3s
+    tcp:
+      preferred_ip_protocol: ip4
+  https_ready:
+    prober: http
+    timeout: 3s
+    http:
+      fail_if_not_ssl: true
+      follow_redirects: false
+      preferred_ip_protocol: ip4
+  https_capacity:
+    prober: http
+    timeout: 3s
+    http:
+      method: GET
+      valid_status_codes: [200]
+      preferred_ip_protocol: ip4
+      follow_redirects: false
+      fail_if_not_ssl: true
+      body_size_limit: 64KiB
+      headers: {Accept-Encoding: identity}
+      fail_if_header_not_matches:
+        - {header: Content-Length, regexp: '^65536$'}
+        - {header: X-ANet-Capacity, regexp: '^v1$'}
+      fail_if_header_matches:
+        - {header: Content-Encoding, regexp: '.+', allow_missing: true}
+      tls_config:
+        ca_file: /etc/anet/capacity-tls/ca.crt
+        cert_file: /etc/anet/capacity-tls/client.crt
+        key_file: /etc/anet/capacity-tls/client.key

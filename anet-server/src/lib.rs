@@ -2,8 +2,12 @@ pub(crate) mod auth_handler;
 pub(crate) mod auth_provider;
 pub(crate) mod client_registry;
 pub mod config;
+pub(crate) mod control_plane;
+mod probe_revision;
 pub(crate) mod ip_pool;
 pub(crate) mod multikey_udp_socket;
 pub mod server;
-pub(crate) mod utils;
 pub mod servers;
+#[cfg(feature = "ebpf-shaper")]
+pub(crate) mod shaper;
+pub(crate) mod utils;

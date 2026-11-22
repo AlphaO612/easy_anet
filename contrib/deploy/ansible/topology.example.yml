@@ -1,0 +1,26 @@
+all:
+  children:
+    anet_topology:
+      hosts:
+        localhost:
+          ansible_connection: local
+      vars:
+        anet_base_revision: 0
+        anet_topology_manifest: !unsafe |
+          {
+            "paths": {
+              "west": {
+                "entry": "entry-1",
+                "exit": "exit-1",
+                "external_ip": "192.0.2.1",
+                "transport": "quic"
+              }
+            },
+            "profiles": {
+              "home": {
+                "entry": "entry-1",
+                "paths": ["west"],
+                "strategy": "prefer-route"
+              }
+            }
+          }

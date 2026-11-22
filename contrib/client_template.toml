@@ -1,0 +1,652 @@
+# =========================================================================
+# ANET Client: базовый шаблон конфигурации, который панель заполняет динамически
+# =========================================================================
+[main]
+# Название виртуального адаптера
+tun_name = "anet-client"
+
+# Включает ручное управление роутингом на клиенте
+manual_routing = false
+
+# Windows per-app split tunneling.
+# include-режим: в туннель идут ТОЛЬКО эти процессы.
+# per_app = ["firefox.exe", "telegram.exe"]
+# per_app_mode = "include"
+
+per_app = {{PER_APP}}
+per_app_mode = "{{PER_APP_MODE}}"
+
+# exclude-режим (в туннель всё, КРОМЕ этих):
+# per_app = ["steam.exe"]
+# per_app_mode = "exclude"
+
+# Настройки Маршрутизации (Split Tunneling)
+route_for = {{ROUTE_FOR}}
+exclude_route_for = {{EXCLUDE_ROUTE_FOR}}
+
+# Список DNS-серверов, используемых при запуске для резолва доменов
+dns_server_list = ["1.1.1.1", "8.8.8.8"]
+
+# Ссылка для скачивания авто-обновлений клиента
+update_url = "https://api.github.com/repos/ZeroTworu/anet/releases/latest"
+
+[keys]
+# Эти параметры бэкенд дешифрует и заполнит автоматически при скачивании
+private_key = "{{PRIVATE_KEY}}"
+server_pub_key = "{{SERVER_PUB_KEY}}"
+
+[stats]
+enabled = true
+interval_minutes = 1
+
+[ahttp]
+# --- Параметры параллельности и коалесценции пакетов (напрямую, Cloudflare / CDNVideo) ---
+# В dsn ноды [[servers]] также поддерживаются точечные query-параметры:
+#   ?cdn=1 (профиль для CDNVideo, батч 48 КБ), ?budget=49152, ?pool=4, ?method=POST
+
+# Количество параллельно открываемых HTTP/2 запросов (потоков)
+concurrency = 12
+# concurrency = 8 # для CDN / Cloudflare
+
+# Количество постоянных независимых TCP/TLS соединений (HTTP/2 клиентов) в Round-Robin пуле
+tcp_pool_size = 4
+# tcp_pool_size = 2 # для CDN / Cloudflare
+
+# Максимальный размер пачки пакетов в байтах (общий бюджет коалесценции: 128 КБ напрямую)
+coalesce_budget_bytes = 131072
+# coalesce_budget_bytes = 65536 # для CDN
+
+# Отдельный лимит размера Uplink POST-батча (напрямую не ограничиваем — используется coalesce_budget_bytes)
+# uplink_coalesce_budget_bytes = 49152 # для CDNVideo (48 КБ под стартовое окно HTTP/2 65535 Б)
+
+# Микро-коалесценция тяжелого uplink-трафика (мкс и порог активации в байтах)
+micro_coalesce_us = 500
+micro_coalesce_min_bytes = 256
+
+# Управление фоновым опросом (защита от idle RPS-флуда на Cloudflare / CDN)
+poll_timeout_ms = 10
+max_idle_polls = 1
+idle_poll_interval_ms = 25
+idle_backoff_max_ms = 500
+
+# Очереди и скользящее окно переупорядочивания
+tx_queue_capacity = 256
+downlink_queue_capacity = 512
+reassembly_queue_max_size = 2048
+# reassembly_queue_max_size = 1024 # для CDN
+reassembly_gap_timeout_ms = 150
+
+# Устойчивость к сбоям, rate-limit (429/503) и переподключение ASTP-сессии
+max_retries = 4
+retry_base_ms = 100
+retry_max_ms = 3000
+max_consecutive_failures = 6
+# reconnect_timeout_secs = 30
+reconnect_retry_min_ms = 350
+reconnect_retry_max_ms = 1500
+abort_on_ip_change = true
+
+# Передача session_id в HTTP-заголовке (рекомендуется для Cloudflare) или через query-параметр URL
+send_session_in_header = false
+# send_session_in_header = true # рекомендуется для Cloudflare / Nginx
+session_id_header = "X-Session-Id"
+session_id_query_param = "session_id"
+
+# --- Тонкая настройка HTTP/2 на уровне сетевого движка ---
+
+# Автоматическое динамическое расширение окна HTTP/2 под BDP канала (Adaptive Flow Control Window)
+http2_adaptive_window = true
+# http2_adaptive_window = false # для CDNVideo (при жёстком лимите окна на edge-узле)
+
+# Ручные окна потока и соединения HTTP/2 (применяются ТОЛЬКО если http2_adaptive_window = false)
+# http2_initial_stream_window_size = 2097152     # без CDN (2 МБ, если http2_adaptive_window = false)
+# http2_initial_connection_window_size = 8388608 # без CDN (8 МБ, если http2_adaptive_window = false)
+# http2_initial_stream_window_size = 49152       # для CDNVideo (48 КБ под окно CDNVideo)
+# http2_initial_connection_window_size = 49152   # для CDNVideo (48 КБ под окно CDNVideo)
+
+# Максимальный размер одного HTTP/2 DATA-фрейма (64 КБ напрямую снижает оверхед заголовков фреймов в 4 раза)
+http2_max_frame_size = 65536
+# http2_max_frame_size = 16384 # для строгих CDN (RFC 7540 фрейм 16 КБ)
+
+# Максимальный размер входящих HTTP-заголовков (в байтах)
+http2_max_header_list_size = 65536
+# http2_max_header_list_size = 16384 # для CDN
+
+# Период отправки фоновых Keep-Alive PING кадров HTTP/2 (в секундах)
+http2_keep_alive_interval_secs = 20
+# http2_keep_alive_interval_secs = 15 # для CDN / Cloudflare
+
+# Таймаут подтверждения (ACK) отправленного PING-кадра (в секундах)
+http2_keep_alive_timeout_secs = 10
+
+# Отправлять ли PING-кадры, когда в туннеле нет активной передачи данных (Idle-режим)
+http2_keep_alive_while_idle = true
+
+# --- Конфигурация пула соединений и путей ---
+
+# Максимальное количество удерживаемых открытыми (idle) сокетов на каждый клиент пула (должно быть >= concurrency)
+pool_max_idle_per_host = 16
+# pool_max_idle_per_host = 8 # для CDN / Cloudflare
+
+# Время простоя соединения в пуле перед его автоматическим закрытием (в секундах)
+pool_idle_timeout_secs = 90
+# pool_idle_timeout_secs = 45 # для CDN / Cloudflare
+
+# Отключение алгоритма Nagle (TCP_NODELAY) для мгновенной отправки фреймов
+tcp_nodelay = true
+
+# Тайм-аут на выполнение одного HTTP-запроса обмена батчем (в секундах)
+timeout_secs = 10
+# timeout_secs = 15 # для CDN / Cloudflare
+
+# Пути эндпоинтов (должны строго совпадать с настройками на сервере)
+handshake_path = "/handshake"
+auth_path = "/auth"
+traffic_path = "/traffic"
+
+[websocket]
+# Максимальный размер скользящего окна переупорядочивания пакетов (`ReassemblyQueue`) для пула `WSS ?pool=N`.
+# Для каналов 250+ Мбит/с рекомендуется увеличивать до 4096..8192.
+reassembly_queue_max_size = 2048
+
+# Таймаут ожидания задержавшегося/потерянного пакета на дыре последовательности (мс).
+reassembly_gap_timeout_ms = 60
+
+# Таймаут отправки одного WebSocket-фрейма (мс). Защищает от зависания на «чёрной дыре» TCP.
+write_timeout_ms = 10000
+
+# Таймаут закрытия WebSocket-сокета (мс).
+close_timeout_ms = 2000
+
+# Таймаут TCP + TLS + HTTP Upgrade (и `WS_MUX_BIND`) одного сокета пула (сек).
+handshake_timeout_secs = 15
+
+# Диапазон случайного интервала клиентских keepalive Ping-фреймов (сек).
+ping_interval_min_secs = 25
+ping_interval_max_secs = 50
+
+# Емкость очереди исходящих пакетов (TUN -> WS-пул) и входящих батчей (WS-пул -> ReassemblyQueue).
+tx_queue_capacity = 512
+downlink_queue_capacity = 1024
+
+# Бюджет коалесценции пакетов на один сокет при active_slots > 1 (байт) и при одиночном сокете (байт).
+pool_coalesce_budget_bytes = 16384
+single_coalesce_budget_bytes = 65536
+
+# Лимит размера одного WebSocket-сообщения/фрейма и буферов `tokio-tungstenite` (байт).
+max_message_size = 262144
+read_buffer_size = 131072
+write_buffer_size = 131072
+max_write_buffer_size = 524288
+
+# Пороги эскалации `WS_MUX_BIND` при `active_slots > 0` до полного ASTP-переподключения (0 — без лимита):
+#   - bind_max_retries: максимум подряд любых неудачных попыток bind;
+#   - bind_reject_max_retries: максимум явных отклонений bind сервером.
+bind_max_retries = 3
+bind_reject_max_retries = 2
+
+# Случайная задержка перед повтором `WS_MUX_BIND` (мс).
+bind_retry_min_ms = 500
+bind_retry_max_ms = 1500
+
+# Общий бюджет времени на цикл `reconnect_astp_session` (сек).
+# Если закомментировано (`None`), вычисляется как `max(server.timeout_secs, 10) * 3`.
+# reconnect_timeout_secs = 30
+
+# Случайная задержка между попытками `reconnect_astp_session` (мс).
+reconnect_retry_min_ms = 350
+reconnect_retry_max_ms = 1400
+
+# Немедленно прерывать `reconnect_astp_session`, если сервер выдал новый туннельный IP/шлюз,
+# чтобы ядро клиента сразу пересоздало TUN и маршруты вместо ожидания до конца `reconnect_timeout_secs`.
+abort_on_ip_change = true
+
+[stealth]
+# -------------------------------------------------------------------------
+# L4 TCP-фрагментация TLS ClientHello (`tlshello`)
+# -------------------------------------------------------------------------
+# ЧЕМ ОТЛИЧАЕТСЯ ОТ СТАРОЙ ASTP-ФРАГМЕНТАЦИИ (`frag_enabled`):
+#   - `tls_frag_*` (`tlshello`) работает НА ПРОВОДЕ ДО ШИФРОВАНИЯ (L4 TCP): режет первый TLS ClientHello
+#     (`0x16 0x03`, открытый SNI) на мелкие TCP-чанки длиной `tls_frag_length` (с паузой `tls_frag_delay_ms`)
+#     для обхода DPI по SNI во всех TLS-транспортах (WSS, AHTTP, IMAPS, WRTC, TURNS Proxy).
+#   - Старая ASTP-фрагментация (`frag_enabled`) режет первый фрейм ПОСЛЕ установки транспорта —
+#     подходит только для не-TLS транспортов `quic` и `vnc` (в SSH внутри шифрованного канала отключена).
+# Формат диапазонов (как в Xcore): "X..Y" или одиночное число "N".
+tls_frag_enabled = false
+tls_frag_length = "10..20"
+tls_frag_delay_ms = "0"
+
+# Старая ASTP-фрагментация первого пакета (QUIC / VNC); `frag_chunks` имеет приоритет над min/max
+frag_enabled = false
+frag_chunks = "2..4"
+frag_min_chunks = 2
+frag_max_chunks = 3
+
+# Готовые пресеты маскировки (при необходимости раскомментируйте нужный блок вместо значений выше):
+# Пресет 1 (Жёсткий ТСПУ / режим «БС»): tls_frag_enabled = true, tls_frag_length = "8..16", tls_frag_delay_ms = "1..3", frag_enabled = false (+ [wrtc].turns_proxy_priority = true)
+# Пресет 2 (Мягкий DPI, без задержек):   tls_frag_enabled = true, tls_frag_length = "10..20", tls_frag_delay_ms = "0", frag_enabled = false
+# Пресет 3 (QUIC / VNC ASTP-резка):      tls_frag_enabled = false, frag_enabled = true, frag_chunks = "2..4"
+
+min_jitter_ns = 1000000   # 1 ms
+max_jitter_ns = 5000000   # 5 ms
+padding_step = 64
+# -------------------------------------------------------------------------
+# Маскировка TLS-отпечатка BoringSSL (JA3/JA4) и синхронизация с HTTP (L4/L7)
+# -------------------------------------------------------------------------
+# Управляет профилем TLS ClientHello и автоматически синхронизирует с ним
+# HTTP-заголовки (User-Agent, Accept-Encoding, наличие или отсутствие sec-ch-ua*):
+#   - "auto"       : (По умолчанию) Случайный выбор реалистичного браузера под текущую ОС
+#                    (Chrome / Firefox / Safari / Randomized) со 100% синхронизацией L4 и L7.
+#   - "chrome"     : Google Chrome / Edge (GREASE включен, перестановка расширений,
+#                    кривые X25519MLKEM768/X25519:P-256:P-384, OCSP+SCT, заголовки sec-ch-ua*).
+#   - "firefox"    : Mozilla Firefox NSS (GREASE выключен, фиксированный порядок расширений,
+#                    кривые X25519:P-256:P-384:P-521, ChaCha20 перед AES-256, БЕЗ sec-ch-ua*).
+#   - "safari"     : Apple Safari / WebKit (GREASE без перестановки расширений,
+#                    кривые X25519:P-256:P-384:P-521, OCSP+SCT, БЕЗ sec-ch-ua*).
+#   - "randomized" : Полиморфный браузерный отпечаток — рандомизирует набор расширений,
+#                    порядок кривых и шифров TLS 1.2 в рамках валидного браузера для каждой сессии,
+#                    защищая от сигнатурного бана по статическому JA3/JA4 хешу на ТСПУ.
+#
+# Может быть переопределен точечно для конкретного узла в [[servers]] или в DSN (?fp=firefox).
+tls_fingerprint = "chrome"
+
+# -------------------------------------------------------------------------
+# Защита от активного спуфинга ТСПУ (MITM / подмена TLS-сертификата)
+# -------------------------------------------------------------------------
+# Защищает транспорты AHTTP, WebSocket, WRTC и DoH от активного перехвата
+# TLS-рукопожатия оборудованием ТСПУ (инжект поддельного ServerHello/Certificate
+# с целью расшифровать первый пакет и обнаружить скрытый путь /handshake или /socket).
+#
+# При tls_verify_peer = true (включено по умолчанию):
+#   1. Клиент проверяет цепочку сертификата сервера по системному хранилищу корневых CA
+#      и сверяет соответствие домена SNI (SubjectAltName) ИЛИ проверяет SHA-256 пин.
+#   2. Если ТСПУ подменяет сертификат на самоподписанный или чужой домен-заглушку,
+#      клиент мгновенно обрывает соединение НА ЭТАПЕ TLS HANDSHAKE до отправки
+#      первого байта полезной нагрузки (0 байт HTTP/WS/ASTP данных утекает в сенсор DPI).
+#
+# Установите false (глобально здесь или в [[servers]] / ?verify=0), ТОЛЬКО если вы
+# подключаетесь к тестовому узлу с самоподписанным сертификатом без настроенного tls_pin_sha256.
+tls_verify_peer = true
+
+[quic_transport]
+algorithm = "bbr"
+expected_rtt_ms = 75
+bandwidth_down_mbps = 200
+bandwidth_up_mbps = 200
+
+# Буферы увеличены до 32 MB для снятия любых ограничений на скачивание
+receive_window = 33554432
+stream_receive_window = 33554432
+send_window = 33554432
+
+enable_gso = true
+idle_timeout_seconds = 21600
+
+# Ограничение физического размера кадра для удаления IP-фрагментации
+max_mtu = 1400
+
+keep_alive_interval_seconds = 20
+
+[routing]
+# Автоматическое обновление скомпилированного кэша правил Smart DNS & AdBlock (rules.abc)
+rules_url = "{{RULES_URL}}"
+
+[wrtc]
+# =========================================================================
+# Тонкая настройка транспорта WebRTC / Контур.Толк (Jitsi SFU / JVB)
+# =========================================================================
+# Секция содержит два профиля значений (аналогично секции [ahttp]):
+#   1. Активные значения по умолчанию — для ЧИСТОГО (прямого) коннекта сервера и клиента к KTalk.
+#   2. Закомментированные значения (# ... # для CF WARP) — для работы в условиях, когда
+#      забаненный ТСПУ зарубежный сервер пробивается к серверам Контур.Толк в РФ
+#      через WireGuard-туннель Cloudflare WARP (wgcf-profile с узким MTU = 1280 и двойным NAT).
+
+# --- Тайм-ауты сигнализации KTalk HTTP API и XMPP/Colibri WebSocket (в секундах) ---
+
+# Тайм-аут установки TCP/TLS соединения с HTTP API Контур.Толк при авторизации гостевой сессии
+http_connect_timeout_secs = 10
+# http_connect_timeout_secs = 15 # для CF WARP (запас времени на TCP/TLS-рукопожатие через дополнительный хоп wgcf-profile)
+
+# Общий тайм-аут выполнения HTTP-запросов к API Контур.Толк (получение токена и данных комнаты)
+http_request_timeout_secs = 15
+# http_request_timeout_secs = 20 # для CF WARP (предотвращает обрыв авторизации при задержках на выходе WARP)
+
+# Тайм-аут подключения к сигнальному XMPP WebSocket, SASL-авторизации, входа в MUC-комнату и запроса STUN/TURN (extdisco)
+xmpp_handshake_timeout_secs = 15
+# xmpp_handshake_timeout_secs = 20 # для CF WARP (запас на полный цикл XMPP-сигнализации через туннель WARP)
+
+# Тайм-аут отправки одного фрейма в WebSocket (XMPP-сигнализация или резервный канал Colibri-WS)
+ws_write_timeout_secs = 5
+# ws_write_timeout_secs = 15 # для CF WARP (защищает от ложного закрытия сокета при кратковременных очередях в wgcf-profile во время Speedtest/бурстов)
+
+# Тайм-аут установки управляющего и резервного WebSocket-соединения (Colibri-WS) напрямую с медиасервером JVB
+colibri_ws_connect_timeout_secs = 10
+# colibri_ws_connect_timeout_secs = 15 # для CF WARP (запас на установку TLS WebSocket до JVB через WARP)
+
+# Тайм-аут чтения входящих кадров из Colibri-WS до тихого фонового переподключения сокета без разрыва видео-тракта (сек)
+colibri_ws_read_timeout_secs = 25
+# colibri_ws_read_timeout_secs = 25 # для CF WARP (тихое переоткрытие зависшего в WARP TCP-сокета Colibri-WS без сброса UDP/RTP)
+
+# --- Обход L4 ECMP / LAG фильтрации ТСПУ (Fast TCP Port Hopping и Multi-Socket UDP ICE) ---
+
+# Количество быстрых попыток перебора исходных TCP-портов (src_port) при установке HTTP API, XMPP-WS и Colibri-WS соединений
+tcp_port_hop_attempts = 8
+# tcp_port_hop_attempts = 8 # для CF WARP
+
+# Тайм-аут одной быстрой попытки TCP-соединения при переборе исходных портов (в миллисекундах)
+tcp_port_hop_timeout_ms = 1000
+# tcp_port_hop_timeout_ms = 1500 # для CF WARP
+
+# Количество параллельных локальных UDP-сокетов (0.0.0.0:0) для сбора множественных ICE host-кандидатов с разными src_port
+udp_ice_socket_count = 6
+# udp_ice_socket_count = 6 # для CF WARP
+
+# --- Системные буферы UDP, реактор и параметры ICE / STUN / TURN ---
+
+# Размер системных буферов UDP-сокета (SO_RCVBUF / SO_SNDBUF) в байтах (8 МБ исключают дропы пакетов ядром ОС на пиках скорости)
+udp_socket_buffer_size = 8388608
+
+# Количество рабочих потоков асинхронного реактора WebRTC для шифрования/дешифрования SRTP и сборки VP8-кадров
+reactor_pool_size = 4
+
+# Время отсутствия входящих STUN/ICE-ответов до перевода соединения в статус Disconnected (в миллисекундах)
+ice_disconnected_timeout_ms = 10000
+# ice_disconnected_timeout_ms = 15000 # для CF WARP (устойчивость к кратковременному джиттеру UDP внутри туннеля WARP)
+
+# Время до полного разрыва ICE-сессии (статус Failed) при потере связности (в миллисекундах)
+ice_failed_timeout_ms = 25000
+# ice_failed_timeout_ms = 35000 # для CF WARP (не дает ICE преждевременно сбрасывать сессию при перегрузке канала WARP)
+
+# Интервал отправки проверочных пакетов STUN Binding Request (ICE keep-alive) для поддержания открытого порта в NAT (в миллисекундах)
+ice_keepalive_interval_ms = 2000
+# ice_keepalive_interval_ms = 1500 # для CF WARP (более частый прогрев UDP-трансляции в жестком NAT Cloudflare WARP)
+
+# Интервал проактивного обновления TURN/TURNS-аллокации (Refresh) и ротации ключей до истечения 10-минутного окна coturn (в секундах)
+turn_refresh_interval_secs = 90
+
+# Разрешить ли использование TURN/TURNS релеев (включая локальные TCP-прокси turns_proxy на порт 443)
+# для соединения с центральным медиасервером JVB (в режиме p2p_direct TURN используется всегда независимо от этого флага).
+# ЗАЧЕМ ЭТО НУЖНО:
+#   - На чистом коннекте (true) TURN/TURNS служит резервным путем до JVB, если провайдер полностью блокирует внешний UDP.
+#   - При работе через CF WARP (false) UDP до JVB уже свободно идет внутри WireGuard-туннеля wgcf-profile.
+#     Если оставить true, ICE может выбрать TURN-кандидат в той же подсети Яндекс.Облака и пустить медиапоток
+#     через локальный TCP-прокси (turns_proxy), что режет скорость скачивания в 5-7 раз (Head-of-Line blocking)
+#     и вызывает обрыв сессии по ошибке "TURN transaction timed out" при ротации аллокации на 90-й секунде.
+jvb_use_turn = false
+# jvb_use_turn = true # включать ТОЛЬКО если провайдер полностью блокирует прямой UDP до JVB (10000-10010/udp)
+
+# Включить для режима «БС» (белые списки / блокировка UDP) — ставит TURNS TCP:443 (`turns_proxy`) в приоритетный Tier 1
+turns_proxy_priority = false
+# turns_proxy_priority = true # для режима «БС»
+
+# --- Параметры MTU, микро-батчинга VP8 (media_video) и коалесценции пакетов ---
+
+# Максимальный размер приемного буфера SCTP для режима DataChannel (в байтах)
+sctp_max_receive_buffer_size = 8388608
+
+# Максимальный размер SCTP-пакета внутри DTLS для режима DataChannel (в байтах)
+sctp_mtu = 1200
+# sctp_mtu = 1000 # для CF WARP (гарантирует прохождение SCTP/DTLS-фреймов через MTU 1280 интерфейса wgcf-profile без фрагментации)
+
+# Размер буфера чтения одного входящего UDP/RTP пакета из сетевого сокета (в байтах)
+receive_mtu = 1600
+
+# Суммарный запас (overhead) в байтах под заголовки внешнего IPv4 (20B) + UDP (8B) + SRTP (16B) +
+# RTP (12B) + VP8 Payload Descriptor/Header (24B) + тег маршрутизации JVB (2B) + ASTP (28B) = 110 байт.
+# Вычитается из серверного [network] mtu при автоматическом расчете эффективного MTU виртуального TUN-интерфейса.
+video_mtu_overhead = 110
+# video_mtu_overhead = 110 # для CF WARP (при серверном mtu = 1100 устанавливает TUN MTU = 990 Б)
+
+# Нижний допустимый порог автоматического расчета MTU виртуального TUN-интерфейса (в байтах).
+# Значение 900 универсально позволяет работать как с прямыми серверами (server mtu = 1250 -> TUN MTU = 1140 Б),
+# так и с серверами за CF WARP (server mtu = 1100 -> TUN MTU = 990 Б) без переключения конфига на клиенте.
+min_tun_mtu = 900
+
+# Жесткий верхний предел размера одного VP8 RTP микро-батча (склеенной пачки IP-пакетов) в байтах.
+# ЗАЧЕМ ЭТО НУЖНО:
+#   - На чистом коннекте (1260) позволяет упаковывать максимум данных в один RTP-пакет под стандартный PMTU 1500.
+#   - Через CF WARP (960) гарантирует, что даже с учетом всех заголовков (ASTP + VP8 + RTP + SRTP + UDP + IPv4 + WireGuard WARP)
+#     итоговый пакет в физической сети никогда не превысит 1280 байт, полностью устраняя потерю пакетов и просадку Download-скорости.
+max_video_batch_bytes = 1260
+# max_video_batch_bytes = 960 # для CF WARP (исключает переполнение MTU 1280 на интерфейсе wgcf-profile и потерю кадров на скачивании)
+
+# Максимальное количество мелких IP-пакетов (TCP ACK, DNS и др.), склеиваемых в один VP8 RTP кадр без задержки (1 = отключить склейку)
+video_batch_max_packets = 16
+# video_batch_max_packets = 12 # для CF WARP (чуть меньшая пачка снижает пиковый размер кадра при двойной инкапсуляции)
+
+# Максимальное количество IP-пакетов, вычитываемых из TUN-интерфейса за один неблокирующий цикл отправки на клиенте
+uplink_burst_max_packets = 64
+# uplink_burst_max_packets = 32 # для CF WARP (более плавная отправка пакетов без переполнения буфера очереди wgcf-profile)
+
+# Максимальный размер пачки в байтах для резервного WebSocket-батчера (Colibri-WS / DataChannel / прогрев сессии до старта видеопотока)
+ws_batcher_max_bytes = 12288
+# ws_batcher_max_bytes = 4096 # для CF WARP (компактные WS-фреймы быстрее проходят через TCP-стек внутри туннеля WARP)
+
+# Максимальная задержка накопления пачки в резервном WebSocket-батчере (в миллисекундах)
+ws_batcher_max_delay_ms = 2
+# ws_batcher_max_delay_ms = 2 # для CF WARP
+
+# Интервал отправки фоновых холостых ключевых кадров VP8 при отсутствии трафика для удержания видео-трека на JVB (в миллисекундах)
+video_keepalive_interval_ms = 1000
+# video_keepalive_interval_ms = 500 # для CF WARP (более частый прогрев медиа-тракта через NAT WARP)
+
+# --- Сторожевые таймеры (watchdog) контроля целостности WebRTC и внутритуннельного тракта (в секундах) ---
+
+# Время нахождения PeerConnection в состоянии Disconnected до принудительного пересоздания сессии
+watchdog_disconnected_timeout_secs = 8
+# watchdog_disconnected_timeout_secs = 12 # для CF WARP (дает ICE время пережить кратковременную просадку маршрута WARP без разрыва VPN)
+
+# Льготный период на старте сессии для открытия управляющего канала (Colibri-WS или DataChannel)
+watchdog_channel_grace_secs = 12
+# watchdog_channel_grace_secs = 15 # для CF WARP (запас времени на инициализацию каналов через туннель WARP)
+
+# Тайм-аут ожидания штатного закрытия PeerConnection при остановке или переподключении
+peer_close_timeout_secs = 3
+
+# Интервал отправки внутритуннельных пингов (anet_ping) от клиента к серверу для проверки сквозной проходимости тракта
+tunnel_ping_interval_secs = 15
+# tunnel_ping_interval_secs = 10 # для CF WARP (более частый контроль живого тракта и поддержание NAT-сессии)
+
+# Тайм-аут отсутствия ответов (anet_pong) или входящих пакетов до автоматического переподключения сессии
+tunnel_ping_timeout_secs = 45
+# tunnel_ping_timeout_secs = 60 # для CF WARP (защита от ложных реконнектов при пиковой загрузке канала WARP)
+
+# Интервал профилактической ротации пустой комнаты Контур.Толк на сервере при отсутствии активных клиентов
+server_idle_room_rotation_secs = 1800
+
+[imap]
+# =========================================================================
+# Тонкая настройка транспорта IMAP (Mail.ru / VK Cloud, порт 993/TLS)
+# =========================================================================
+# Интервал перевхода в IDLE (keepalive) в состоянии покоя (без активного трафика) для обхода NAT и RFC 2177 (в мс, 10 сек)
+idle_refresh_interval_ms = 10000
+
+# Короткий интервал удержания IDLE во время активного обмена трафиком (в мс, 400 мс).
+# Исключает 5–10 секундные провалы скорости, когда уведомление `* N EXISTS` от Mail.ru попадает в «Слепое окно» между FETCH и IDLE.
+idle_active_poll_ms = 400
+
+# Время удержания быстрого режима опроса (`idle_active_poll_ms`) после последнего принятого или отправленного пакета (в мс, 5 сек).
+idle_active_window_ms = 5000
+
+# Тайм-аут выполнения одной IMAP-команды (LOGIN, CAPABILITY, SELECT, APPEND, FETCH, STORE, EXPUNGE) в мс
+command_timeout_ms = 15000
+
+# Максимальная задержка накопления микро-батча перед первым APPEND (в мс, 5..50)
+batch_coalesce_ms = 15
+
+# Максимальный размер одной склеенной пачки IP-пакетов до шифрования (в КБ, от 4 до 512 КБ без переполнения u16)
+max_batch_kb = 128
+
+# Максимальное число писем при порционном индексированном FETCH (в основном потоковом 1-RTT режиме используется UID FETCH <last+1>:4294967295)
+fetch_max_messages = 3
+
+# Порог накопления прочитанных писем для попутного пакетного удаления (UID STORE +FLAGS.SILENT (\Deleted) + UID EXPUNGE)
+expunge_batch_size = 25
+
+# Пауза отсутствия новых входящих писем перед фоновой очисткой накопленных прочитанных UID (в мс, 1.5 сек)
+expunge_idle_delay_ms = 1500
+
+# Максимальное окно неподтвержденных батчей в полете на один ящик до срабатывания Backpressure
+max_inflight_batches = 35
+
+# Емкость очереди bulk-пакетов из TUN (вместе с Linux TCP Small Queues обеспечивает плавный pacing без потерь пакетов; ICMP, DNS и мелкие пакеты <= 256 Б идут в приоритетную Fast-Lane очередь)
+tx_queue_capacity = 256
+
+# Автоматическое определение поддержки расширения `LITERAL+` / `LITERAL-` по ответу `CAPABILITY` после `LOGIN` (1-RTT APPEND)
+literal_plus_auto = true
+
+# Пауза перед переключением / повторным подключением к ящику при срабатывании анти-спам лимита THROTTLED / OVERQUOTA (в мс)
+throttle_backoff_ms = 30000
+
+[connectivity]
+# Включить фоновую диагностику состояния сети и линейный индикатор пульса (true / false)
+enabled = true
+
+# Интервал отправки внутритуннельных ICMP-пингов для замера RTT при подключенном туннеле (в секундах, рекомендуется 1–2 с)
+ping_interval_secs = 2
+
+# Интервал опроса контрольных точек для оценки состояния внешних и локальных маршрутов (в секундах, рекомендуется 2–6 с)
+probe_interval_secs = 4
+
+# Тайм-аут ожидания ответа от одной контрольной точки при проверке связности (в миллисекундах)
+timeout_ms = 2500
+
+# Глобальные контрольные точки (проверка доступности внешних международных маршрутов)
+global_targets = [
+    "https://www.google.com/generate_204",
+    "https://connectivitycheck.gstatic.com/generate_204",
+    "https://store.steampowered.com/favicon.ico",
+]
+
+# Локальные контрольные точки (проверка базовой внутренней связности при деградации внешних маршрутов)
+domestic_targets = [
+    "https://ya.ru",
+    "https://vk.com",
+    "https://www.gosuslugi.ru",
+]
+
+# =========================================================================
+# Профили браузерной мимикрии L4 (TLS ClientHello) и L7 (HTTP/2 + WebSocket)
+# =========================================================================
+# Встроенные дефолты зашиты в бинарник, но продублированы здесь, чтобы любые
+# шифры, кривые, расширения, окна HTTP/2, порядок WS-заголовков и User-Agent
+# можно было переопределить без пересборки клиента.
+[[browser_profiles]]
+name = "Chrome"
+cipher_list = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA"
+curves = "X25519MLKEM768:X25519:P-256:P-384"
+sigalgs = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha512"
+grease = true
+permute_extensions = true
+session_ticket = true
+ocsp_stapling = true
+signed_cert_timestamps = true
+ech_grease = true
+alps_h2 = true
+cert_compression = ["brotli"]
+h2_initial_stream_window_size = 6291456
+h2_initial_connection_window_size = 15728640
+h2_max_header_list_size = 262144
+ws_headers_order = [
+    "Host",
+    "Connection",
+    "Pragma",
+    "Cache-Control",
+    "User-Agent",
+    "Upgrade",
+    "Origin",
+    "Sec-WebSocket-Version",
+    "Accept-Encoding",
+    "Accept-Language",
+    "Cookie",
+    "Sec-WebSocket-Key",
+    "Sec-WebSocket-Extensions",
+]
+user_agents = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+]
+headers = [
+    "Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding: gzip, deflate, br, zstd",
+]
+
+[[browser_profiles]]
+name = "Firefox"
+cipher_list = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA"
+curves = "X25519:P-256:P-384:P-521"
+sigalgs = "ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha256:rsa_pkcs1_sha384:rsa_pkcs1_sha512:ecdsa_sha1:rsa_pkcs1_sha1"
+grease = false
+permute_extensions = false
+session_ticket = true
+ocsp_stapling = true
+signed_cert_timestamps = false
+ech_grease = true
+alps_h2 = false
+cert_compression = ["zlib", "brotli", "zstd"]
+h2_initial_stream_window_size = 131072
+h2_initial_connection_window_size = 12582912
+h2_max_header_list_size = 65536
+ws_headers_order = [
+    "Host",
+    "User-Agent",
+    "Accept",
+    "Accept-Language",
+    "Accept-Encoding",
+    "Sec-WebSocket-Version",
+    "Origin",
+    "Sec-WebSocket-Extensions",
+    "Sec-WebSocket-Key",
+    "Cookie",
+    "Connection",
+    "Pragma",
+    "Cache-Control",
+    "Upgrade",
+]
+user_agents = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0",
+]
+headers = [
+    "Accept-Language: ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
+    "Accept-Encoding: gzip, deflate, br, zstd",
+]
+
+[[browser_profiles]]
+name = "Safari"
+cipher_list = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA:AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-SHA:AES128-SHA:ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:DES-CBC3-SHA"
+curves = "X25519:P-256:P-384:P-521"
+sigalgs = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha384:rsa_pkcs1_sha512:ecdsa_sha1:rsa_pkcs1_sha1"
+grease = true
+permute_extensions = false
+session_ticket = false
+ocsp_stapling = true
+signed_cert_timestamps = true
+ech_grease = false
+alps_h2 = false
+cert_compression = ["zlib"]
+h2_initial_stream_window_size = 4194304
+h2_initial_connection_window_size = 10485760
+h2_max_header_list_size = 65536
+ws_headers_order = [
+    "Host",
+    "Upgrade",
+    "Connection",
+    "Sec-WebSocket-Key",
+    "Origin",
+    "Sec-WebSocket-Version",
+    "User-Agent",
+    "Accept-Language",
+    "Accept-Encoding",
+    "Cookie",
+    "Sec-WebSocket-Extensions",
+]
+user_agents = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1",
+]
+headers = [
+    "Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding: gzip, deflate, br",
+]

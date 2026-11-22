@@ -1,0 +1,23 @@
+name: anet-capacity-target
+services:
+  capacity-target:
+    image: nginxinc/nginx-unprivileged:1.28-alpine@sha256:7377697a821c131a924a7105fafbe7414db4e9fcc77a6f08f776f33f141ec3f8
+    entrypoint: [nginx]
+    command: [-c, /etc/nginx/capacity.conf, -g, "daemon off;"]
+    ports: ["${CAPACITY_BIND:-127.0.0.1}:${CAPACITY_PORT:-9444}:9444"]
+    volumes:
+      - ./capacity.conf:/etc/nginx/capacity.conf:ro
+      - ${CAPACITY_SERVER_TLS_DIR:?set server TLS directory}:/etc/anet/tls:ro
+      - type: bind
+        source: ${CAPACITY_PAYLOAD:?set path to 65536-byte file}
+        target: /etc/anet/payload.bin
+        read_only: true
+        bind: {create_host_path: false}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    pids_limit: 32
+    mem_limit: 48m
+    cpus: 0.25

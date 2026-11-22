@@ -1,0 +1,1865 @@
+use super::{ClientTransport, ConnectionResult, ShutdownHook};
+use crate::auth::{AuthChannel, AuthHandler};
+use crate::config::{CoreConfig, ServerConfig};
+use crate::events::{status, warn as emit_warn};
+use anet_common::boring_tls::set_default_tls_config;
+use anet_common::consts::{
+    COALESCE_BUDGET_BYTES, VIDEO_BATCH_MARKER, VIDEO_WARMUP_MARKER_HI, VIDEO_WARMUP_MARKER_LO,
+    VIDEO_WARMUP_PAYLOAD, VP8_ASTP_PREFIX_LEN, WRTC_CLIENT_CONSTRAINTS_REASSERT_COUNT,
+    WRTC_CLIENT_CONSTRAINTS_REASSERT_INTERVAL_SECS, WRTC_DEFAULT_FALLBACK_JVB_IP,
+    WRTC_DEFAULT_FALLBACK_JVB_PORT, WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+    WRTC_DISCOVER_BROADCAST_INTERVAL_SECS, WRTC_DUPLEX_BUFFER_SIZE,
+    WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN, WRTC_P2P_ICE_GATHER_POLL_ATTEMPTS,
+    WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS, WRTC_VIDEO_CHANNEL_CAPACITY, WRTC_WATCHDOG_TICK_SECS,
+};
+use anet_common::encryption::Cipher;
+use anet_common::handshake_fragmentation::FragmentConfig;
+use anet_common::http_help::BrowserProfile;
+use anet_common::icmp_probe::clamp_tcp_mss_bytes;
+use anet_common::stream_framing::{FrameReader, frame_packet_into};
+use anet_common::transport::{
+    unwrap_packet_bytes, wrap_packet_padded, wrap_packet_slice, wrap_packet_slice_with_headroom,
+};
+use anet_common::wrtc::{
+    batcher::{unpack_batch, PacketBatcher},
+    colibri::{
+        client_tag_from_ip, compute_server_endpoint_suffix_from_b64, verify_beacon,
+        ColibriMessage, ReceiverVideoConstraints, WrtcMessage, WrtcMode,
+    },
+    jingle::{
+        filter_p2p_sdp_relay_only, is_valid_jvb_candidate_ip, parse_jingle_session, JingleAction,
+    },
+    peer::{cache_resolved_ice_host, create_p2p_channel, P2pSession, WrtcPeer},
+    providers::{ProviderKind, WrtcProviderRegistry},
+    stealth::generate_random_guest_name,
+    xmpp::XmppSession,
+    xmpp_xml::{parse_xmpp_stanzas, InboundXmpp},
+};
+use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
+use base64::prelude::*;
+use bytes::{BufMut, Bytes, BytesMut};
+use http::Uri;
+use log::{info, trace, warn};
+use rand::random;
+use rtc::peer_connection::sdp::RTCSessionDescription;
+use std::collections::HashSet;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, SystemTime};
+use tokio::io::{duplex, split, AsyncWriteExt};
+use tokio::net::lookup_host;
+use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::task::{yield_now, AbortHandle};
+use tokio::time::{
+    interval, sleep, sleep_until, timeout, Instant as TokioInstant, MissedTickBehavior,
+};
+
+fn current_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+pub struct WrtcTransport {
+    config: CoreConfig,
+    server: ServerConfig,
+}
+
+impl WrtcTransport {
+    pub fn new(config: CoreConfig, server: ServerConfig) -> Self {
+        Self { config, server }
+    }
+}
+
+struct WrtcAuthChannel {
+    peer: Arc<WrtcPeer>,
+    target_server_id: String,
+}
+
+#[async_trait]
+impl AuthChannel for WrtcAuthChannel {
+    async fn send(&self, data: Bytes, _frag: &FragmentConfig) -> Result<()> {
+        let b64 = BASE64_STANDARD.encode(&data);
+        let msg = ColibriMessage::astp(self.target_server_id.clone(), b64);
+        self.peer.send(msg).await?;
+        Ok(())
+    }
+
+    async fn recv(&self, wait_timeout: Duration) -> Result<Bytes> {
+        let receive = async {
+            while let Some(msg) = self.peer.recv().await {
+                if let WrtcMessage::Astp { data } = msg.msg_payload {
+                    if let Ok(bytes) = BASE64_STANDARD.decode(&data) {
+                        return Ok(Bytes::from(bytes));
+                    }
+                }
+            }
+            bail!("DataChannel closed during authentication")
+        };
+
+        timeout(wait_timeout, receive)
+            .await
+            .context("ASTP authentication timeout over WebRTC DataChannel")?
+    }
+}
+
+#[async_trait]
+impl ClientTransport for WrtcTransport {
+    async fn connect(&self) -> Result<ConnectionResult> {
+        let (domain, room_name) = self.server.wrtc_room()?;
+        let tls_cfg = self.server.effective_tls_config(&self.config.stealth);
+        set_default_tls_config(tls_cfg.clone());
+        let browser_profile = BrowserProfile::with_tls_config(tls_cfg);
+        let guest_name = generate_random_guest_name();
+
+        let mut wrtc_cfg = self.config.wrtc.clone();
+        if let Some(use_turn) = self.server.wrtc_use_turn {
+            wrtc_cfg.jvb_use_turn = use_turn;
+        }
+        if let Some(turns_prio) = self.server.wrtc_turns_priority {
+            wrtc_cfg.turns_proxy_priority = turns_prio;
+        }
+
+        let provider_kind = WrtcProviderRegistry::detect(&domain);
+        info!(
+            "[WRTC] Connecting to {:?} room '{}' at domain '{}' as '{}'...",
+            provider_kind, room_name, domain, guest_name
+        );
+
+        let bootstrap = WrtcProviderRegistry::bootstrap_room(
+            &domain,
+            &room_name,
+            Some(&guest_name),
+            &browser_profile,
+            &wrtc_cfg,
+        )
+        .await
+        .context("Failed to bootstrap WRTC conference room")?;
+
+        let ping_secs = self.server.wrtc_ping_interval_secs.unwrap_or(30);
+        let mut xmpp = XmppSession::connect_from_bootstrap(
+            &bootstrap,
+            Some(&guest_name),
+            None,
+            &browser_profile,
+            ping_secs,
+            &wrtc_cfg,
+        )
+        .await
+        .context("Failed to establish XMPP session and join conference MUC")?;
+
+        let fallback_ip_owned = self
+            .server
+            .wrtc_fallback_jvb_ip
+            .clone()
+            .or_else(|| {
+                if provider_kind == ProviderKind::StandardJitsi {
+                    xmpp.remote_ip.map(|ip| ip.to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| WRTC_DEFAULT_FALLBACK_JVB_IP.to_string());
+        let fallback_ip = fallback_ip_owned.as_str();
+        let fallback_port = self
+            .server
+            .wrtc_fallback_jvb_port
+            .unwrap_or(WRTC_DEFAULT_FALLBACK_JVB_PORT);
+
+        if !bootstrap.pre_allocate_before_muc {
+            let _ = xmpp.request_conference_allocation().await;
+        }
+
+        let server_pub_key = self
+            .server
+            .server_pub_key
+            .as_deref()
+            .or_else(|| {
+                if !self.config.keys.server_pub_key.is_empty() {
+                    Some(self.config.keys.server_pub_key.as_str())
+                } else {
+                    None
+                }
+            });
+
+        let expected_srv_suffix = server_pub_key
+            .and_then(|pk| compute_server_endpoint_suffix_from_b64(pk, &bootstrap.conference_id));
+
+        let timeout_secs = self.server.timeout_secs.max(15);
+        let mut parsed_session = None;
+        let jingle_wait_start = TokioInstant::now();
+        let jingle_deadline = jingle_wait_start + Duration::from_secs(timeout_secs);
+
+        while TokioInstant::now() < jingle_deadline {
+            match timeout(Duration::from_millis(400), xmpp.recv_stanza()).await {
+                Ok(Some(stanza)) => {
+                    if let Some(session) = parse_jingle_session(&stanza, fallback_ip, fallback_port) {
+                        parsed_session = Some(session);
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    xmpp.leave_room().await;
+                    bail!("XMPP WebSocket closed while waiting for Jicofo session-initiate");
+                }
+                Err(_) => {
+                    if jingle_wait_start.elapsed() >= Duration::from_secs(4) {
+                        let occupants = xmpp.get_other_occupants();
+                        let has_srv_occupant = match expected_srv_suffix {
+                            Some(ref suffix) => {
+                                occupants.iter().any(|occ| occ.ends_with(suffix.as_str()))
+                            }
+                            None => !occupants.is_empty(),
+                        };
+                        if !has_srv_occupant {
+                            xmpp.leave_room().await;
+                            bail!(
+                                "No active server occupant in room '{room_name}' after 4s (fast failover)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let Some(session) = parsed_session else {
+            xmpp.leave_room().await;
+            bail!(
+                "Failed to receive Jicofo session-initiate within {timeout_secs}s (no server or bridge session in room)"
+            );
+        };
+
+        if session.sources.len() > 50 || session.video_sources.len() > 50 {
+            warn!(
+                "[WRTC Client] Ktalk room '{room_name}' contains {} audio / {} video Jingle sources in Jicofo (stale ghost endpoints). If WRTC VIDEO fails to warm up due to multi-bridge JVB split, switch to a fresh Ktalk room URL.",
+                session.sources.len(),
+                session.video_sources.len()
+            );
+        }
+
+        let mut bypass_ips: Vec<IpAddr> = Vec::new();
+
+        if let Some(ip) = xmpp.remote_ip {
+            if ip.is_ipv4() && !ip.is_loopback() {
+                bypass_ips.push(ip);
+            }
+        }
+        if let Ok(ip) = domain.parse::<IpAddr>() {
+            if ip.is_ipv4() && !ip.is_loopback() {
+                bypass_ips.push(ip);
+            }
+        } else if let Ok(resolved) = lookup_host((domain.as_str(), 443)).await {
+            for addr in resolved {
+                if addr.ip().is_ipv4() && !addr.ip().is_loopback() {
+                    bypass_ips.push(addr.ip());
+                }
+            }
+        }
+
+        if let Some(ref ws_url) = session.transport.colibri_ws_url {
+            if let Ok(uri) = ws_url.parse::<Uri>() {
+                if let Some(host) = uri.host() {
+                    let port = uri.port_u16().unwrap_or(443);
+                    let mut ws_ips = Vec::new();
+                    if let Ok(ip) = host.parse::<IpAddr>() {
+                        if ip.is_ipv4() && !ip.is_loopback() {
+                            bypass_ips.push(ip);
+                            ws_ips.push(ip);
+                        }
+                    } else if let Ok(resolved) = lookup_host((host, port)).await {
+                        for addr in resolved {
+                            if addr.ip().is_ipv4() && !addr.ip().is_loopback() {
+                                bypass_ips.push(addr.ip());
+                                ws_ips.push(addr.ip());
+                            }
+                        }
+                    }
+                    if !ws_ips.is_empty() {
+                        cache_resolved_ice_host(host, &ws_ips);
+                    }
+                }
+            }
+        }
+
+        for candidate in &session.transport.candidates {
+            if is_valid_jvb_candidate_ip(&candidate.ip) {
+                if let Ok(ip) = candidate.ip.parse::<IpAddr>() {
+                    if ip.is_ipv4() && !ip.is_loopback() {
+                        bypass_ips.push(ip);
+                    }
+                }
+            }
+        }
+
+        if session.transport.candidates.is_empty() {
+            if let Ok(ip) = fallback_ip.parse::<IpAddr>() {
+                if ip.is_ipv4() && !ip.is_loopback() {
+                    bypass_ips.push(ip);
+                }
+            }
+        }
+
+        let mut extdisco_bypass_log: Vec<String> = Vec::new();
+        for ice in xmpp.get_ice_servers() {
+            let mut host_ips = Vec::new();
+            if let Ok(ip) = ice.host.parse::<IpAddr>() {
+                if ip.is_ipv4() && !ip.is_loopback() {
+                    bypass_ips.push(ip);
+                    host_ips.push(ip);
+                }
+            } else if let Ok(resolved) = lookup_host((ice.host.as_str(), ice.port)).await {
+                for addr in resolved {
+                    if addr.ip().is_ipv4() && !addr.ip().is_loopback() {
+                        bypass_ips.push(addr.ip());
+                        host_ips.push(addr.ip());
+                    }
+                }
+            }
+            if !host_ips.is_empty() {
+                cache_resolved_ice_host(&ice.host, &host_ips);
+                xmpp.cache_resolved_ice_ips(&ice.host, &host_ips);
+            }
+            let proto_tag = ice
+                .urls
+                .first()
+                .map(|u| u.as_str())
+                .unwrap_or(ice.host.as_str());
+            extdisco_bypass_log.push(format!("{proto_tag} -> {host_ips:?}"));
+        }
+
+        info!(
+            "[WRTC] Resolved extdisco STUN/TURN/TURNS hosts for TUN bypass: {:?}",
+            extdisco_bypass_log
+        );
+        status(format!(
+            "[WRTC] Resolved extdisco STUN/TURN/TURNS bypass: {:?}",
+            extdisco_bypass_log
+        ));
+
+        bypass_ips.sort_unstable();
+        bypass_ips.dedup();
+        info!("[WRTC] Discovered media bypass IPs: {:?}", bypass_ips);
+        status(format!("[WRTC] Discovered media bypass IPs: {:?}", bypass_ips));
+
+        let wrtc_mode = self.server.wrtc_transport_mode();
+        info!("[WRTC] Selected WebRTC transport mode: {:?}", wrtc_mode);
+        status(format!("[WRTC] Selected transport mode: {:?}", wrtc_mode));
+
+        let audio_keepalive_ms = self.server.wrtc_media_keepalive_interval_ms.unwrap_or(20);
+        let peer = match WrtcPeer::create(
+            Some(&session),
+            Some(&xmpp),
+            fallback_ip,
+            fallback_port,
+            audio_keepalive_ms,
+            wrtc_mode,
+            &wrtc_cfg,
+        )
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                xmpp.leave_room().await;
+                return Err(e).context("Failed to initialize WebRTC PeerConnection and DataChannel");
+            }
+        };
+
+        if matches!(wrtc_mode, WrtcMode::MediaVideo | WrtcMode::Auto) {
+            if let Some(ref suffix) = expected_srv_suffix {
+                for (v_ssrc, owner) in &session.video_source_owners {
+                    if owner.ends_with(suffix.as_str()) {
+                        peer.set_expected_peer_video_ssrc(*v_ssrc);
+                        info!(
+                            "[WRTC Client] Pre-bound expected server video SSRC from session-initiate: {} (owner: {})",
+                            v_ssrc, owner
+                        );
+                    }
+                }
+                let srv_occupants: Vec<String> = xmpp
+                    .get_other_occupants()
+                    .into_iter()
+                    .filter(|occ| occ.ends_with(suffix.as_str()))
+                    .collect();
+                if !srv_occupants.is_empty() {
+                    let pre_constraints = ReceiverVideoConstraints::for_endpoints(
+                        &srv_occupants,
+                        WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                    );
+                    let _ = peer.send_video_constraints(&pre_constraints).await;
+                }
+            }
+        } else {
+            let mute_constraints = ReceiverVideoConstraints::new_all(0);
+            let _ = peer.send_video_constraints(&mute_constraints).await;
+        }
+
+        info!(
+            "[WRTC] WebRTC Peer ICE configuration: {} | Local candidates: {:?}",
+            peer.ice_tier_summary, peer.local_candidates_summary
+        );
+        status(format!(
+            "[WRTC] ICE config: {} | Local candidates: {:?}",
+            peer.ice_tier_summary, peer.local_candidates_summary
+        ));
+
+        info!("[WRTC] WebRTC Peer created. Starting server discovery...");
+        status("[WRTC] WebRTC Peer created. Starting server discovery...");
+
+        let client_nonce = format!("{:016x}", random::<u64>());
+        let deadline = TokioInstant::now() + Duration::from_secs(timeout_secs);
+        let mut disc_interval = interval(Duration::from_secs(
+            WRTC_DISCOVER_BROADCAST_INTERVAL_SECS,
+        ));
+
+        let mut verified_server_id = None;
+        while TokioInstant::now() < deadline {
+            tokio::select! {
+                _ = disc_interval.tick() => {
+                    let c_video_ssrc = match wrtc_mode {
+                        WrtcMode::MediaVideo | WrtcMode::Auto => Some(peer.video_ssrc),
+                        _ => None,
+                    };
+                    let c_mode_str = wrtc_mode.as_str();
+
+                    let current_occupants = xmpp.get_other_occupants();
+                    let target_occupants: Vec<String> = match expected_srv_suffix {
+                        Some(ref suffix) => current_occupants
+                            .into_iter()
+                            .filter(|occ| occ.ends_with(suffix.as_str()))
+                            .collect(),
+                        None => current_occupants,
+                    };
+                    for occupant in target_occupants {
+                        info!("[WRTC] Sending unicast e2ee-ping to server occupant: {occupant} (nonce: {client_nonce}, mode: {c_mode_str}, video_ssrc: {c_video_ssrc:?})");
+                        status(format!("[WRTC] Sending unicast e2ee-ping to occupant: {occupant}"));
+                        let unicast_discover = ColibriMessage::discover(
+                            Some(occupant),
+                            client_nonce.clone(),
+                            c_video_ssrc,
+                            Some(c_mode_str.to_string()),
+                        );
+                        let _ = peer.send(unicast_discover).await;
+                    }
+                }
+                stanza_opt = xmpp.recv_stanza() => {
+                    if let Some(stanza) = stanza_opt {
+                        for parsed in parse_xmpp_stanzas(&stanza, fallback_ip, fallback_port) {
+                            if let InboundXmpp::Jingle(j_sess) = parsed {
+                                let action = JingleAction::from(j_sess.action.as_str());
+                                if matches!(action, JingleAction::SourceAdd | JingleAction::DescriptionInfo) {
+                                    let filtered_video_ssrcs: Vec<u32> = if wrtc_mode == WrtcMode::MediaVideo || wrtc_mode == WrtcMode::Auto {
+                                        if let Some(ref suffix) = expected_srv_suffix {
+                                            if j_sess.video_source_owners.is_empty() {
+                                                j_sess.video_sources.clone()
+                                            } else {
+                                                j_sess
+                                                    .video_source_owners
+                                                    .iter()
+                                                    .filter(|(_, owner)| owner.ends_with(suffix.as_str()))
+                                                    .map(|(v_ssrc, _)| *v_ssrc)
+                                                    .collect()
+                                            }
+                                        } else {
+                                            j_sess.video_sources.clone()
+                                        }
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    for &v_ssrc in &filtered_video_ssrcs {
+                                        peer.set_expected_peer_video_ssrc(v_ssrc);
+                                        info!("[WRTC Client] Jicofo announced server video SSRC during discovery: {v_ssrc}");
+                                    }
+                                    peer.add_remote_ssrcs_with_rtx(
+                                        &j_sess.sources,
+                                        &filtered_video_ssrcs,
+                                        &j_sess.rtx_pairs,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+                msg_opt = peer.recv() => {
+                    if let Some(msg) = msg_opt {
+                        if let WrtcMessage::Beacon { server_id, client_nonce: beacon_nonce, signature, video_ssrc } = msg.msg_payload {
+                            info!("[WRTC] Received beacon from server: {server_id} (nonce match: {}, server_video_ssrc: {video_ssrc:?})", beacon_nonce == client_nonce);
+                            status(format!("[WRTC] Received beacon from server: {server_id} (nonce match: {}, server_video_ssrc: {video_ssrc:?})", beacon_nonce == client_nonce));
+                            if beacon_nonce == client_nonce {
+                                if wrtc_mode == WrtcMode::MediaVideo || wrtc_mode == WrtcMode::Auto {
+                                    if let Some(v_ssrc) = video_ssrc {
+                                        peer.set_expected_peer_video_ssrc(v_ssrc);
+                                        info!("[WRTC Client] Set expected server video SSRC: {v_ssrc}");
+                                        status(format!("[WRTC Client] Set expected server video SSRC: {v_ssrc}"));
+
+                                        // ИНЖЕКТИРУЕМ SSRC СЕРВЕРА В REMOTE_DESCRIPTION
+                                        peer.add_remote_video_ssrc(v_ssrc).await;
+
+                                        let constraints = ReceiverVideoConstraints::for_endpoint(
+                                            &server_id,
+                                            WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                        );
+                                        let _ = peer.send_video_constraints(&constraints).await;
+                                    }
+                                }
+                                if let Some(pub_key) = server_pub_key {
+                                    match verify_beacon(pub_key, &client_nonce, &server_id, &signature) {
+                                        Ok(true) => {
+                                            info!("[WRTC] Server beacon signature verified successfully! Server ID: {server_id}");
+                                            status(format!("[WRTC] Server beacon signature verified successfully! Server ID: {server_id}"));
+                                            verified_server_id = Some(server_id);
+                                            break;
+                                        }
+                                        Ok(false) => {
+                                            warn!("[WRTC] Server beacon signature verification FAILED! Check server_pub_key in client.toml vs server_signing_key in server.toml");
+                                            emit_warn("[WRTC] Server beacon signature verification FAILED! Check server_pub_key in client.toml vs server_signing_key in server.toml");
+                                        }
+                                        Err(e) => {
+                                            warn!("[WRTC] Error verifying server beacon: {e:#}");
+                                            emit_warn(format!("[WRTC] Error verifying server beacon: {e:#}"));
+                                        }
+                                    }
+                                } else {
+                                    info!("[WRTC] No server_pub_key configured, accepting server: {server_id}");
+                                    status(format!("[WRTC] No server_pub_key configured, accepting server: {server_id}"));
+                                    verified_server_id = Some(server_id);
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let Some(target_server_id) = verified_server_id else {
+            xmpp.leave_room().await;
+            let _ = peer.close().await;
+            bail!(
+                "Server discovery in room '{room_name}' timed out after {timeout_secs}s"
+            );
+        };
+
+        info!("[WRTC] Starting ASTP authentication with server: {target_server_id}");
+        status(format!("[WRTC] Starting ASTP authentication with server: {target_server_id}"));
+
+        let shared_peer = Arc::new(peer);
+        let auth_channel = WrtcAuthChannel {
+            peer: shared_peer.clone(),
+            target_server_id: target_server_id.clone(),
+        };
+
+        let auth_handler = match AuthHandler::new(&self.config, self.server.server_pub_key.as_deref()) {
+            Ok(h) => h,
+            Err(e) => {
+                xmpp.leave_room().await;
+                let _ = shared_peer.close().await;
+                return Err(e);
+            }
+        };
+        let (mut auth_response, shared_key) = match auth_handler.authenticate(&auth_channel).await {
+            Ok(res) => res,
+            Err(e) => {
+                xmpp.leave_room().await;
+                let _ = shared_peer.close().await;
+                return Err(e);
+            }
+        };
+
+        let cfg_max_video_batch_bytes = self.config.wrtc.max_video_batch_bytes.clamp(400, 1400);
+        if wrtc_mode == WrtcMode::MediaVideo
+            || wrtc_mode == WrtcMode::P2pDirect
+            || wrtc_mode == WrtcMode::Auto
+        {
+            let server_mtu = auth_response.mtu;
+            let video_overhead = i32::from(self.config.wrtc.video_mtu_overhead);
+            let min_tun_mtu = i32::from(self.config.wrtc.min_tun_mtu.clamp(576, 1500));
+            let adjusted_mtu = server_mtu
+                .saturating_sub(video_overhead)
+                .min((cfg_max_video_batch_bytes + 30) as i32)
+                .max(min_tun_mtu);
+            info!(
+                "[WRTC] Adjusted TUN MTU to {} (server MTU {} - {}B WebRTC RTP/SCTP overhead, max_batch={}, min_tun_mtu={})",
+                adjusted_mtu,
+                server_mtu,
+                self.config.wrtc.video_mtu_overhead,
+                cfg_max_video_batch_bytes,
+                min_tun_mtu
+            );
+            auth_response.mtu = adjusted_mtu;
+        }
+        let tcp_clamp_mtu = (auth_response.mtu as usize).clamp(576, 1500);
+        let max_single_video_pkt_bytes = tcp_clamp_mtu;
+        let max_video_batch_bytes = (auth_response.mtu as usize)
+            .saturating_sub(30)
+            .min(cfg_max_video_batch_bytes);
+        let video_batch_max_packets = self.config.wrtc.video_batch_max_packets.clamp(1, 64);
+        let uplink_burst_max_packets = self.config.wrtc.uplink_burst_max_packets.clamp(1, 256);
+        let ws_batcher_max_bytes = self.config.wrtc.ws_batcher_max_bytes.clamp(512, 65536);
+        let ws_batcher_max_delay_ms = self.config.wrtc.ws_batcher_max_delay_ms.clamp(1, 50);
+
+        info!(
+            "[WRTC] ASTP Authentication succeeded! Assigned VPN IP: {}",
+            auth_response.ip
+        );
+        status(format!("[WRTC] ASTP Authentication succeeded! Assigned VPN IP: {}", auth_response.ip));
+        let my_client_tag = client_tag_from_ip(&auth_response.ip);
+        info!(
+            "[WRTC] Fake Video Track client tag: 0x{:04X} (derived from IP {})",
+            my_client_tag, auth_response.ip
+        );
+
+        let cipher = Arc::new(Cipher::new(&shared_key));
+        let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into()?;
+        let sequence = Arc::new(AtomicU64::new(0));
+
+        let first_client_rx = Arc::new(AtomicBool::new(true));
+        let p2p_session_opt: Arc<Mutex<Option<Arc<P2pSession>>>> = Arc::new(Mutex::new(None));
+        let p2p_negotiating = Arc::new(AtomicBool::new(false));
+        let p2p_xmpp_rot = p2p_session_opt.clone();
+        let xmpp_arc = Arc::new(Mutex::new(xmpp));
+        let xmpp_bg = Arc::clone(&xmpp_arc);
+        let peer_xmpp = Arc::clone(&shared_peer);
+        let first_rx_xmpp = Arc::clone(&first_client_rx);
+        let target_srv_xmpp = target_server_id.clone();
+        let fb_ip_owned = fallback_ip.to_string();
+        let xmpp_jingle_task = tokio::spawn(async move {
+            loop {
+                if peer_xmpp.is_failed.load(Ordering::SeqCst) {
+                    return;
+                }
+                let recv_res = {
+                    let mut guard = xmpp_bg.lock().await;
+                    timeout(Duration::from_millis(50), guard.recv_stanza()).await
+                };
+                match recv_res {
+                    Ok(Some(stanza)) => {
+                        for parsed in parse_xmpp_stanzas(
+                            &stanza,
+                            &fb_ip_owned,
+                            fallback_port,
+                        ) {
+                            match parsed {
+                                InboundXmpp::Jingle(jingle) => {
+                                    match jingle.action_kind() {
+                                        JingleAction::SessionTerminate => {
+                                            warn!(
+                                                "[WRTC Client] Jicofo sent session-terminate (sid: {}, reason: {:?}). Triggering reconnect...",
+                                                jingle.sid, jingle.reason
+                                            );
+                                            emit_warn(format!(
+                                                "[WRTC Client] Jingle session terminated ({:?}). Reconnecting...",
+                                                jingle.reason
+                                            ));
+                                            peer_xmpp.failed_notify.notify_waiters();
+                                            peer_xmpp.failed_notify.notify_one();
+                                            return;
+                                        }
+                                        JingleAction::SourceAdd
+                                        | JingleAction::DescriptionInfo
+                                        | JingleAction::SessionInitiate => {
+                                            let filtered_video_ssrcs: Vec<u32> = if matches!(wrtc_mode, WrtcMode::MediaVideo | WrtcMode::Auto) {
+                                                let owned_matches: Vec<u32> = jingle
+                                                    .video_source_owners
+                                                    .iter()
+                                                    .filter(|(_, owner)| owner == &target_srv_xmpp)
+                                                    .map(|(v_ssrc, _)| *v_ssrc)
+                                                    .collect();
+                                                if !owned_matches.is_empty() {
+                                                    owned_matches
+                                                } else if jingle.video_source_owners.is_empty() {
+                                                    jingle.video_sources.clone()
+                                                } else {
+                                                    Vec::new()
+                                                }
+                                            } else {
+                                                Vec::new()
+                                            };
+                                            for &v_ssrc in &filtered_video_ssrcs {
+                                                peer_xmpp.set_expected_peer_video_ssrc(v_ssrc);
+                                            }
+                                            peer_xmpp
+                                                .add_remote_ssrcs_with_rtx(
+                                                    &jingle.sources,
+                                                    &filtered_video_ssrcs,
+                                                    &jingle.rtx_pairs,
+                                                )
+                                                .await;
+                                            if matches!(wrtc_mode, WrtcMode::MediaVideo | WrtcMode::Auto) {
+                                                let needs_constraints = first_rx_xmpp.load(Ordering::Relaxed)
+                                                    || peer_xmpp.video_rx_age_ms().map_or(true, |a| a >= 5_000);
+                                                if !filtered_video_ssrcs.is_empty() && needs_constraints {
+                                                    let constraints = ReceiverVideoConstraints::for_endpoint(
+                                                        &target_srv_xmpp,
+                                                        WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                                    );
+                                                    let _ = peer_xmpp.send_video_constraints(&constraints).await;
+                                                    peer_xmpp.force_next_keyframe();
+                                                }
+                                            } else {
+                                                let mute_constraints = ReceiverVideoConstraints::new_all(0);
+                                                let _ = peer_xmpp.send_video_constraints(&mute_constraints).await;
+                                            }
+                                        }
+                                        JingleAction::SourceRemove => {
+                                            let cur_expected = peer_xmpp.expected_peer_video_ssrc.load(Ordering::Relaxed);
+                                            let srv_removed = jingle.video_source_owners.iter().any(|(v_ssrc, owner)| {
+                                                owner == &target_srv_xmpp || (*v_ssrc != 0 && *v_ssrc == cur_expected)
+                                            }) || (cur_expected != 0 && jingle.video_sources.contains(&cur_expected));
+                                            if srv_removed {
+                                                warn!(
+                                                    "[WRTC Client] Jicofo removed server video SSRC {cur_expected} ({target_srv_xmpp}); clearing expected SSRC and re-asserting constraints"
+                                                );
+                                                peer_xmpp.set_expected_peer_video_ssrc(0);
+                                                if matches!(wrtc_mode, WrtcMode::MediaVideo | WrtcMode::Auto) {
+                                                    let constraints = ReceiverVideoConstraints::for_endpoint(
+                                                        &target_srv_xmpp,
+                                                        WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                                    );
+                                                    let _ = peer_xmpp.send_video_constraints(&constraints).await;
+                                                    peer_xmpp.force_next_keyframe();
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                InboundXmpp::JingleAck {
+                                    id: ack_id,
+                                    ..
+                                } => {
+                                    info!("[WRTC Client] Jicofo acknowledged Jingle IQ {ack_id}");
+                                    if matches!(wrtc_mode, WrtcMode::MediaVideo | WrtcMode::Auto) {
+                                        let needs_constraints = first_rx_xmpp.load(Ordering::Relaxed)
+                                            || peer_xmpp.video_rx_age_ms().map_or(true, |a| a >= 5_000);
+                                        if needs_constraints {
+                                            let constraints = ReceiverVideoConstraints::for_endpoint(
+                                                &target_srv_xmpp,
+                                                WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                            );
+                                            let _ = peer_xmpp.send_video_constraints(&constraints).await;
+                                            peer_xmpp.force_next_keyframe();
+                                        }
+                                    } else {
+                                        let mute_constraints = ReceiverVideoConstraints::new_all(0);
+                                        let _ = peer_xmpp.send_video_constraints(&mute_constraints).await;
+                                    }
+                                }
+                                InboundXmpp::ExtdiscoServices(fresh_ice) => {
+                                    peer_xmpp.rotate_turn_credentials(&fresh_ice).await;
+                                    if let Some(p2p) = p2p_xmpp_rot.lock().await.clone() {
+                                        p2p.rotate_turn_credentials(&fresh_ice).await;
+                                    }
+                                }
+                                InboundXmpp::Presence {
+                                    from,
+                                    is_unavailable: true,
+                                    ..
+                                } => {
+                                    if let Some(occupant_id) = from.split('/').nth(1) {
+                                        if occupant_id == target_srv_xmpp {
+                                            warn!(
+                                                "[WRTC Client] Server occupant {target_srv_xmpp} left the MUC room. Triggering immediate reconnect..."
+                                            );
+                                            emit_warn(format!(
+                                                "[WRTC Client] Server {target_srv_xmpp} left room. Reconnecting..."
+                                            ));
+                                            peer_xmpp.failed_notify.notify_waiters();
+                                            peer_xmpp.failed_notify.notify_one();
+                                            return;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        warn!(
+                            "[WRTC Client] XMPP signaling WebSocket closed. Triggering clean session reconnect..."
+                        );
+                        peer_xmpp.failed_notify.notify_waiters();
+                        peer_xmpp.failed_notify.notify_one();
+                        return;
+                    }
+                    Err(_) => {
+                        sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        });
+
+        let p2p_handshake_aborts: Arc<StdMutex<Vec<AbortHandle>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let spawn_p2p_handshake = {
+            let p2p_store = p2p_session_opt.clone();
+            let p2p_neg_flag = p2p_negotiating.clone();
+            let peer_sig = shared_peer.clone();
+            let target_srv = target_server_id.clone();
+            let wrtc_cfg_p2p = self.config.wrtc.clone();
+            let xmpp_for_p2p = xmpp_arc.clone();
+            let p2p_aborts = p2p_handshake_aborts.clone();
+
+            move |reason_label: &'static str| {
+                if p2p_neg_flag
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    return;
+                }
+                let p2p_store = p2p_store.clone();
+                let p2p_neg_flag = p2p_neg_flag.clone();
+                let peer_sig = peer_sig.clone();
+                let target_srv = target_srv.clone();
+                let wrtc_cfg_p2p = wrtc_cfg_p2p.clone();
+                let xmpp_for_p2p = xmpp_for_p2p.clone();
+
+                let handshake_task = tokio::spawn(async move {
+                    info!(
+                        "[P2P Direct] {reason_label}: initiating Relay-Only WebRTC P2P DataChannel with server {target_srv}..."
+                    );
+                    status(format!(
+                        "[P2P Direct] {reason_label}: initiating Relay-Only P2P with {target_srv}..."
+                    ));
+                    let fresh_ice = {
+                        let guard = xmpp_for_p2p.lock().await;
+                        guard.get_ice_servers()
+                    };
+                    match create_p2p_channel(&fresh_ice, &wrtc_cfg_p2p, &peer_sig.bind_addr).await {
+                        Ok(p2p) => {
+                            let p2p_arc = Arc::new(p2p);
+                            let old_p2p = {
+                                let mut guard = p2p_store.lock().await;
+                                guard.replace(p2p_arc.clone())
+                            };
+                            if let Some(prev) = old_p2p {
+                                prev.close().await;
+                            }
+
+                            let offer_sent_notify = Arc::new(Notify::new());
+                            let offer_aborted = Arc::new(AtomicBool::new(false));
+                            let sent_cands: Arc<StdMutex<HashSet<String>>> =
+                                Arc::new(StdMutex::new(HashSet::new()));
+                            if let Some(mut cand_rx) = p2p_arc.take_candidate_rx() {
+                                let notify_c = offer_sent_notify.clone();
+                                let aborted_c = offer_aborted.clone();
+                                let sent_cands_c = sent_cands.clone();
+                                let peer_sig_c = peer_sig.clone();
+                                let target_srv_c = target_srv.clone();
+                                let cand_task = tokio::spawn(async move {
+                                    if timeout(Duration::from_secs(10), notify_c.notified())
+                                        .await
+                                        .is_err()
+                                        || aborted_c.load(Ordering::SeqCst)
+                                    {
+                                        return;
+                                    }
+                                    while let Some(cand) = cand_rx.recv().await {
+                                        let norm = cand
+                                            .trim()
+                                            .strip_prefix("a=")
+                                            .unwrap_or(cand.trim())
+                                            .to_string();
+                                        let already_sent = sent_cands_c
+                                            .lock()
+                                            .map(|mut s| !s.insert(norm.clone()))
+                                            .unwrap_or(false);
+                                        if already_sent {
+                                            continue;
+                                        }
+                                        let msg = ColibriMessage::p2p_candidate(
+                                            target_srv_c.clone(),
+                                            norm,
+                                        );
+                                        if peer_sig_c.send(msg).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+                                if let Ok(mut tasks) = p2p_arc.bg_tasks.lock() {
+                                    tasks.push(cand_task.abort_handle());
+                                }
+                            }
+
+                            match p2p_arc.pc.create_offer(None).await {
+                                Ok(offer) => {
+                                    if let Err(e) =
+                                        p2p_arc.pc.set_local_description(offer.clone()).await
+                                    {
+                                        warn!("[P2P Direct] set_local_description error: {e}");
+                                        emit_warn(format!(
+                                            "[P2P Direct] set_local_description error: {e}"
+                                        ));
+                                        offer_aborted.store(true, Ordering::SeqCst);
+                                        offer_sent_notify.notify_waiters();
+                                        p2p_arc.close().await;
+                                        p2p_neg_flag.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                    let mut final_sdp = offer.sdp.clone();
+                                    for _ in 0..WRTC_P2P_ICE_GATHER_POLL_ATTEMPTS {
+                                        if let Some(desc) = p2p_arc.pc.local_description().await {
+                                            if desc.sdp.contains("a=candidate:") {
+                                                final_sdp = desc.sdp;
+                                                if final_sdp.contains("typ relay") {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        sleep(Duration::from_millis(
+                                            WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS,
+                                        ))
+                                        .await;
+                                    }
+                                    if final_sdp.is_empty() {
+                                        if let Some(desc) = p2p_arc.pc.local_description().await {
+                                            final_sdp = desc.sdp;
+                                        }
+                                    }
+                                    let relay_only_sdp = filter_p2p_sdp_relay_only(&final_sdp);
+                                    if let Ok(mut set) = sent_cands.lock() {
+                                        for line in relay_only_sdp.lines() {
+                                            let trimmed = line.trim();
+                                            if trimmed.starts_with("a=candidate:") {
+                                                let norm = trimmed
+                                                    .strip_prefix("a=")
+                                                    .unwrap_or(trimmed)
+                                                    .to_string();
+                                                set.insert(norm);
+                                            }
+                                        }
+                                    }
+
+                                    let offer_msg = ColibriMessage::p2p_offer(
+                                        target_srv.clone(),
+                                        relay_only_sdp,
+                                        vec![],
+                                    );
+                                    if let Err(e) = peer_sig.send(offer_msg).await {
+                                        warn!("[P2P Direct] Failed to send ice-offer: {e}");
+                                        emit_warn(format!("[P2P Direct] Send failed: {e}"));
+                                        offer_aborted.store(true, Ordering::SeqCst);
+                                        offer_sent_notify.notify_waiters();
+                                    } else {
+                                        offer_sent_notify.notify_waiters();
+                                        info!("[P2P Direct] Sent Relay-Only ice-offer to server {target_srv}");
+                                        status(format!(
+                                            "[P2P Direct] Sent Relay-Only ice-offer to server {target_srv}"
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("[P2P Direct] create_offer error: {e}");
+                                    emit_warn(format!("[P2P Direct] Create offer error: {e}"));
+                                    offer_aborted.store(true, Ordering::SeqCst);
+                                    offer_sent_notify.notify_waiters();
+                                    p2p_arc.close().await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[P2P Direct] Failed to create P2P channel: {e:#}");
+                        }
+                    }
+                    p2p_neg_flag.store(false, Ordering::SeqCst);
+                });
+                {
+                    let mut guard = p2p_aborts.lock().unwrap();
+                    guard.retain(|h| !h.is_finished());
+                    guard.push(handshake_task.abort_handle());
+                }
+            }
+        };
+
+        if wrtc_mode == WrtcMode::P2pDirect {
+            spawn_p2p_handshake("Initial connect");
+        }
+
+        let (client_stream, internal_router) = duplex(WRTC_DUPLEX_BUFFER_SIZE);
+        let (mut tunnel_read, mut tunnel_write) = split(internal_router);
+
+        let (tun_inject_tx, mut tun_inject_rx) =
+            mpsc::channel::<Bytes>(WRTC_VIDEO_CHANNEL_CAPACITY);
+
+        let tunnel_writer_task = tokio::spawn(async move {
+            let mut write_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
+            while let Some(packet) = tun_inject_rx.recv().await {
+                write_buf.clear();
+                frame_packet_into(&mut write_buf, &packet);
+                while write_buf.len() < COALESCE_BUDGET_BYTES {
+                    match tun_inject_rx.try_recv() {
+                        Ok(next_pkt) => frame_packet_into(&mut write_buf, &next_pkt),
+                        Err(_) => break,
+                    }
+                }
+                if let Err(e) = tunnel_write.write_all(&write_buf).await {
+                    warn!("[WRTC Client] tunnel_write error: {e}");
+                    break;
+                }
+            }
+        });
+        let tunnel_writer_abort = tunnel_writer_task.abort_handle();
+
+        let peer_tx = shared_peer.clone();
+        let target_srv_tx = target_server_id.clone();
+        let cipher_tx = cipher.clone();
+        let sequence_tx = sequence.clone();
+        let padding_step = self.config.stealth.padding_step;
+        let p2p_uplink = p2p_session_opt.clone();
+        let first_client_rx_tx = first_client_rx.clone();
+        let last_video_rx_secs = Arc::new(AtomicU64::new(0));
+        let last_video_rx_tx = last_video_rx_secs.clone();
+
+        let tunnel_ping_interval_secs = self.config.wrtc.tunnel_ping_interval_secs.max(1);
+        let tunnel_ping_timeout_secs = self.config.wrtc.tunnel_ping_timeout_secs.max(5);
+        let mut ping_interval =
+            interval(Duration::from_secs(tunnel_ping_interval_secs));
+        let mut watchdog_interval =
+            interval(Duration::from_secs(WRTC_WATCHDOG_TICK_SECS));
+        watchdog_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut batch_interval =
+            interval(Duration::from_millis(ws_batcher_max_delay_ms));
+        batch_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let last_pong = Arc::new(AtomicU64::new(current_timestamp_secs()));
+        let last_pong_tx = last_pong.clone();
+        let last_pong_p2p = last_pong.clone();
+        let last_pong_video = last_pong.clone();
+        let mut batcher = PacketBatcher::new(ws_batcher_max_bytes, ws_batcher_max_delay_ms);
+
+        let uplink_pacing_ns_per_byte = self.config.wrtc.uplink_pacing_ns_per_byte;
+        let pacing_horizon = Duration::from_nanos(self.config.wrtc.pacing_horizon_ns);
+
+        let uplink_task = tokio::spawn(async move {
+            let mut frame_reader = FrameReader::new();
+            let mut pending_packet: Option<Bytes> = None;
+            let mut video_batch_buf = BytesMut::with_capacity(max_video_batch_bytes + 64);
+            let mut cached_p2p: Option<Arc<P2pSession>> = None;
+            let mut dl_video_stalled = false;
+            let uplink_started_at = TokioInstant::now();
+            let mut last_stall_check_at = TokioInstant::now();
+            let mut pacing_next_at = TokioInstant::now();
+
+            if wrtc_mode == WrtcMode::MediaVideo || wrtc_mode == WrtcMode::Auto {
+                peer_tx.force_next_keyframe();
+                for _ in 0..3 {
+                    let seq = sequence_tx.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
+                        &cipher_tx,
+                        &nonce_prefix,
+                        seq,
+                        &VIDEO_WARMUP_PAYLOAD,
+                        VP8_ASTP_PREFIX_LEN,
+                    ) {
+                        let _ = peer_tx
+                            .send_video_frame_preallocated(my_client_tag, enc_buf)
+                            .await;
+                    }
+                }
+            }
+
+            loop {
+                tokio::select! {
+                    biased;
+                    packet_opt = async {
+                        if let Some(p) = pending_packet.take() {
+                            Some(p)
+                        } else {
+                            frame_reader.read_next_packet(&mut tunnel_read).await.ok().flatten()
+                        }
+                    } => {
+                        let Some(mut packet) = packet_opt else { break; };
+
+                        if wrtc_mode == WrtcMode::P2pDirect {
+                            let need_refresh = cached_p2p
+                                .as_ref()
+                                .map(|p| !p.is_ready())
+                                .unwrap_or(true);
+                            if need_refresh {
+                                cached_p2p = p2p_uplink.lock().await.clone();
+                            }
+                        }
+                        let p2p_active = cached_p2p
+                            .as_ref()
+                            .map(|p| p.is_ready())
+                            .unwrap_or(false);
+                        if wrtc_mode == WrtcMode::P2pDirect {
+                            peer_tx.set_p2p_alive(p2p_active);
+                        }
+                        let has_text_fallback = peer_tx.has_ws.load(Ordering::Relaxed)
+                            || peer_tx.dc_is_open.load(Ordering::Relaxed);
+                        if !p2p_active
+                            && (wrtc_mode == WrtcMode::MediaVideo || wrtc_mode == WrtcMode::Auto)
+                            && peer_tx.is_connected.load(Ordering::Relaxed)
+                            && has_text_fallback
+                        {
+                            if last_stall_check_at.elapsed() >= Duration::from_millis(500) {
+                                last_stall_check_at = TokioInstant::now();
+                                let rx_age_ms = peer_tx.video_rx_age_ms();
+                                let warmed_ever = !first_client_rx_tx.load(Ordering::Relaxed);
+                                let next_stalled = if warmed_ever || uplink_started_at.elapsed() >= Duration::from_secs(15) {
+                                    let age = rx_age_ms.unwrap_or(u64::MAX);
+                                    if dl_video_stalled {
+                                        age >= 3_000
+                                    } else {
+                                        age >= 10_000
+                                    }
+                                } else {
+                                    false
+                                };
+                                if next_stalled != dl_video_stalled {
+                                    dl_video_stalled = next_stalled;
+                                    if dl_video_stalled {
+                                        warn!("[WRTC Client] Downlink VP8 video stalled (age={rx_age_ms:?} ms); reporting stall to fallback downlink to Colibri-WS/DC");
+                                    } else {
+                                        info!("[WRTC Client] Downlink VP8 video recovered; clearing stall state");
+                                        peer_tx.force_next_keyframe();
+                                    }
+                                    let _ = peer_tx
+                                        .send(ColibriMessage::video_rx_stall(
+                                            target_srv_tx.clone(),
+                                            dl_video_stalled,
+                                        ))
+                                        .await;
+                                }
+                            }
+                        } else if dl_video_stalled {
+                            dl_video_stalled = false;
+                        }
+                        let can_video_mode = !p2p_active
+                            && (wrtc_mode == WrtcMode::MediaVideo || wrtc_mode == WrtcMode::Auto);
+                        let last_v_rx = last_video_rx_tx.load(Ordering::Relaxed);
+                        let video_warmed_up = !first_client_rx_tx.load(Ordering::Relaxed)
+                            && peer_tx.is_connected.load(Ordering::Relaxed)
+                            && (last_v_rx > 0
+                                && current_timestamp_secs().saturating_sub(last_v_rx) <= 10);
+
+                        for _burst_idx in 0..uplink_burst_max_packets {
+                            if packet.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                packet = clamp_tcp_mss_bytes(packet, tcp_clamp_mtu);
+                                let use_video = can_video_mode && packet.len() <= max_single_video_pkt_bytes;
+                                let batch_capable = if use_video {
+                                    video_warmed_up
+                                } else {
+                                    p2p_active
+                                };
+                                // Zero-delay micro-batching мелких пакетов (TCP ACK, DNS) в единый VP8 RTP кадр
+                                let mut batched_payload = false;
+
+                                if batch_capable && (packet.len() + 3 < max_video_batch_bytes) {
+                                    let mut batch_count = 1usize;
+                                    while batch_count < video_batch_max_packets {
+                                        let Ok(Some(next_pkt)) = frame_reader.try_next_packet() else {
+                                            break;
+                                        };
+                                        if next_pkt.len() < WRTC_MIN_IP_PACKET_LEN {
+                                            continue;
+                                        }
+                                        let next_pkt = clamp_tcp_mss_bytes(next_pkt, tcp_clamp_mtu);
+                                        let current_len = if batched_payload {
+                                            video_batch_buf.len()
+                                        } else {
+                                            1 + 2 + packet.len()
+                                        };
+                                        if current_len + 2 + next_pkt.len() <= max_video_batch_bytes {
+                                            if !batched_payload {
+                                                video_batch_buf.clear();
+                                                video_batch_buf.put_u8(VIDEO_BATCH_MARKER);
+                                                video_batch_buf.put_u16(packet.len() as u16);
+                                                video_batch_buf.put_slice(&packet);
+                                                batched_payload = true;
+                                            }
+                                            video_batch_buf.put_u16(next_pkt.len() as u16);
+                                            video_batch_buf.put_slice(&next_pkt);
+                                            batch_count += 1;
+                                        } else {
+                                            pending_packet = Some(next_pkt);
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                let seq = sequence_tx.fetch_add(1, Ordering::Relaxed);
+
+                                if use_video {
+                                    let payload_slice: &[u8] = if batched_payload {
+                                        &video_batch_buf
+                                    } else {
+                                        &packet
+                                    };
+                                    match wrap_packet_slice_with_headroom(
+                                        &cipher_tx,
+                                        &nonce_prefix,
+                                        seq,
+                                        payload_slice,
+                                        VP8_ASTP_PREFIX_LEN,
+                                    ) {
+                                        Ok(enc_buf) => {
+                                            if uplink_pacing_ns_per_byte > 0 {
+                                                let frame_wire_bytes = enc_buf.len() as u64;
+                                                let pace_now = TokioInstant::now();
+                                                let pace_start = pacing_next_at.max(pace_now);
+                                                let pace_sched = pace_start
+                                                    + Duration::from_nanos(
+                                                        frame_wire_bytes
+                                                            .saturating_mul(uplink_pacing_ns_per_byte),
+                                                    );
+                                                if pace_sched.saturating_duration_since(pace_now)
+                                                    > pacing_horizon
+                                                {
+                                                    sleep_until(pace_sched).await;
+                                                }
+                                                pacing_next_at = pace_sched;
+                                            }
+
+                                            match peer_tx
+                                                .send_video_frame_preallocated(my_client_tag, enc_buf)
+                                                .await
+                                            {
+                                                Ok(frozen) => {
+                                                    // До получения первого входящего видеокадра от сервера дублируем ASTP-срез
+                                                    // в WS/DC-батчер без копирования, только если открыт быстрый канал (Colibri-WS или SCTP DC),
+                                                    // чтобы не затапливать сигнальный XMPP MUC чат дубликатами при прогреве SFU.
+                                                    if !video_warmed_up
+                                                        && (peer_tx.has_ws.load(Ordering::Relaxed)
+                                                            || peer_tx.dc_is_open.load(Ordering::Relaxed))
+                                                    {
+                                                        batcher.push(frozen.slice(VP8_ASTP_PREFIX_LEN..));
+                                                        while batcher.should_flush() {
+                                                            let Some(batch_data) = batcher.flush() else { break; };
+                                                            let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                            let msg = ColibriMessage::astp_batch(
+                                                                target_srv_tx.clone(),
+                                                                b64,
+                                                            );
+                                                            if let Err(e) = peer_tx.send(msg).await {
+                                                                warn!("[WRTC Client] Peer send batch error: {e}");
+                                                                return;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("[WRTC Media Video OUT] send error: {e}");
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("[WRTC Client] wrap_packet error: {e}");
+                                            emit_warn(format!("[WRTC Client] wrap_packet error: {e}"));
+                                        }
+                                    }
+                                } else {
+                                    let enc_res = if p2p_active {
+                                        let payload_slice: &[u8] = if batched_payload {
+                                            &video_batch_buf
+                                        } else {
+                                            &packet
+                                        };
+                                        wrap_packet_slice(&cipher_tx, &nonce_prefix, seq, payload_slice, 0)
+                                    } else {
+                                        wrap_packet_padded(&cipher_tx, &nonce_prefix, seq, packet, padding_step)
+                                    };
+
+                                    match enc_res {
+                                        Ok(enc_bytes) => {
+                                            let mut sent_p2p = false;
+                                            if let Some(ref p2p) = cached_p2p {
+                                                if p2p_active {
+                                                    if p2p.send_packet(&enc_bytes).await.is_ok() {
+                                                        trace!("[P2P Direct OUT]");
+                                                        sent_p2p = true;
+                                                    }
+                                                }
+                                            }
+
+                                            if !sent_p2p {
+                                                batcher.push(enc_bytes);
+                                                while batcher.should_flush() {
+                                                    let Some(batch_data) = batcher.flush() else { break; };
+                                                    let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                    let msg = ColibriMessage::astp_batch(
+                                                        target_srv_tx.clone(),
+                                                        b64,
+                                                    );
+                                                    if let Err(e) = peer_tx.send(msg).await {
+                                                        warn!("[WRTC Client] Peer send batch error: {e}");
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("[WRTC Client] wrap_packet error: {e}");
+                                            emit_warn(format!("[WRTC Client] wrap_packet error: {e}"));
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(next_p) = pending_packet.take() {
+                                packet = next_p;
+                            } else if let Ok(Some(next_p)) = frame_reader.try_next_packet() {
+                                packet = next_p;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    _ = batch_interval.tick() => {
+                        while !batcher.is_empty() {
+                            let Some(batch_data) = batcher.flush() else { break; };
+                            let b64 = BASE64_STANDARD.encode(&batch_data);
+                            let msg = ColibriMessage::astp_batch(target_srv_tx.clone(), b64);
+                            if let Err(e) = peer_tx.send(msg).await {
+                                warn!("[WRTC Client] Peer flush batch send error: {e}");
+                                emit_warn(format!("[WRTC Client] Peer send batch error: {e}"));
+                                return;
+                            }
+                        }
+                    }
+                    _ = ping_interval.tick() => {
+                        let now = current_timestamp_secs();
+                        if now.saturating_sub(last_pong_tx.load(Ordering::Relaxed)) > tunnel_ping_timeout_secs {
+                            warn!(
+                                "[WRTC Client] Ping timeout (no pong from server for {}s). Reconnecting...",
+                                tunnel_ping_timeout_secs
+                            );
+                            emit_warn(format!(
+                                "[WRTC Client] Ping timeout (no pong from server for {}s). Reconnecting...",
+                                tunnel_ping_timeout_secs
+                            ));
+                            break;
+                        }
+                        let ping_msg = ColibriMessage::ping(target_srv_tx.clone());
+                        if let Err(e) = peer_tx.send(ping_msg).await {
+                            warn!("[WRTC Client] Peer ping error: {e}");
+                            emit_warn(format!("[WRTC Client] Peer ping error: {e}"));
+                            break;
+                        }
+                    }
+                    _ = watchdog_interval.tick() => {
+                        if wrtc_mode == WrtcMode::P2pDirect {
+                            let p2p_is_ready = {
+                                let guard = p2p_uplink.lock().await;
+                                guard.as_ref().map(|p| p.is_ready()).unwrap_or(false)
+                            };
+                            peer_tx.set_p2p_alive(p2p_is_ready);
+                        }
+                        if let Some(reason) = peer_tx.check_dead_reason() {
+                            warn!("[WRTC Client] Watchdog detected dead WebRTC session ({reason}). Reconnecting...");
+                            emit_warn(format!("[WRTC Client] Watchdog detected dead session ({reason}). Reconnecting..."));
+                            break;
+                        }
+                        if wrtc_mode == WrtcMode::P2pDirect {
+                            let need_reneg = {
+                                let guard = p2p_uplink.lock().await;
+                                match guard.as_ref() {
+                                    Some(p2p) => p2p.should_renegotiate(6_000, 15_000),
+                                    None => true,
+                                }
+                            };
+                            if need_reneg {
+                                cached_p2p = None;
+                                spawn_p2p_handshake("Watchdog P2P auto-recovery");
+                            }
+                        }
+                        if (wrtc_mode == WrtcMode::MediaVideo || wrtc_mode == WrtcMode::Auto)
+                            && peer_tx.is_connected.load(Ordering::Relaxed)
+                        {
+                            let has_text_fallback = peer_tx.has_ws.load(Ordering::Relaxed)
+                                || peer_tx.dc_is_open.load(Ordering::Relaxed);
+                            let rx_age_ms = peer_tx.video_rx_age_ms();
+                            if has_text_fallback {
+                                last_stall_check_at = TokioInstant::now();
+                                let warmed_ever = !first_client_rx_tx.load(Ordering::Relaxed);
+                                let next_stalled = if warmed_ever || uplink_started_at.elapsed() >= Duration::from_secs(15) {
+                                    let age = rx_age_ms.unwrap_or(u64::MAX);
+                                    if dl_video_stalled {
+                                        age >= 3_000
+                                    } else {
+                                        age >= 10_000
+                                    }
+                                } else {
+                                    false
+                                };
+                                if next_stalled != dl_video_stalled {
+                                    dl_video_stalled = next_stalled;
+                                    if dl_video_stalled {
+                                        warn!("[WRTC Client] Downlink VP8 video stalled (age={rx_age_ms:?} ms); reporting stall to fallback downlink to Colibri-WS/DC");
+                                    } else {
+                                        info!("[WRTC Client] Downlink VP8 video recovered; clearing stall state");
+                                        peer_tx.force_next_keyframe();
+                                    }
+                                    let _ = peer_tx
+                                        .send(ColibriMessage::video_rx_stall(
+                                            target_srv_tx.clone(),
+                                            dl_video_stalled,
+                                        ))
+                                        .await;
+                                }
+                            }
+                            let seq = sequence_tx.fetch_add(1, Ordering::Relaxed);
+                            if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
+                                &cipher_tx,
+                                &nonce_prefix,
+                                seq,
+                                &VIDEO_WARMUP_PAYLOAD,
+                                VP8_ASTP_PREFIX_LEN,
+                            ) {
+                                let _ = peer_tx
+                                    .send_video_frame_preallocated(my_client_tag, enc_buf)
+                                    .await;
+                            }
+                        }
+                    }
+                    _ = peer_tx.failed_notify.notified() => {
+                        warn!("[WRTC Client] WebRTC session or server signaling closed. Reconnecting...");
+                        emit_warn("[WRTC Client] WebRTC session or server signaling closed. Reconnecting...");
+                        break;
+                    }
+                }
+            }
+            tunnel_writer_task.abort();
+        });
+
+        let peer_rx = shared_peer.clone();
+        let cipher_rx = cipher.clone();
+        let tun_inject_ws = tun_inject_tx.clone();
+        let p2p_sig = p2p_session_opt.clone();
+
+        let ws_rx_task = tokio::spawn(async move {
+            loop {
+                let msg_opt = peer_rx.recv().await;
+                match msg_opt {
+                    Some(msg) => {
+                        match msg.msg_payload {
+                            WrtcMessage::P2pAnswer { sdp, .. } => {
+                                info!("[P2P Direct] Received ice-answer from server! Applying remote Relay-Only SDP...");
+                                status("[P2P Direct] Received ice-answer from server! Applying remote SDP...");
+                                let p2p_opt = {
+                                    let guard = p2p_sig.lock().await;
+                                    guard.clone()
+                                };
+                                if let Some(p2p) = p2p_opt {
+                                    let relay_sdp = filter_p2p_sdp_relay_only(&sdp);
+                                    if let Ok(answer_desc) = RTCSessionDescription::answer(relay_sdp) {
+                                        if let Err(e) = p2p.set_remote_description_and_flush(answer_desc).await {
+                                            warn!("[P2P Direct] set_remote_description error: {e}");
+                                        } else {
+                                            info!("[P2P Direct] Applied remote answer successfully. Awaiting DataChannel open...");
+                                            status("[P2P Direct] Applied remote answer successfully. Awaiting DataChannel open...");
+                                        }
+                                    }
+                                }
+                            }
+                            WrtcMessage::P2pCandidate { candidate } => {
+                                let p2p_opt = {
+                                    let guard = p2p_sig.lock().await;
+                                    guard.clone()
+                                };
+                                if let Some(p2p) = p2p_opt {
+                                    p2p.add_remote_candidate(candidate).await;
+                                }
+                            }
+                            WrtcMessage::Astp { data } => {
+                                match BASE64_STANDARD.decode(&data) {
+                                    Ok(raw_encrypted) => {
+                                        match unwrap_packet_bytes(
+                                            &cipher_rx,
+                                            Bytes::from(raw_encrypted),
+                                        ) {
+                                            Ok(decrypted) => {
+                                                last_pong.store(current_timestamp_secs(), Ordering::Relaxed);
+                                                if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
+                                                    let packets = unpack_batch(&decrypted[1..]);
+                                                    for pkt in packets {
+                                                        if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                            let clamped = clamp_tcp_mss_bytes(
+                                                                pkt,
+                                                                tcp_clamp_mtu,
+                                                            );
+                                                            let _ = tun_inject_ws.send(clamped).await;
+                                                        }
+                                                    }
+                                                } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                    let clamped = clamp_tcp_mss_bytes(
+                                                        decrypted,
+                                                        tcp_clamp_mtu,
+                                                    );
+                                                    let _ = tun_inject_ws.send(clamped).await;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                trace!("[WRTC Client] Decrypt packet error: {e}");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        trace!("[WRTC Client] Base64 decode error: {e}");
+                                    }
+                                }
+                            }
+                            WrtcMessage::AstpBatch { data } => {
+                                match BASE64_STANDARD.decode(&data) {
+                                    Ok(raw_batch) => {
+                                        let packets = unpack_batch(&raw_batch);
+                                        for enc_pkt in packets {
+                                            match unwrap_packet_bytes(&cipher_rx, enc_pkt) {
+                                                Ok(decrypted) => {
+                                                    last_pong.store(current_timestamp_secs(), Ordering::Relaxed);
+                                                    if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
+                                                        let inner_pkts = unpack_batch(&decrypted[1..]);
+                                                        for pkt in inner_pkts {
+                                                            if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                                let clamped = clamp_tcp_mss_bytes(
+                                                                    pkt,
+                                                                    tcp_clamp_mtu,
+                                                                );
+                                                                let _ = tun_inject_ws.send(clamped).await;
+                                                            }
+                                                        }
+                                                    } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                        let clamped = clamp_tcp_mss_bytes(
+                                                            decrypted,
+                                                            tcp_clamp_mtu,
+                                                        );
+                                                        let _ = tun_inject_ws.send(clamped).await;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    trace!("[WRTC Client] Decrypt batch packet error: {e}");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        trace!("[WRTC Client] Base64 batch decode error: {e}");
+                                    }
+                                }
+                            }
+                            WrtcMessage::Pong => {
+                                last_pong.store(current_timestamp_secs(), Ordering::Relaxed);
+                            }
+                            _ => {}
+                        }
+                    }
+                    None => break,
+                }
+            }
+        });
+
+        let p2p_rx_task = p2p_session_opt.clone();
+        let cipher_p2p = cipher.clone();
+        let tun_inject_p2p = tun_inject_tx.clone();
+
+        let p2p_rx_worker = tokio::spawn(async move {
+            loop {
+                let p2p_opt = {
+                    let guard = p2p_rx_task.lock().await;
+                    guard.clone()
+                };
+
+                if let Some(p2p) = p2p_opt {
+                    while let Some(first_bytes) = p2p.recv_packet().await {
+                        let mut current_raw = Some(first_bytes);
+                        let mut drained = 0usize;
+                        while let Some(raw_bytes) = current_raw.take() {
+                            match unwrap_packet_bytes(&cipher_p2p, raw_bytes) {
+                                Ok(decrypted) => {
+                                    last_pong_p2p.store(current_timestamp_secs(), Ordering::Relaxed);
+                                    if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
+                                        let packets = unpack_batch(&decrypted[1..]);
+                                        for pkt in packets {
+                                            if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                let clamped = clamp_tcp_mss_bytes(
+                                                    pkt,
+                                                    tcp_clamp_mtu,
+                                                );
+                                                if tun_inject_p2p.send(clamped).await.is_err() {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                        trace!("[P2P Direct IN] Decrypted packet ({} bytes)", decrypted.len());
+                                        let clamped = clamp_tcp_mss_bytes(
+                                            decrypted,
+                                            tcp_clamp_mtu,
+                                        );
+                                        if tun_inject_p2p.send(clamped).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    trace!("[P2P Direct] Decrypt packet error: {e}");
+                                }
+                            }
+                            drained += 1;
+                            if drained >= 256 {
+                                yield_now().await;
+                                break;
+                            }
+                            current_raw = p2p.try_recv_packet();
+                        }
+                    }
+                    if tun_inject_p2p.is_closed() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                } else {
+                    if tun_inject_p2p.is_closed() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        });
+
+        let peer_video_rx = shared_peer.clone();
+        let cipher_video = cipher.clone();
+        let tun_inject_video = tun_inject_tx.clone();
+
+        let constraints_task = if wrtc_mode == WrtcMode::MediaVideo || wrtc_mode == WrtcMode::Auto
+        {
+            let first_rx_clone = first_client_rx.clone();
+            let peer_reassert = shared_peer.clone();
+            let srv_ep_reassert = target_server_id.clone();
+            let cipher_warmup = cipher.clone();
+            let seq_warmup = sequence.clone();
+            Some(tokio::spawn(async move {
+                // Как только ICE/DTLS переходит в состояние Connected — мгновенно пробиваем
+                // RTP Video Uplink (Client -> Server) серией ключевых кадров VIDEO_WARMUP_PAYLOAD,
+                // не дожидаясь 2-секундного тика watchdog.
+                for _ in 0..50 {
+                    if !first_rx_clone.load(Ordering::Relaxed)
+                        || peer_reassert.is_connected.load(Ordering::Relaxed)
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                if !first_rx_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+                if peer_reassert.is_connected.load(Ordering::Relaxed) {
+                    peer_reassert.force_next_keyframe();
+                    for _ in 0..3 {
+                        let seq = seq_warmup.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
+                            &cipher_warmup,
+                            &nonce_prefix,
+                            seq,
+                            &VIDEO_WARMUP_PAYLOAD,
+                            VP8_ASTP_PREFIX_LEN,
+                        ) {
+                            let _ = peer_reassert
+                                .send_video_frame_preallocated(my_client_tag, enc_buf)
+                                .await;
+                        }
+                    }
+                }
+                let ticks_per_reassert =
+                    (WRTC_CLIENT_CONSTRAINTS_REASSERT_INTERVAL_SECS * 2).max(1) as usize;
+                for tick in 0..(WRTC_CLIENT_CONSTRAINTS_REASSERT_COUNT * ticks_per_reassert) {
+                    sleep(Duration::from_millis(500)).await;
+                    if !first_rx_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if peer_reassert.is_connected.load(Ordering::Relaxed) {
+                        peer_reassert.force_next_keyframe();
+                        let seq = seq_warmup.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
+                            &cipher_warmup,
+                            &nonce_prefix,
+                            seq,
+                            &VIDEO_WARMUP_PAYLOAD,
+                            VP8_ASTP_PREFIX_LEN,
+                        ) {
+                            let _ = peer_reassert
+                                .send_video_frame_preallocated(my_client_tag, enc_buf)
+                                .await;
+                        }
+                    }
+                    if (tick + 1) % ticks_per_reassert == 0 {
+                        if !first_rx_clone.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let constraints = ReceiverVideoConstraints::for_endpoint(
+                            &srv_ep_reassert,
+                            WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                        );
+                        let _ = peer_reassert.send_video_constraints(&constraints).await;
+                        info!(
+                            "[WRTC Client] Periodic re-assertion of ReceiverVideoConstraints for server endpoint {srv_ep_reassert}"
+                        );
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+        let video_rx_task = tokio::spawn(async move {
+            'outer: while let Some(mut raw_frame) = peer_video_rx.recv_video_frame().await {
+                let mut drained = 0usize;
+                loop {
+                    if raw_frame.len() >= WRTC_MIN_ASTP_VIDEO_FRAME_LEN {
+                        let tag = u16::from_be_bytes([raw_frame[0], raw_frame[1]]);
+                        if tag == my_client_tag {
+                            let raw_astp = raw_frame.slice(2..);
+                            let raw_len = raw_astp.len();
+                            match unwrap_packet_bytes(&cipher_video, raw_astp) {
+                                Ok(decrypted) => {
+                                    peer_video_rx.mark_video_rx_verified();
+                                    let now_secs = current_timestamp_secs();
+                                    last_pong_video.store(now_secs, Ordering::Relaxed);
+
+                                    let is_warmup_frame = decrypted.len()
+                                        == VIDEO_WARMUP_PAYLOAD.len()
+                                        && decrypted.starts_with(&[
+                                            VIDEO_BATCH_MARKER,
+                                            VIDEO_WARMUP_MARKER_HI,
+                                            VIDEO_WARMUP_MARKER_LO,
+                                        ]);
+
+                                    if is_warmup_frame {
+                                        let server_confirmed_client_video =
+                                            decrypted.get(3).copied().unwrap_or(0) == 1;
+                                        if server_confirmed_client_video {
+                                            last_video_rx_secs.store(now_secs, Ordering::Relaxed);
+                                            if first_client_rx.swap(false, Ordering::Relaxed) {
+                                                info!(
+                                                    "[WRTC Client Video IN] Bidirectional RTP Video confirmed by server (tag: 0x{:04X})",
+                                                    tag
+                                                );
+                                                status(format!(
+                                                    "[WRTC Client Video IN] Bidirectional RTP Video confirmed by server (tag: 0x{:04X})",
+                                                    tag
+                                                ));
+                                            }
+                                        } else {
+                                            // Server -> Client видео работает, но сервер ещё НЕ получил наш Client -> Server видеокадр!
+                                            // Не отключаем дублирование в Colibri-WS, пока сервер не пришлёт подтверждение (byte[3] == 1).
+                                            peer_video_rx.force_next_keyframe();
+                                        }
+                                    } else {
+                                        last_video_rx_secs.store(now_secs, Ordering::Relaxed);
+                                        if first_client_rx.swap(false, Ordering::Relaxed) {
+                                            info!(
+                                                "[WRTC Client Video IN] First video frame decrypted from server (len: {} bytes, tag: 0x{:04X})",
+                                                decrypted.len(), tag
+                                            );
+                                            status(format!("[WRTC Client Video IN] First video frame decrypted from server (len: {} bytes, tag: 0x{:04X})", decrypted.len(), tag));
+                                        }
+                                        if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
+                                            let packets = unpack_batch(&decrypted[1..]);
+                                            for pkt in packets {
+                                                if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                    let clamped = clamp_tcp_mss_bytes(
+                                                        pkt,
+                                                        tcp_clamp_mtu,
+                                                    );
+                                                    if tun_inject_video.send(clamped).await.is_err() {
+                                                        break 'outer;
+                                                    }
+                                                }
+                                            }
+                                        } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                            trace!("[WRTC Media Video IN] Decrypted packet ({} bytes)", decrypted.len());
+                                            let clamped = clamp_tcp_mss_bytes(
+                                                decrypted,
+                                                tcp_clamp_mtu,
+                                            );
+                                            if tun_inject_video.send(clamped).await.is_err() {
+                                                break 'outer;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    trace!("[WRTC Media Video IN] Decrypt packet error: {e} (raw_astp len: {raw_len})");
+                                }
+                            }
+                        }
+                    }
+                    drained += 1;
+                    if drained >= 256 {
+                        yield_now().await;
+                        break;
+                    }
+                    match peer_video_rx.try_recv_video_frame() {
+                        Some(next) => raw_frame = next,
+                        None => break,
+                    }
+                }
+            }
+        });
+
+        let p2p_open = {
+            let guard = p2p_session_opt.lock().await;
+            guard.as_ref().map(|p| p.is_open.load(Ordering::SeqCst)).unwrap_or(false)
+        };
+        let effective_mode = Some(shared_peer.effective_mode(p2p_open).to_string());
+
+        info!("[WRTC] Active transport mode: {:?}", effective_mode.as_deref().unwrap_or("UNKNOWN"));
+        status(format!("[WRTC] Effective mode: {:?}", effective_mode.as_deref().unwrap_or("UNKNOWN")));
+
+        if let Some(ws_ip) = shared_peer.colibri_ws_ip() {
+            if !ws_ip.is_loopback() && !bypass_ips.contains(&ws_ip) {
+                bypass_ips.push(ws_ip);
+            }
+        }
+        let remote_ip = bypass_ips.first().copied();
+        let xmpp_shutdown = Arc::clone(&xmpp_arc);
+        let peer_shutdown = Arc::clone(&shared_peer);
+        let p2p_shutdown = Arc::clone(&p2p_session_opt);
+        let shutdown_hook: ShutdownHook = Box::pin(async move {
+            xmpp_jingle_task.abort();
+            uplink_task.abort();
+            ws_rx_task.abort();
+            p2p_rx_worker.abort();
+            if let Some(t) = constraints_task {
+                t.abort();
+            }
+            video_rx_task.abort();
+            tunnel_writer_abort.abort();
+            {
+                let mut guard = p2p_handshake_aborts.lock().unwrap();
+                for h in guard.drain(..) {
+                    h.abort();
+                }
+            }
+            yield_now().await;
+            let p2p_opt = p2p_shutdown.lock().await.take();
+            let p2p_fut = async move {
+                if let Some(p2p) = p2p_opt {
+                    let _ = timeout(Duration::from_millis(350), p2p.close()).await;
+                }
+            };
+            let xmpp_fut = async move {
+                if let Ok(xmpp) = timeout(Duration::from_millis(500), xmpp_shutdown.lock()).await {
+                    let _ = timeout(Duration::from_millis(800), xmpp.leave_room()).await;
+                }
+            };
+            let peer_fut = timeout(Duration::from_millis(500), peer_shutdown.close());
+            let _ = tokio::join!(p2p_fut, xmpp_fut, peer_fut);
+        });
+
+        Ok(ConnectionResult {
+            auth_response,
+            vpn_stream: Box::new(client_stream),
+            endpoint: None,
+            connection: None,
+            health_pause: None,
+            remote_ip,
+            bypass_ips,
+            effective_mode,
+            shutdown_hook: Some(shutdown_hook),
+        })
+    }
+}

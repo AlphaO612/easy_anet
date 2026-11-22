@@ -1,0 +1,9 @@
+services:
+  auth:
+    environment:
+      ANET_PROMETHEUS_URL: http://prometheus:9090
+    networks: [metrics-read]
+networks:
+  metrics-read:
+    external: true
+    name: ${ANET_METRICS_NETWORK:-anet-metrics-read}

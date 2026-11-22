@@ -1,0 +1,11 @@
+route:
+  receiver: operator
+  group_by: [source_node, target_node, module]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 4h
+receivers:
+  - name: operator
+    webhook_configs:
+      - url: https://alerts.example.invalid/anet
+        send_resolved: true

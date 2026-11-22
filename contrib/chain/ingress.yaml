@@ -1,0 +1,28 @@
+services:
+  network:
+    ports:
+      - "${INGRESS_BIND:-127.0.0.1}:${INGRESS_PORT:?set external port}:${INGRESS_TARGET:?51820/udp or 8443/tcp}"
+  ingress:
+    image: ${INGRESS_IMAGE:?set INGRESS_IMAGE}
+    network_mode: service:network
+    depends_on:
+      network: {condition: service_healthy}
+    command: ["${INGRESS_PROTOCOL:?wireguard or vless}"]
+    environment:
+      # The base stack publishes the native VPN as well. Require an explicit bind.
+      VPN_BIND: ${VPN_BIND:?set native VPN bind address, e.g. 127.0.0.1}
+      INGRESS_PATH: ${INGRESS_PATH:?chain or direct}
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW, CHOWN, SETUID, SETGID, SETPCAP]
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    pids_limit: 96
+    tmpfs: ["/run:size=1m,mode=0755,noexec,nosuid,nodev"]
+    volumes:
+      - type: bind
+        source: ${INGRESS_DIR:?absolute server profile directory}
+        target: /input
+        read_only: true
+        bind: {create_host_path: false}

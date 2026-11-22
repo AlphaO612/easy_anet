@@ -4,9 +4,14 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[features]
+default = []
+poem = ["dep:poem-openapi"]
+
 [dependencies]
 tun = {workspace = true}
 bytes = {workspace = true}
+futures = {workspace = true}
 prost = {workspace = true}
 tokio = {workspace = true}
 log = {workspace = true}
@@ -16,15 +21,31 @@ chacha20poly1305 = {workspace = true}
 aes-gcm = "0.10.3"
 aead = { version = "0.5.2", features = ["getrandom"] }
 serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0"
+toml = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
 rand = {workspace = true}
 x25519-dalek = {workspace = true}
 ed25519-dalek = {workspace = true}
 sha2 = {workspace = true}
-futures = { workspace = true }
+webrtc = { workspace = true }
+rtc = { workspace = true }
+http = { workspace = true }
+poem-openapi = { version = "5.1.12", features = ["uuid"], optional = true }
 
 base64 = "0.22.1"
-
-
+async-trait = "0.1.89"
+roxmltree = { workspace = true }
+socket2 = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+russh = { workspace = true }
+url = "2.5.7"
+tokio-boring = {workspace = true}
+rustls-native-certs = { workspace = true }
+webpki-root-certs = "1.0.4"
+boring = {workspace = true}
 [build-dependencies]
 prost-build = "0.14.1"
 

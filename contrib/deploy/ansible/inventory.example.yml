@@ -1,0 +1,20 @@
+all:
+  children:
+    anet:
+      hosts:
+        entry1:
+          ansible_host: vpn.example.org
+          ansible_user: deploy
+          anet_host: vpn.example.org
+          anet_mode: build
+          anet_profile: webui
+          anet_install_docker: true
+          anet_metrics_panel: false  # Enable after starting monitoring with compose.panel.yaml
+          anet_environment:
+            VPN_PORT: "4519"
+            PANEL_PORT: "8088"
+          # For a full offline entry, set anet_profile: anet-easy, anet_mode: launch,
+          # anet_install_docker: false and supply either of the following.
+          # anet_bundle_src: /private/controller-bundles/amd64
+          # anet_bundle_dir: /private/already-transferred/amd64
+          # anet_env_file: /private/entry.env  # absolute path on the target

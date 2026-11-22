@@ -1,20 +1,273 @@
-use poem_openapi::{ApiResponse, Object, SecurityScheme, auth::Bearer, payload::Json};
+use poem_openapi::{
+    ApiResponse, Object, SecurityScheme, auth::Bearer, payload::Json, payload::PlainText,
+};
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 
-/// [ VPN Core Communication ]
-#[derive(Object)]
-pub struct CheckAccessRequest {
-    #[oai(validator(min_length = 10))]
+// Реэкспортируем общие DTO-структуры из anet-common
+pub use anet_common::dto::{
+    CheckAccessRequest, CheckAccessResponse, NodeCommand, NodeCommandResultRequest,
+    NodeHeartbeatRequest, NodeSessionCountItem, NodeTrafficReport,
+};
+
+/// [ VPN Server Management Area ]
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct ServerDto {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub address: String,
+    pub public_key: String,
+    pub quic_port: Option<i32>,
+    pub ssh_port: Option<i32>,
+    pub vnc_port: Option<i32>,
+    pub websocket_url: Option<String>,
+    pub ahttp_url: Option<String>,
+    pub wrtc_url: Option<String>,
+    pub wrtc_mode: Option<String>,
+    pub ssh_user: Option<String>,
+    pub is_active: bool,
+    pub has_control_credential: bool,
+    pub runtime: Option<NodeRuntimeDto>,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct NodeRuntimeDto {
+    pub status: String,
+    pub last_seen_at: String,
+    pub version: String,
+    pub uptime_seconds: i64,
+    pub active_connections: i64,
+    pub accepting_connections: bool,
+}
+
+#[derive(ApiResponse)]
+pub enum NodeHeartbeatResponse {
+    #[oai(status = 204)]
+    Accepted,
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAdmissionCommandRequest {
+    pub accepting_connections: bool,
+}
+
+#[derive(ApiResponse)]
+pub enum CreateNodeCommandResponse {
+    #[oai(status = 201)]
+    Created(Json<NodeCommand>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct NodeCommandStatusDto {
+    pub command_id: uuid::Uuid,
+    pub server_id: uuid::Uuid,
+    pub command_type: String,
+    pub status: String,
+    pub accepting_connections: Option<bool>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(ApiResponse)]
+pub enum GetNodeCommandStatusResponse {
+    #[oai(status = 200)]
+    Ok(Json<NodeCommandStatusDto>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum GetNodeCommandsResponse {
+    #[oai(status = 200)]
+    Ok(Json<Vec<NodeCommand>>),
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum NodeCommandResultResponse {
+    #[oai(status = 204)]
+    Accepted,
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 409)]
+    Conflict(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum TrafficReportResponse {
+    #[oai(status = 204)]
+    Accepted,
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct NodeCredentialDto {
+    pub node_id: uuid::Uuid,
+    pub token: String,
+}
+
+#[derive(ApiResponse)]
+pub enum RotateNodeCredentialResponse {
+    #[oai(status = 200)]
+    Ok(Json<NodeCredentialDto>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct NodeTrafficStatDto {
+    pub node_id: uuid::Uuid,
+    pub name: String,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct UserTrafficStatDto {
+    pub user_id: Option<uuid::Uuid>,
+    pub uid: Option<String>,
     pub fingerprint: String,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
 }
 
-#[derive(Object)]
-pub struct CheckAccessResponse {
-    pub allowed: bool,
-    pub message: String,
+#[derive(ApiResponse)]
+pub enum GetNodeTrafficStatsResponse {
+    #[oai(status = 200)]
+    Ok(Json<Vec<NodeTrafficStatDto>>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
 }
 
-/// [ Authentication Area ]
+#[derive(ApiResponse)]
+pub enum GetUserTrafficStatsResponse {
+    #[oai(status = 200)]
+    Ok(Json<Vec<UserTrafficStatDto>>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct TrafficHistoryPointDto {
+    pub bucket_start: String,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
+}
+
+#[derive(ApiResponse)]
+pub enum GetTrafficHistoryResponse {
+    #[oai(status = 200)]
+    Ok(Json<Vec<TrafficHistoryPointDto>>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct CreateServerRequest {
+    pub name: String,
+    pub address: String,
+    pub public_key: String,
+    pub quic_port: Option<i32>,
+    pub ssh_port: Option<i32>,
+    pub vnc_port: Option<i32>,
+    pub websocket_url: Option<String>,
+    pub ahttp_url: Option<String>,
+    pub wrtc_url: Option<String>,
+    pub wrtc_mode: Option<String>,
+    pub ssh_user: Option<String>,
+    pub is_active: Option<bool>,
+}
+
+#[derive(ApiResponse)]
+pub enum GetServersResponse {
+    #[oai(status = 200, content_type = "application/json")]
+    Ok(Json<Vec<ServerDto>>),
+    #[oai(status = 401, content_type = "application/json")]
+    Unauthorized(Json<String>),
+    #[oai(status = 500, content_type = "application/json")]
+    Error(Json<String>),
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateServerRequest {
+    pub name: Option<String>,
+    pub address: Option<String>,
+    pub public_key: Option<String>,
+    pub quic_port: Option<Option<i32>>,
+    pub ssh_port: Option<Option<i32>>,
+    pub vnc_port: Option<Option<i32>>,
+    pub websocket_url: Option<Option<String>>,
+    pub ahttp_url: Option<Option<String>>,
+    pub wrtc_url: Option<Option<String>>,
+    pub wrtc_mode: Option<Option<String>>,
+    pub ssh_user: Option<Option<String>>,
+    pub is_active: Option<bool>,
+}
+
+#[derive(ApiResponse)]
+pub enum UpdateServerApiResult {
+    #[oai(status = 200)]
+    Ok(Json<ServerDto>),
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
 #[derive(Object)]
 pub struct LoginRequest {
     #[oai(validator(max_length = 100))]
@@ -44,10 +297,22 @@ pub struct Claims {
     pub exp: usize,
 }
 
-/// [ User Management Area ]
 #[derive(SecurityScheme)]
 #[oai(ty = "bearer", bearer_format = "jwt")]
 pub struct AdminToken(pub Bearer);
+
+#[derive(Object, Debug, Serialize, Deserialize, Clone)]
+pub struct RateReqDto {
+    pub sessions: i32,
+    pub date_end: String,
+}
+
+#[derive(Object, Debug, Serialize, Deserialize, Clone)]
+pub struct RateDto {
+    pub id: uuid::Uuid,
+    pub sessions: i32,
+    pub date_end: String,
+}
 
 #[derive(Object)]
 pub struct VpnUserDto {
@@ -56,11 +321,17 @@ pub struct VpnUserDto {
     pub uid: Option<String>,
     pub is_active: bool,
     pub created_at: String,
+    pub rate: Option<RateDto>,
+    pub static_ip: Option<Ipv4Addr>,
+    pub server_ids: Vec<uuid::Uuid>,
+    pub pool_ids: Vec<uuid::Uuid>,
+    pub route_map_id: Option<uuid::Uuid>,
+    pub group_id: Option<uuid::Uuid>,
 }
 
 #[derive(Object)]
 pub struct PaginatedUsers {
-    pub total: u64,
+    pub total: i64,
     pub items: Vec<VpnUserDto>,
 }
 
@@ -74,17 +345,36 @@ pub enum GetUsersResponse {
     Error(Json<String>),
 }
 
+#[derive(ApiResponse)]
+pub enum GetUserApiResult {
+    #[oai(status = 200)]
+    Ok(Json<VpnUserDto>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
 #[derive(Object)]
 pub struct AddUserRequest {
     pub uid: String,
+    pub rate: Option<RateReqDto>,
+    pub server_ids: Option<Vec<uuid::Uuid>>,
+    pub pool_ids: Option<Vec<uuid::Uuid>>,
+    pub route_map_id: Option<uuid::Uuid>,
+    pub group_id: Option<uuid::Uuid>,
 }
 
 #[derive(Object)]
 pub struct AddUserResponse {
+    pub id: uuid::Uuid,
     pub uid: String,
     pub fingerprint: String,
     pub private_key: String,
     pub public_key: String,
+    pub rate: Option<RateDto>,
 }
 
 #[derive(ApiResponse)]
@@ -101,12 +391,200 @@ pub enum AddUserApiResult {
 pub struct UpdateUserRequest {
     pub uid: Option<String>,
     pub is_active: Option<bool>,
+    pub static_ip: Option<String>,
+    pub server_ids: Option<Vec<uuid::Uuid>>,
+    pub pool_ids: Option<Vec<uuid::Uuid>>,
+    pub route_map_id: Option<uuid::Uuid>,
+    pub clear_route_map: Option<bool>,
+    pub group_id: Option<uuid::Uuid>,
+    pub clear_group: Option<bool>,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct RouteRuleDto {
+    pub id: Option<uuid::Uuid>,
+    pub position: i32,
+    pub match_type: String,
+    pub match_value: String,
+    pub action: String,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct RouteMapDto {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub description: String,
+    pub default_action: String,
+    pub is_active: bool,
+    pub revision: i64,
+    pub rules: Vec<RouteRuleDto>,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct SaveRouteMapRequest {
+    pub name: String,
+    pub description: String,
+    pub default_action: String,
+    pub is_active: Option<bool>,
+    pub rules: Vec<RouteRuleDto>,
+}
+
+#[derive(ApiResponse)]
+pub enum GetRouteMapsResponse {
+    #[oai(status = 200)]
+    Ok(Json<Vec<RouteMapDto>>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum SaveRouteMapResponse {
+    #[oai(status = 200)]
+    Ok(Json<RouteMapDto>),
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum DeleteRouteMapResponse {
+    #[oai(status = 204)]
+    Deleted,
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct NodePoolMemberDto {
+    pub server_id: uuid::Uuid,
+    #[oai(default = "default_protocol")]
+    pub protocol: crate::entities::ProtocolType,
+    #[oai(default)]
+    pub port_or_url: Option<String>,
+    #[oai(default)]
+    pub wrtc_mode: Option<String>,
+    #[oai(default = "default_member_weight")]
+    pub weight: i32,
+}
+
+fn default_protocol() -> crate::entities::ProtocolType {
+    crate::entities::ProtocolType::Quic
+}
+
+fn default_member_weight() -> i32 {
+    1
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct NodePoolDto {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub strategy: String,
+    pub is_active: bool,
+    pub members: Vec<NodePoolMemberDto>,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct SaveNodePoolRequest {
+    pub name: String,
+    pub strategy: String,
+    pub is_active: Option<bool>,
+    pub members: Vec<NodePoolMemberDto>,
+}
+
+#[derive(ApiResponse)]
+pub enum GetNodePoolsResponse {
+    #[oai(status = 200)]
+    Ok(Json<Vec<NodePoolDto>>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum SaveNodePoolResponse {
+    #[oai(status = 200)]
+    Ok(Json<NodePoolDto>),
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum DeleteNodePoolResponse {
+    #[oai(status = 204)]
+    Deleted,
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
 }
 
 #[derive(ApiResponse)]
 pub enum UpdateUserApiResult {
     #[oai(status = 200)]
     Ok(Json<VpnUserDto>),
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(Object)]
+pub struct UpdateRateRequest {
+    pub sessions: Option<i32>,
+    pub date_end: Option<String>,
+}
+
+#[derive(ApiResponse)]
+pub enum UpdateRateApiResult {
+    #[oai(status = 200)]
+    Ok(Json<RateDto>),
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(Object)]
+pub struct AddRateRequest {
+    pub sessions: Option<i32>,
+    pub date_end: Option<String>,
+    pub traffic_limit: Option<i64>,
+    pub speed_limit: Option<i32>,
+}
+
+#[derive(ApiResponse)]
+pub enum AddRateApiResult {
+    #[oai(status = 200)]
+    Ok(Json<RateDto>),
     #[oai(status = 400)]
     BadRequest(Json<String>),
     #[oai(status = 401)]
@@ -136,4 +614,143 @@ pub enum RegenerateUserApiResult {
     NotFound(Json<String>),
     #[oai(status = 500)]
     Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum DownloadConfigResponse {
+    #[oai(status = 200, content_type = "application/octet-stream")]
+    Ok(
+        PlainText<String>,
+        #[oai(header = "Content-Disposition")] String,
+    ),
+    #[oai(status = 404, content_type = "application/json")]
+    NotFound(Json<String>),
+    #[oai(status = 500, content_type = "application/json")]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum QrPageResponse {
+    #[oai(status = 200, content_type = "text/html")]
+    Ok(PlainText<String>),
+    #[oai(status = 404, content_type = "application/json")]
+    NotFound(Json<String>),
+    #[oai(status = 500, content_type = "application/json")]
+    Error(Json<String>),
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveConnectionDto {
+    pub user_id: uuid::Uuid,
+    pub username: String,
+    pub server_id: uuid::Uuid,
+    pub server_name: String,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
+    pub connection_count: i32,
+    pub protocol: String,
+    pub fingerprint: String,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct GroupDto {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub traffic_limit: i64,
+    pub speed_limit: i32,
+    pub sessions_limit: i32,
+    pub duration_days: i32,
+    pub user_count: i64,
+    #[oai(default)]
+    pub pool_ids: Vec<uuid::Uuid>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct AddGroupMemberRequest {
+    pub user_id: uuid::Uuid,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct SaveGroupRequest {
+    pub name: String,
+    pub traffic_limit: i64,
+    pub speed_limit: i32,
+    pub sessions_limit: i32,
+    pub duration_days: i32,
+    #[oai(default)]
+    pub pool_ids: Option<Vec<uuid::Uuid>>,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct SetGroupPoolsRequest {
+    pub pool_ids: Vec<uuid::Uuid>,
+}
+
+#[derive(ApiResponse)]
+pub enum GetGroupPoolsResponse {
+    #[oai(status = 200)]
+    Ok(Json<Vec<NodePoolDto>>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum SetGroupPoolsResponse {
+    #[oai(status = 200)]
+    Ok(Json<Vec<uuid::Uuid>>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum GetGroupsResponse {
+    #[oai(status = 200)]
+    Ok(Json<Vec<GroupDto>>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum SaveGroupResponse {
+    #[oai(status = 200)]
+    Ok(Json<GroupDto>),
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum DeleteGroupResponse {
+    #[oai(status = 204)]
+    Deleted,
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct DisconnectMemberRequest {
+    pub server_id: uuid::Uuid,
+    pub fingerprint: String,
 }

@@ -1,0 +1,11 @@
+name: Build
+
+on:
+  push:
+    branches: [ "master", "test/*", "dev/*", "fixes/*" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: "./.github/workflows/build-components.yaml"
+    secrets: inherit

@@ -1,46 +1,87 @@
-use crate::config::CoreConfig;
-use crate::dns::{DnsManager, get_dns_manager};
-use crate::events::status;
+use crate::auth::AuthDenyError;
+use crate::config::{CoreConfig, PerAppMode, ServerConfig, TransportMode};
+use crate::connectivity_monitor::{ConnectivityMonitor, NodeProbeMonitor};
+use crate::direct_ip_cache::DirectIpCache;
+use crate::dns::{get_dns_manager, DnsManager};
+use crate::dns_interceptor::{
+    extract_packet_dst_ip, is_encrypted_dns_packet, DnsInterceptor, InterceptResult,
+};
+use crate::events::{
+    account_info, client_state, err, status, warn as emit_warn_event, AccountInfo, ClientState,
+};
+use crate::rule_updater::{default_rules_cache_path, RuleCacheManager};
+use crate::statistic::{
+    start_fast_stats_monitor, start_stats_monitor, PingStatsProvider, QuicStatsProvider,
+    StatsProvider, StreamStatsProvider,
+};
 use crate::traits::{RouteManager, TunFactory};
-use crate::statistic;
 use crate::transport::factory::create_transport;
-use anet_common::stream_framing::{frame_packet, read_next_packet};
-use hickory_resolver::TokioAsyncResolver;
-use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
+use crate::transport::ShutdownHook;
+#[cfg(all(windows, feature = "per-app"))]
+use anet_appfilter::{AppFilter, AppPolicy};
+use anet_common::boring_tls::set_default_tls_config;
+use anet_common::consts::COALESCE_BUDGET_BYTES;
+use anet_common::icmp_probe::{
+    build_ipv4_icmp_echo_request, build_reject_packet, clamp_tcp_mss_bytes,
+    is_quic_udp_443_packet, parse_ipv4_icmp_echo_reply, DOMESTIC_PROBE_IPS,
+    PROBE_DOMESTIC_IDENTIFIER, PROBE_IDENTIFIER, PROBE_WORLD_IDENTIFIER, WORLD_PROBE_IPS,
+};
+use anet_common::protocol::{AuthResponse, BillingType as ProtoBillingType};
+use anet_common::stream_framing::{frame_packet_into, FrameReader};
+use anet_filter_core::{LocalOverrides, RuleAction};
+#[cfg(all(windows, feature = "per-app"))]
+use anyhow::Context;
+use anyhow::{anyhow, Error as AnyhowError, Result};
+use bytes::{Bytes, BytesMut};
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::proto::xfer::Protocol;
+use hickory_resolver::TokioResolver;
+use http::Uri;
 use ipnet::IpNet;
 use log::{error, info, warn};
 use quinn::Endpoint;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::AsyncWriteExt; // Для write_all
+use std::time::{Duration, Instant, SystemTime};
+use tokio::io::{split as io_split, AsyncWriteExt};
+use tokio::net::lookup_host;
+use tokio::select;
+use tokio::spawn;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
+use tokio::time::{sleep, timeout};
 
-/// Хранит "живые" объекты запущенной сессии.
 struct RunningSession {
-    /// QUIC Endpoint (только для QUIC, нужно для отправки close frame)
     endpoint: Option<Endpoint>,
-    /// Сигнал для остановки фоновых задач пересылки байт
     shutdown_notify: Arc<Notify>,
-    /// Хендл главной задачи, чтобы подождать её завершения
+    reconnect_signal: Arc<Notify>,
+    disconnect_reason: Arc<Mutex<String>>,
     main_task: JoinHandle<()>,
-    /// Имя интерфейса (нужно для очистки DNS/маршрутов)
+    t1_abort: AbortHandle,
+    t2_abort: AbortHandle,
+    health_abort: AbortHandle,
+    aux_aborts: Vec<AbortHandle>,
+    dns_aborts: Arc<Mutex<Vec<AbortHandle>>>,
     iface_name: String,
+    shutdown_hook: Option<ShutdownHook>,
 }
 
-/// Thread-safe, можно шарить между потоками GUI.
 pub struct AnetClient {
     config: CoreConfig,
-    /// Фабрика TUN (платформо-зависимая)
     tun_factory: Box<dyn TunFactory>,
-    /// Менеджер маршрутов (платформо-зависимый)
-    route_manager: Box<dyn RouteManager>,
-    /// Менеджер DNS (платформо-зависимый)
+    route_manager: Arc<dyn RouteManager>,
     dns_manager: Box<dyn DnsManager>,
-    /// Состояние: Запущен или нет?
-    /// Когда это поле None - VPN выключен.
+    rule_cache: RuleCacheManager,
     session: Mutex<Option<RunningSession>>,
+    stop_requested: AtomicBool,
+    permanently_cancelled: AtomicBool,
+    is_active: AtomicBool,
+    cancel_signal: Arc<Notify>,
+    active_finished_notify: Arc<Notify>,
 }
 
 impl AnetClient {
@@ -50,16 +91,93 @@ impl AnetClient {
         route_manager: Box<dyn RouteManager>,
     ) -> Self {
         let dns_manager = get_dns_manager();
+        set_default_tls_config(config.stealth.to_tls_client_config());
+        let rule_cache = RuleCacheManager::new(default_rules_cache_path());
+        ConnectivityMonitor::ensure_started(config.connectivity.clone());
         Self {
             config,
             tun_factory,
-            route_manager,
+            route_manager: Arc::from(route_manager),
             dns_manager,
+            rule_cache,
             session: Mutex::new(None),
+            stop_requested: AtomicBool::new(false),
+            permanently_cancelled: AtomicBool::new(false),
+            is_active: AtomicBool::new(false),
+            cancel_signal: Arc::new(Notify::new()),
+            active_finished_notify: Arc::new(Notify::new()),
         }
     }
 
-    /// Резолвинг доменов и парсинг IP из конфига
+    /// Подготавливает экземпляр клиента к новому запуску `start()` после предыдущего `stop()`.
+    pub fn prepare_for_start(&self) {
+        self.permanently_cancelled.store(false, Ordering::SeqCst);
+        if !self.is_active.load(Ordering::SeqCst) {
+            self.stop_requested.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Неблокирующая синхронная отмена текущей сессии/попытки подключения.
+    pub fn cancel(&self) {
+        self.permanently_cancelled.store(true, Ordering::SeqCst);
+        self.stop_requested.store(true, Ordering::SeqCst);
+        self.cancel_signal.notify_waiters();
+        if let Ok(state) = self.session.lock() {
+            if let Some(ref running) = *state {
+                running.shutdown_notify.notify_waiters();
+                running.reconnect_signal.notify_one();
+            }
+        }
+    }
+
+    async fn sync_rules_cache(&self, config: &CoreConfig) {
+        if self.stop_requested.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(rules_server_url) = config.get_rules_server_url() {
+            let sync_timeout = if self.rule_cache.has_cached_rules() {
+                Duration::from_millis(2500)
+            } else {
+                Duration::from_secs(5)
+            };
+            select! {
+                _ = self.cancel_signal.notified() => {
+                    info!("[RuleCache] Sync cancelled by stop signal.");
+                }
+                res = timeout(
+                    sync_timeout,
+                    self.rule_cache.update_from_server(&rules_server_url),
+                ) => {
+                    match res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            let msg = format!(
+                                "[RuleCache] Failed to download rules.abc from {rules_server_url}: {e}"
+                            );
+                            warn!("{msg}");
+                            status(&msg);
+                        }
+                        Err(_) => {
+                            let msg = format!(
+                                "[RuleCache] Timeout downloading rules.abc from {rules_server_url} (using cached rules if available)"
+                            );
+                            warn!("{msg}");
+                            status(&msg);
+                        }
+                    }
+                }
+            }
+        } else {
+            let msg = "[RuleCache] Server URL for rules.abc is not configured (set [routing] rules_url in client.toml)";
+            warn!("{msg}");
+            status(msg);
+        }
+    }
+
+    pub fn get_config(&self) -> CoreConfig {
+        self.config.clone()
+    }
+
     async fn resolve_list(&self, list: &[String]) -> Vec<IpNet> {
         let mut result = Vec::new();
         if list.is_empty() {
@@ -67,7 +185,6 @@ impl AnetClient {
         }
 
         let dns_servers = &self.config.main.dns_server_list;
-
         let mut resolver_config = ResolverConfig::new();
         for dns in dns_servers {
             if let Ok(ip) = IpAddr::from_str(dns) {
@@ -78,250 +195,1631 @@ impl AnetClient {
         if resolver_config.name_servers().is_empty() {
             resolver_config = ResolverConfig::google();
         }
-        let resolver = TokioAsyncResolver::tokio(resolver_config, ResolverOpts::default());
+        let resolver = TokioResolver::builder_with_config(
+            resolver_config,
+            TokioConnectionProvider::default(),
+        )
+        .with_options(ResolverOpts::default())
+        .build();
 
         for target in list {
-            if let Ok(net) = IpNet::from_str(target) {
+            if self.stop_requested.load(Ordering::SeqCst) {
+                break;
+            }
+            let trimmed = target.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(net) = IpNet::from_str(trimmed) {
                 result.push(net);
                 continue;
             }
-            if let Ok(ip) = IpAddr::from_str(target) {
+            if let Ok(ip) = IpAddr::from_str(trimmed) {
                 result.push(IpNet::from(ip));
                 continue;
             }
+            let clean = trimmed.trim_start_matches('*').trim_start_matches('.');
+            if clean.is_empty() {
+                continue;
+            }
+            select! {
+                _ = self.cancel_signal.notified() => break,
+                res = timeout(Duration::from_millis(1500), resolver.lookup_ip(clean)) => {
+                    match res {
+                        Ok(Ok(lookup)) => {
+                            for ip in lookup.iter() {
+                                if ip.is_ipv4() {
+                                    result.push(IpNet::from(ip));
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => warn!("[Core] Failed to resolve {}: {}", clean, e),
+                        Err(_) => warn!("[Core] Timeout resolving {}", clean),
+                    }
+                }
+            }
+        }
 
-            // Domain resolution
-            match resolver.lookup_ip(target).await {
-                Ok(lookup) => {
-                    for ip in lookup.iter() {
-                        if ip.is_ipv4() {
-                            result.push(IpNet::from(ip));
+        let mut normalized_result: Vec<IpNet> = result
+            .into_iter()
+            .filter_map(|net| IpNet::new(net.network(), net.prefix_len()).ok())
+            .collect();
+
+        normalized_result.sort();
+        normalized_result.dedup();
+
+        normalized_result
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.is_active.load(Ordering::SeqCst) || self.session.lock().unwrap().is_some()
+    }
+
+    pub async fn start(&self) -> Result<()> {
+        if self
+            .is_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(anyhow!("VPN tunnel is already active"));
+        }
+
+        if self.permanently_cancelled.load(Ordering::SeqCst) {
+            self.is_active.store(false, Ordering::SeqCst);
+            self.active_finished_notify.notify_waiters();
+            return Ok(());
+        }
+        // Сбрасываем stop_requested от предыдущего цикла stop(), чтобы повторный Connect в GUI работал безотказно
+        self.stop_requested.store(false, Ordering::SeqCst);
+
+        let mut config_clone = self.config.clone();
+        if let Err(e) = config_clone.sanitize() {
+            self.is_active.store(false, Ordering::SeqCst);
+            self.active_finished_notify.notify_waiters();
+            client_state(ClientState::Failed, format!("Config error: {}", e), None);
+            return Err(e);
+        }
+
+        // Синхронизируем rules.abc сразу при старте клиента до поднятия туннеля (едино для CLI, GUI, Android, macOS, Windows, iOS)
+        self.sync_rules_cache(&config_clone).await;
+        if self.stop_requested.load(Ordering::SeqCst) {
+            info!("[Core] Stop requested during initial rules sync. Exiting.");
+            self.is_active.store(false, Ordering::SeqCst);
+            self.active_finished_notify.notify_waiters();
+            return Ok(());
+        }
+        ConnectivityMonitor::ensure_started(config_clone.connectivity.clone());
+
+        info!("[Core] Starting failover connection loop...");
+        emit_warn_event("[Core] Starting connection loop...");
+        client_state(ClientState::Connecting, "Starting connection loop", None);
+
+        let mut current_server_index = 0;
+
+        loop {
+            if self.stop_requested.load(Ordering::SeqCst) {
+                info!("[Core] Stop requested by user. Exiting connection loop.");
+                break;
+            }
+
+            let reconnect_signal = Arc::new(Notify::new());
+
+            let server = &config_clone.servers[current_server_index];
+            set_default_tls_config(server.effective_tls_config(&config_clone.stealth));
+
+            let server_name = server.get_name();
+            info!(
+                "[Core] Connecting to server '{}' ({})",
+                server_name, server.dsn
+            );
+            status(format!("Connecting to '{}'...", server_name));
+            client_state(
+                ClientState::Connecting,
+                format!("Connecting to '{}'", server_name),
+                Some(server_name.clone()),
+            );
+
+            match self.connect_and_run(server, reconnect_signal.clone()).await {
+                Ok(()) => {
+                    if self.stop_requested.load(Ordering::SeqCst) {
+                        info!("[Core] Stop requested by user. Exiting connection loop.");
+                        break;
+                    }
+
+                    warn!(
+                        "[Core] Connection with server '{}' lost. Switching to the next node...",
+                        server_name
+                    );
+                    emit_warn_event("Connection lost. Reconnecting...");
+                    client_state(
+                        ClientState::Reconnecting,
+                        "Connection lost; reconnecting",
+                        Some(server_name.clone()),
+                    );
+
+                    current_server_index = (current_server_index + 1) % config_clone.servers.len();
+                    select! {
+                        _ = sleep(Duration::from_secs(2)) => {}
+                        _ = self.cancel_signal.notified() => {
+                            info!("[Core] Connection loop sleep cancelled by user.");
+                            break;
                         }
                     }
                 }
-                Err(e) => warn!("[Core] Failed to resolve {}: {}", target, e),
+                Err(e) => {
+                    if self.stop_requested.load(Ordering::SeqCst)
+                        || e.to_string().contains("shutdown requested")
+                    {
+                        info!("[Core] Stop requested by user. Exiting connection loop.");
+                        self.stop_requested.store(true, Ordering::SeqCst);
+                        break;
+                    }
+
+                    if let Some(auth_err) =
+                        should_abort_on_auth_deny(&e, config_clone.servers.len())
+                    {
+                        error!(
+                            "[Core] Authentication denied by server '{}': {}. Stopping connection loop.",
+                            server_name, auth_err.message
+                        );
+                        err(auth_err.message.clone());
+                        client_state(
+                            ClientState::Failed,
+                            format!("Auth error: {}", auth_err.message),
+                            Some(server_name.clone()),
+                        );
+                        self.stop_requested.store(true, Ordering::SeqCst);
+                        break;
+                    }
+
+                    error!(
+                        "[Core] Connection failed or timed out for server '{}': {}",
+                        server_name, e
+                    );
+                    err(format!("Node error: {}", e));
+                    client_state(
+                        ClientState::Reconnecting,
+                        format!("Node error: {e}"),
+                        Some(server_name.clone()),
+                    );
+
+                    current_server_index = (current_server_index + 1) % config_clone.servers.len();
+                    select! {
+                        _ = sleep(Duration::from_secs(2)) => {}
+                        _ = self.cancel_signal.notified() => {
+                            info!("[Core] Connection loop sleep cancelled by user.");
+                            break;
+                        }
+                    }
+                }
             }
         }
-        result
+
+        self.is_active.store(false, Ordering::SeqCst);
+        self.active_finished_notify.notify_waiters();
+        Ok(())
     }
 
-    /// Проверяет, запущен ли клиент
-    pub fn is_running(&self) -> bool {
-        let state = self.session.lock().unwrap();
-        state.is_some()
-    }
+    #[cfg(all(windows, feature = "per-app"))]
+    async fn acquire_packet_source(
+        &self,
+        _server: &ServerConfig,
+        auth: &AuthResponse,
+    ) -> Result<(
+        Sender<Bytes>,
+        Receiver<Bytes>,
+        String,
+        Option<AppFilter>,
+    )> {
+        let (tun_tx, tun_rx, iface_name) = self.tun_factory.create_tun(auth).await?;
+        let mode = self.config.main.effective_per_app_mode();
 
-    /// Запуск VPN
-    pub async fn start(&self) -> anyhow::Result<()> {
-        // 1. Защита от двойного запуска
-        if self.is_running() {
-            return Err(anyhow::anyhow!("VPN is already running"));
+        if mode == PerAppMode::All
+            || (mode == PerAppMode::Include && self.config.main.per_app.is_empty())
+        {
+            info!("[Core] Per-app mode is disabled (All applications)");
+            status("[Core] Per-app mode is disabled (All applications)");
+            return Ok((tun_tx, tun_rx, iface_name, None));
         }
 
-        info!("[Core] Starting...");
-        status("[Core] Starting...");
+        let initial_bypass: Vec<IpAddr> = self
+            .config
+            .servers
+            .iter()
+            .filter_map(|s| s.host_port().ok())
+            .filter_map(|(host, _)| IpAddr::from_str(&host).ok())
+            .collect();
 
-        // --- НОВАЯ ЛОГИКА ТРАНСПОРТА ---
-        status(format!("[CORE] Connecting to {}", self.config.main.address));
-        info!("[CORE] Connecting to {}", self.config.main.address);
-        let transport = create_transport(&self.config);
+        let policy = match mode {
+            PerAppMode::Exclude => AppPolicy::exclude(self.config.main.per_app.clone()),
+            PerAppMode::Include => AppPolicy::include(self.config.main.per_app.clone()),
+            PerAppMode::All => AppPolicy::exclude(Vec::<String>::new()),
+        };
 
-        info!("[Core] Transport mode: [{:?}]", self.config.transport.mode);
-        status(format!("[Core] Transport mode: [{:?}]", self.config.transport.mode));
+        let vpn_ip = IpAddr::from_str(&auth.ip).context("Failed to parse assigned VPN IP")?;
 
-        // Connect возвращает AuthResponse (настройки сети) и VpnStream (трубу данных)
-        // Если это QUIC - stream это обертка над QUIC стримами.
-        // Если это SSH - stream это обертка над SSH каналом.
-        let result  = transport.connect().await?;
+        let (filter, tx, rx) = AppFilter::start(policy, initial_bypass, vpn_ip)?;
 
-        info!("[Core] Authenticated. VPN IP: {}", result.auth_response.ip);
-        status(format!("[Core] Authenticated. VPN IP: {}", result.auth_response.ip));
+        let (server_host, server_port) = _server.host_port()?;
+        if let Ok(ip) = IpAddr::from_str(&server_host) {
+            filter.add_bypass(ip).await;
+        } else if let Ok(mut addrs) = lookup_host((server_host.as_str(), server_port)).await {
+            if let Some(sa) = addrs.next() {
+                filter.add_bypass(sa.ip()).await;
+            }
+        }
 
-        // =========================================================================
-        // ПРЕ-РЕЗОЛВИНГ: Собираем IP-адреса ДО того, как сломаем сеть адаптерами
-        // =========================================================================
-        status("Resolving domain routes...");
-        let include_routes = self.resolve_list(&self.config.main.route_for).await;
-        let exclude_routes = self.resolve_list(&self.config.main.exclude_route_for).await;
+        let apps_names = self.config.main.per_app.join(", ");
+        let mode_str = match mode {
+            PerAppMode::All => "all",
+            PerAppMode::Include => "include",
+            PerAppMode::Exclude => "exclude",
+        };
 
-        // --- НАСТРОЙКА СЕТИ ---
+        info!(
+            "[Core] Per-app mode active, apps: [{}], mode: [{}]",
+            apps_names, mode_str,
+        );
+        status(format!(
+            "[Core] Per-app mode active, apps: [{}], mode: [{}]",
+            apps_names, mode_str,
+        ));
 
-        // Бэкапим маршруты
+        spawn(async move {
+            let mut rx = tun_rx;
+            while rx.recv().await.is_some() {}
+        });
+
+        Ok((tx, rx, iface_name, Some(filter)))
+    }
+
+    #[cfg(not(all(windows, feature = "per-app")))]
+    async fn acquire_packet_source(
+        &self,
+        _server: &ServerConfig,
+        auth: &AuthResponse,
+    ) -> Result<(Sender<Bytes>, Receiver<Bytes>, String, Option<()>)> {
+        let (tx, rx, iface) = self.tun_factory.create_tun(auth).await?;
+        Ok((tx, rx, iface, None))
+    }
+
+    async fn connect_and_run(
+        &self,
+        server: &ServerConfig,
+        reconnect_signal: Arc<Notify>,
+    ) -> Result<()> {
+        let mut config_clone = self.config.clone();
+        config_clone.sanitize()?;
+
+        let transport = create_transport(&config_clone, server)?;
+        let conn_timeout = Duration::from_secs(server.timeout_secs.max(30));
+
+        let connect_fut = transport.connect();
+        let stop_flag = &self.stop_requested;
+
+        let mut result = select! {
+            res = timeout(conn_timeout, connect_fut) => {
+                match res {
+                    Ok(Ok(auth_res)) => auth_res,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err(anyhow!("Connection handshake timed out")),
+                }
+            }
+            _ = self.cancel_signal.notified() => {
+                info!("[Core] Handshake cancelled by user.");
+                return Ok(());
+            }
+            _ = async {
+                loop {
+                    if stop_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+            } => {
+                info!("[Core] Handshake cancelled by user.");
+                return Ok(());
+            }
+        };
+
+        if self.stop_requested.load(Ordering::SeqCst) {
+            info!("[Core] Connection cancelled before configuring tunnel.");
+            if let Some(hook) = result.shutdown_hook.take() {
+                let _ = timeout(Duration::from_millis(800), hook).await;
+            }
+            if let Some(ref endpoint) = result.endpoint {
+                endpoint.close(0u32.into(), b"cancelled");
+            }
+            return Ok(());
+        }
+
+        info!("[Core] Authentication successful. Configuring tunnel interface...");
+        status("[Core] Authentication successful. Configuring tunnel interface...");
+
         self.route_manager.backup_routes().await?;
 
-        // Добавляем маршрут до VPN-сервера (Bypass), чтобы не зациклить трафик
-        let server_host = self.config.main.address.split(':').next().unwrap();
+        let (server_host, server_port) = server.host_port()?;
+        let mut bypass_ips = Vec::new();
+        let mut hosts_to_bypass = vec![(server_host, server_port)];
+        for s in &self.config.servers {
+            if let Ok(hp) = s.host_port() {
+                hosts_to_bypass.push(hp);
+            }
+        }
+        hosts_to_bypass.extend(NodeProbeMonitor::configured_hosts_and_ports());
+        hosts_to_bypass.sort_unstable();
+        hosts_to_bypass.dedup();
 
-        // Пытаемся распарсить как IP, если не выйдет - надо резолвить (но пока считаем что там IP)
-        if let Ok(server_ip) = IpAddr::from_str(server_host) {
-            self.route_manager.add_bypass_route(server_ip, 32).await?;
-        } else {
-            warn!(
-                "[Core] Server address is domain, skipping bypass route (TODO: implement resolve)"
-            );
+        for (h, p) in hosts_to_bypass {
+            if self.stop_requested.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Ok(ip) = IpAddr::from_str(&h) {
+                if ip.is_ipv4() && !ip.is_loopback() {
+                    bypass_ips.push(ip);
+                }
+            } else if let Ok(Ok(resolved)) =
+                timeout(Duration::from_millis(1500), lookup_host((h.as_str(), p))).await
+            {
+                bypass_ips.extend(
+                    resolved
+                        .map(|addr| addr.ip())
+                        .filter(|ip| ip.is_ipv4() && !ip.is_loopback()),
+                );
+            }
         }
 
-        // Поднимаем TUN интерфейс
-        let (tx_to_tun, mut rx_from_tun, iface_name) =
-            self.tun_factory.create_tun(&result.auth_response).await?;
+        // ГАРАНТИЯ: если транспорт закрепил конкретный IP CDN (Round-Robin),
+        // обязательно добавляем его в обход туннеля, чтобы избежать петли маршрутизации!
+        if let Some(pinned_ip) = result.remote_ip {
+            if pinned_ip.is_ipv4() && !pinned_ip.is_loopback() {
+                bypass_ips.push(pinned_ip);
+            }
+        }
 
-        // --- ЗАПУСК МОСТА (BRIDGE) ---
+        for bypass_ip in result.bypass_ips {
+            if bypass_ip.is_ipv4() && !bypass_ip.is_loopback() {
+                bypass_ips.push(bypass_ip);
+            }
+        }
+
+        bypass_ips.sort_unstable();
+        bypass_ips.dedup();
+
+        for server_ip in &bypass_ips {
+            let prefix = if server_ip.is_ipv4() { 32 } else { 128 };
+            self.route_manager
+                .add_bypass_route(*server_ip, prefix)
+                .await?;
+        }
+
+        // Инициализация и синхронизация движка Smart DNS, Geo-Routing и AdBlock (.abc + Local Overrides)
+        // Выполняется ДО acquire_packet_source, чтобы все платформы (Linux, Windows, macOS, Android VpnService, iOS)
+        // получили актуальные статические Direct-подсети в RouteManager до поднятия TUN-интерфейса.
+        let local_overrides = Arc::new(LocalOverrides::from_config(
+            &config_clone.routing.overrides,
+        ));
+        let mut aux_aborts: Vec<AbortHandle> = Vec::new();
+        let rule_cache = self.rule_cache.clone();
+        if let Some(rules_server_url) = config_clone.get_rules_server_url() {
+            // Добавляем IP сервера правил в обход туннеля для фоновых ETag-обновлений
+            if let Ok(uri) = rules_server_url.parse::<Uri>() {
+                if let Some(host) = uri.host() {
+                    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("https") {
+                        443
+                    } else {
+                        80
+                    });
+                    if let Ok(ip) = IpAddr::from_str(host) {
+                        if ip.is_ipv4() && !ip.is_loopback() {
+                            let _ = self.route_manager.add_bypass_route(ip, 32).await;
+                        }
+                    } else if let Ok(Ok(addrs)) =
+                        timeout(Duration::from_millis(1500), lookup_host((host, port))).await
+                    {
+                        for addr in addrs {
+                            let ip = addr.ip();
+                            if ip.is_ipv4() && !ip.is_loopback() {
+                                let _ = self.route_manager.add_bypass_route(ip, 32).await;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let rc_bg = rule_cache.clone();
+            let url_bg = rules_server_url.clone();
+            let shutdown_bg = self.cancel_signal.clone();
+            let rules_bg_task = spawn(async move {
+                if !rc_bg.is_loaded() {
+                    let _ = rc_bg.update_from_server(&url_bg).await;
+                }
+                loop {
+                    select! {
+                        _ = sleep(Duration::from_secs(600)) => {
+                            let _ = rc_bg.update_from_server(&url_bg).await;
+                        }
+                        _ = shutdown_bg.notified() => break,
+                    }
+                }
+            });
+            aux_aborts.push(rules_bg_task.abort_handle());
+        }
+
+        let per_app_requested = cfg!(all(windows, feature = "per-app"))
+            && config_clone.main.per_app_mode != PerAppMode::All
+            && !(config_clone.main.per_app_mode == PerAppMode::Include
+                && config_clone.main.per_app.is_empty());
+
+        if !per_app_requested && config_clone.main.route_for.is_empty() {
+            // Применяем пользовательские исключения exclude_route_for до создания TUN,
+            // чтобы Android VpnService и десктопные RouteManager получили все маршруты за один проход
+            if !config_clone.main.exclude_route_for.is_empty() {
+                let exclude_routes = self
+                    .resolve_list(&config_clone.main.exclude_route_for)
+                    .await;
+                let batch: Vec<(IpAddr, u8)> = exclude_routes
+                    .iter()
+                    .map(|net| (net.network(), net.prefix_len()))
+                    .collect();
+                if !batch.is_empty() {
+                    let _ = self.route_manager.add_bypass_routes(&batch).await;
+                }
+            }
+
+            // Применяем локальные исключения [routing.overrides] direct из client.toml
+            if !config_clone.routing.overrides.direct.is_empty() {
+                let local_direct_routes = self
+                    .resolve_list(&config_clone.routing.overrides.direct)
+                    .await;
+                let batch: Vec<(IpAddr, u8)> = local_direct_routes
+                    .iter()
+                    .map(|net| (net.network(), net.prefix_len()))
+                    .collect();
+                if !batch.is_empty() {
+                    let _ = self.route_manager.add_bypass_routes(&batch).await;
+                }
+            }
+
+            // Применяем статические CIDR-маршруты Direct из скомпилированного rules.abc:
+            // На Android при активных мобильных Белых Списках (или DPI) провайдер может блокировать/замедлять
+            // прямые обращения к части подсетей вне БС, а системный DNS идёт через туннель, поэтому
+            // на Android не исключаем 5200+ подсетей из tun0 по умолчанию (пользовательские exclude_route_for
+            // и [routing.overrides] direct выше при этом продолжают работать штатно).
+            let abc_direct_routes = rule_cache.collect_direct_routes();
+            if !abc_direct_routes.is_empty() {
+                let count = abc_direct_routes.len();
+                let msg = format!(
+                    "[RuleCache] Loaded {} static Direct CIDR rules from rules.abc",
+                    count
+                );
+                info!("{msg}");
+                status(&msg);
+            }
+        }
+
+        if self.stop_requested.load(Ordering::SeqCst) {
+            info!("[Core] Connection cancelled before acquiring packet source.");
+            for h in aux_aborts.drain(..) {
+                h.abort();
+            }
+            if let Some(hook) = result.shutdown_hook.take() {
+                let _ = timeout(Duration::from_millis(800), hook).await;
+            }
+            if let Some(ref endpoint) = result.endpoint {
+                endpoint.close(0u32.into(), b"cancelled");
+            }
+            let _ = self.route_manager.restore_routes().await;
+            return Ok(());
+        }
+
+        let (tx_to_tun, mut rx_from_tun, iface_name, _app_filter) = match self
+            .acquire_packet_source(server, &result.auth_response)
+            .await
+        {
+            Ok(res) => res,
+            Err(e) => {
+                warn!("[Core] Failed to acquire packet source (TUN/WinDivert): {e:#}. Cleaning up transport session...");
+                for h in aux_aborts.drain(..) {
+                    h.abort();
+                }
+                if let Some(hook) = result.shutdown_hook.take() {
+                    let _ = timeout(Duration::from_millis(1200), hook).await;
+                }
+                if let Some(ref endpoint) = result.endpoint {
+                    endpoint.close(0u32.into(), b"tun_failed");
+                }
+                let _ = self.route_manager.restore_routes().await;
+                return Err(e);
+            }
+        };
+
+        #[cfg(all(windows, feature = "per-app"))]
+        if let Some(ref filter) = _app_filter {
+            // 1. IP адреса серверов и контрольных точек
+            for ip in &bypass_ips {
+                filter.add_bypass_sync(*ip);
+            }
+
+            // 2. Исключения exclude_route_for из конфига
+            if !config_clone.main.exclude_route_for.is_empty() {
+                for net in self.resolve_list(&config_clone.main.exclude_route_for).await {
+                    filter.add_bypass_net(net);
+                }
+            }
+
+            // 3. Пользовательские исключения [routing.overrides] direct
+            if !config_clone.routing.overrides.direct.is_empty() {
+                for net in self.resolve_list(&config_clone.routing.overrides.direct).await {
+                    filter.add_bypass_net(net);
+                }
+            }
+
+            // 4. [ИСПРАВЛЕНИЕ] Добавляем все статические Direct-подсети из скомпилированной базы rules.abc
+            let abc_direct_routes = rule_cache.collect_direct_routes();
+            for (ip, prefix) in abc_direct_routes {
+                if let Ok(net) = IpNet::new(ip, prefix) {
+                    filter.add_bypass_net(net);
+                }
+            }
+        }
+
+        let direct_ip_cache = DirectIpCache::new();
+        let dns_interceptor = DnsInterceptor::new(
+            local_overrides.clone(),
+            direct_ip_cache.clone(),
+        );
+
+        let session_start = Instant::now();
+        let disconnect_reason = Arc::new(Mutex::new("Normal session termination".to_string()));
+
+        let last_rx_time = Arc::new(AtomicU64::new(0));
+        let last_tx_time = Arc::new(AtomicU64::new(0));
+
+        let total_rx_bytes = Arc::new(AtomicU64::new(0));
+        let total_tx_bytes = Arc::new(AtomicU64::new(0));
+        let total_rx_packets = Arc::new(AtomicU64::new(0));
+        let total_tx_packets = Arc::new(AtomicU64::new(0));
 
         let shutdown_notify = Arc::new(Notify::new());
         let notify_tx = shutdown_notify.clone();
         let notify_rx = shutdown_notify.clone();
 
-        // Разделяем VpnStream на Reader и Writer
-        let (mut stream_reader, mut stream_writer) = tokio::io::split(result.vpn_stream);
+        let client_ip_opt: Option<Ipv4Addr> = result.auth_response.ip.parse().ok();
+        let gateway_ip_opt: Option<Ipv4Addr> = result.auth_response.gateway.parse().ok();
 
-        // Task 1: TUN -> NETWORK (Пишем в транспорт)
-        let t1 = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    pkt = rx_from_tun.recv() => {
-                        if let Some(packet) = pkt {
-                            // ВАЖНО: Всегда используем frame_packet (u16 length prefix).
-                            // Это нужно для SSH (TCP) и не вредит QUIC (просто overhead 2 байта).
-                            let framed = frame_packet(packet);
-                            if stream_writer.write_all(&framed).await.is_err() {
-                                error!("[Bridge] Write to transport failed");
-                                break;
-                            }
-                            // Flush может быть дорогим, но для SSH/TCP он нужен, чтобы протолкнуть буфер
-                            let _ = stream_writer.flush().await;
-                        } else {
-                            break;
+        let last_rtt_us = Arc::new(AtomicU64::new(u64::MAX));
+        let last_reply_us = Arc::new(AtomicU64::new(0));
+        let (tx_probe, mut rx_probe) = channel::<Bytes>(64);
+
+        let is_wrtc_proto = matches!(server.mode(), Ok(TransportMode::Wrtc));
+        let is_imap_proto = matches!(server.mode(), Ok(TransportMode::Imap));
+
+        // Внутритуннельный генератор ICMP Echo Request для универсального измерения честного RTT
+        // и реальной сквозной связности «РФ / Мир» внутри туннеля (включая Android с addDisallowedApplication).
+        // Работает для ВСЕХ видов транспорта (QUIC, SSH, VNC, AHTTP, WS, WRTC, IMAP) прямо внутри шифрованного потока.
+        if let (Some(client_ip), Some(gateway_ip)) = (client_ip_opt, gateway_ip_opt) {
+            let tx_probe_c = tx_probe.clone();
+            let probe_shutdown = shutdown_notify.clone();
+            let probe_start_time = session_start;
+            let probe_last_rtt = last_rtt_us.clone();
+            let ping_interval = if is_imap_proto {
+                // В режиме IMAP не шлем холостые письма каждые 2 секунды, чтобы не триггерить анти-спам лимит THROTTLED
+                Duration::from_secs(config_clone.connectivity.ping_interval_secs.clamp(10, 30))
+            } else {
+                Duration::from_secs(config_clone.connectivity.ping_interval_secs.clamp(1, 30))
+            };
+
+            let icmp_probe_task = spawn(async move {
+                let mut seq: u16 = 0;
+                // Небольшая задержка перед первым зондом для завершения инициализации туннеля
+                select! {
+                    _ = sleep(Duration::from_millis(150)) => {}
+                    _ = probe_shutdown.notified() => return,
+                }
+
+                loop {
+                    seq = seq.wrapping_add(1);
+                    let now_us = probe_start_time.elapsed().as_micros() as u64;
+                    let probe_packet = build_ipv4_icmp_echo_request(
+                        client_ip,
+                        gateway_ip,
+                        PROBE_IDENTIFIER,
+                        seq,
+                        now_us,
+                    );
+
+                    if tx_probe_c.send(probe_packet).await.is_err() {
+                        break;
+                    }
+
+                    // На первом цикле и далее каждые 2 цикла отправляем легковесные 36-байтные
+                    // внутритуннельные ICMP-зонды к глобальным (1.1.1.1, 8.8.8.8, 9.9.9.9)
+                    // и российским (77.88.8.8, 77.88.8.1, 87.250.250.242) узлам через NAT сервера.
+                    if seq == 1 || seq % 2 == 0 {
+                        let now_ext_us = probe_start_time.elapsed().as_micros() as u64;
+                        for (idx, &world_ip) in WORLD_PROBE_IPS.iter().enumerate() {
+                            let pkt = build_ipv4_icmp_echo_request(
+                                client_ip,
+                                world_ip,
+                                PROBE_WORLD_IDENTIFIER,
+                                (idx as u16) + 1,
+                                now_ext_us,
+                            );
+                            let _ = tx_probe_c.try_send(pkt);
+                        }
+                        for (idx, &dom_ip) in DOMESTIC_PROBE_IPS.iter().enumerate() {
+                            let pkt = build_ipv4_icmp_echo_request(
+                                client_ip,
+                                dom_ip,
+                                PROBE_DOMESTIC_IDENTIFIER,
+                                (idx as u16) + 1,
+                                now_ext_us,
+                            );
+                            let _ = tx_probe_c.try_send(pkt);
                         }
                     }
-                    _ = notify_tx.notified() => { break; }
+
+                    // Если самый первый зонд ещё не успел получить ответ (например, завершалась привязка второго ящика),
+                    // повторяем зонд через 2.5 с, чтобы метрика RTT в UI и [STATS] появлялась сразу после старта сессии.
+                    let wait_dur = if seq <= 2 && probe_last_rtt.load(Ordering::Relaxed) == u64::MAX {
+                        Duration::from_millis(2500).min(ping_interval)
+                    } else {
+                        ping_interval
+                    };
+
+                    select! {
+                        _ = sleep(wait_dur) => {}
+                        _ = probe_shutdown.notified() => break,
+                    }
+                }
+            });
+            aux_aborts.push(icmp_probe_task.abort_handle());
+        }
+
+        let dns_aborts: Arc<Mutex<Vec<AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
+        let dns_aborts_t2 = dns_aborts.clone();
+
+        let (mut stream_reader, mut stream_writer) = io_split(result.vpn_stream);
+
+        let tx_time = last_tx_time.clone();
+        let tx_start = session_start;
+        let tx_bytes = total_tx_bytes.clone();
+        let tx_packets = total_tx_packets.clone();
+        let sig_t1 = reconnect_signal.clone();
+        let reason_t1 = disconnect_reason.clone();
+        let tx_to_tun_dns = tx_to_tun.clone();
+        let dns_interceptor_tx = dns_interceptor.clone();
+        let rule_cache_tx = rule_cache.clone();
+        let local_overrides_tx = local_overrides.clone();
+        let direct_ip_cache_tx = direct_ip_cache.clone();
+
+        #[cfg(all(windows, feature = "per-app"))]
+        let app_filter_bypass_t2 = _app_filter.as_ref().map(|f| f.bypass_set());
+
+        let client_clamp_mtu = (result.auth_response.mtu as usize).clamp(576, 1500);
+
+        let t1 = spawn(async move {
+            let mut write_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
+
+            // Возвращает true, если пакет должен идти в VPN-туннель, или false, если он перехвачен/отброшен
+            let should_forward_to_tunnel = |pkt: &Bytes| -> bool {
+                // 1. Мгновенно отклоняем IPv6-пакеты (TCP RST / ICMPv6 Unreachable за 0.05 мс),
+                // чтобы Telegram и браузеры на мобильных сетях (МегаФон/МТС/Tele2) без задержки шли по IPv4
+                if pkt.first().map(|b| b >> 4) == Some(6) {
+                    if let Some(reject) = build_reject_packet(pkt) {
+                        let _ = tx_to_tun_dns.try_send(reject);
+                    }
+                    return false;
+                }
+
+                // 2. Отклоняем DoH/DoT (порты 853 и 443 к DNS-резолверам) с активным TCP RST / ICMP Unreachable,
+                // чтобы Android Private DNS (netd) и Firefox мгновенно переключались на UDP:53 без зависания «Адрес не найден»
+                if is_encrypted_dns_packet(pkt) {
+                    if let Some(reject) = build_reject_packet(pkt) {
+                        let _ = tx_to_tun_dns.try_send(reject);
+                    }
+                    return false;
+                }
+
+                // 3. В режимах WRTC и IMAP отклоняем QUIC (UDP:443) через ICMP Port Unreachable,
+                // чтобы YouTube и браузеры за 0.05 мс переходили на TCP:443 (HTTP/2) с автоматическим TCP MSS Clamping
+                // и коалесценцией батчей
+                if (is_wrtc_proto || is_imap_proto) && is_quic_udp_443_packet(pkt) {
+                    if let Some(reject) = build_reject_packet(pkt) {
+                        let _ = tx_to_tun_dns.try_send(reject);
+                    }
+                    return false;
+                }
+
+                match dns_interceptor_tx.handle_packet(pkt, |domain| rule_cache_tx.lookup_domain(domain)) {
+                    InterceptResult::Handled(synth_reply) => {
+                        let _ = tx_to_tun_dns.try_send(synth_reply);
+                        return false;
+                    }
+                    InterceptResult::Drop => {
+                        return false;
+                    }
+                    // Все разрешённые DNS-запросы (и Proxy, и Direct IPv4 A) идут строго внутри
+                    // зашифрованного VPN-туннеля (0% DNS Leak наружу). Для Direct-доменов ответ
+                    // перехватывается в t2 (`inspect_dns_response`), который прописывает /32 bypass-маршруты
+                    // до передачи DNS-ответа приложению.
+                    InterceptResult::DirectQuery | InterceptResult::PassThrough => {}
+                }
+
+                if let Some(dst_ip) = extract_packet_dst_ip(pkt) {
+                    let ip_action = local_overrides_tx
+                        .lookup_ip(dst_ip)
+                        .or_else(|| direct_ip_cache_tx.check(&dst_ip))
+                        .or_else(|| rule_cache_tx.lookup_ip(dst_ip));
+
+                    if matches!(ip_action, Some(RuleAction::Block)) {
+                        return false;
+                    }
+                }
+
+                true
+            };
+
+            loop {
+                let (packet, is_probe) = select! {
+                    biased;
+                    probe_pkt = rx_probe.recv() => {
+                        match probe_pkt {
+                            Some(p) => (p, true),
+                            None => {
+                                match rx_from_tun.recv().await {
+                                    Some(p) => (p, false),
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+                    pkt = rx_from_tun.recv() => {
+                        match pkt {
+                            Some(p) => (p, false),
+                            None => {
+                                info!("[Tunnel/Tx] Local TUN packet channel closed (adapter or worker stopped).");
+                                *reason_t1.lock().unwrap() = "Local TUN packet channel closed (adapter or worker stopped)".to_string();
+                                sig_t1.notify_one();
+                                break;
+                            }
+                        }
+                    }
+                    _ = notify_tx.notified() => {
+                        info!("[Tunnel/Tx] Worker received shutdown notification.");
+                        break;
+                    }
+                };
+
+                write_buf.clear();
+                if is_probe {
+                    frame_packet_into(&mut write_buf, &packet);
+                } else if should_forward_to_tunnel(&packet) {
+                    let packet = clamp_tcp_mss_bytes(packet, client_clamp_mtu);
+                    let len = packet.len() as u64;
+                    tx_bytes.fetch_add(len, Ordering::Relaxed);
+                    tx_packets.fetch_add(1, Ordering::Relaxed);
+                    frame_packet_into(&mut write_buf, &packet);
+                }
+
+                while write_buf.len() < COALESCE_BUDGET_BYTES {
+                    if let Ok(p) = rx_probe.try_recv() {
+                        frame_packet_into(&mut write_buf, &p);
+                        continue;
+                    }
+                    match rx_from_tun.try_recv() {
+                        Ok(p) => {
+                            if should_forward_to_tunnel(&p) {
+                                let p = clamp_tcp_mss_bytes(p, client_clamp_mtu);
+                                let len = p.len() as u64;
+                                tx_bytes.fetch_add(len, Ordering::Relaxed);
+                                tx_packets.fetch_add(1, Ordering::Relaxed);
+                                frame_packet_into(&mut write_buf, &p);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                if write_buf.is_empty() {
+                    continue;
+                }
+                tx_time.store(tx_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+                // ВНИМАНИЕ: ЗДЕСЬ УДАЛЁН flush().await, ИНАЧЕ QUIC И SSH РАБОТАЮЮТ КАК STOP-AND-WAIT
+                if let Err(e) = stream_writer.write_all(&write_buf).await {
+                    warn!("[Tunnel/Tx] Failed to write {} bytes to VPN stream: {e:#}", write_buf.len());
+                    *reason_t1.lock().unwrap() = format!("Failed to write {} bytes to VPN stream: {e:#}", write_buf.len());
+                    sig_t1.notify_one();
+                    break;
                 }
             }
         });
 
-        // Task 2: NETWORK -> TUN (Читаем из транспорта)
-        let t2 = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    // read_next_packet читает u16 length, потом данные
-                    res = read_next_packet(&mut stream_reader) => {
+        let rx_time = last_rx_time.clone();
+        let rx_bytes = total_rx_bytes.clone();
+        let rx_packets = total_rx_packets.clone();
+        let sig_t2 = reconnect_signal.clone();
+        let reason_t2 = disconnect_reason.clone();
+        let last_rtt_rx = last_rtt_us.clone();
+        let last_reply_rx = last_reply_us.clone();
+        let probe_start_rx = session_start;
+        let dns_interceptor_rx = dns_interceptor.clone();
+        let rule_cache_rx = rule_cache.clone();
+        let route_manager_rx = self.route_manager.clone();
+        let t2 = spawn(async move {
+            let mut frame_reader = FrameReader::new();
+            'rx_loop: loop {
+                select! {
+                    res = frame_reader.read_next_packet(&mut stream_reader) => {
                         match res {
-                            Ok(Some(packet)) => {
-                                if tx_to_tun.send(packet).await.is_err() { break; }
+                            Ok(Some(first_packet)) => {
+                                let batch_rx_us = probe_start_rx.elapsed().as_micros() as u64;
+                                rx_time.store(batch_rx_us, Ordering::Relaxed);
+                                let mut current_pkt = Some(first_packet);
+                                while let Some(packet) = current_pkt.take() {
+                                    // Перехватываем внутритуннельные ICMP Echo Reply:
+                                    // 1) PROBE_IDENTIFIER (0x414E) — замер RTT до VPN-узла
+                                    // 2) PROBE_WORLD_IDENTIFIER (0x4157) — проверка связности «Мир» сквозь туннель
+                                    // 3) PROBE_DOMESTIC_IDENTIFIER (0x4144) — проверка связности «РФ» сквозь туннель
+                                    if let Some(c_ip) = client_ip_opt {
+                                        if let Some((_seq, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
+                                            &packet,
+                                            c_ip,
+                                            PROBE_IDENTIFIER,
+                                        ) {
+                                            let sample_us = batch_rx_us.saturating_sub(sent_ts_us);
+
+                                            // Асимметричное экспоненциальное сглаживание (EWMA):
+                                            // - при росте задержки (bufferbloat под нагрузкой): alpha = 0.25 (плавное демпфирование)
+                                            // - при снижении задержки (после завершения Speedtest): alpha = 0.75 (быстрый возврат к норме)
+                                            let prev_us = last_rtt_rx.load(Ordering::Relaxed);
+                                            let smoothed_us = if prev_us == u64::MAX {
+                                                sample_us
+                                            } else if sample_us < prev_us {
+                                                (prev_us + (sample_us * 3)) / 4
+                                            } else {
+                                                ((prev_us * 3) + sample_us) / 4
+                                            };
+
+                                            last_rtt_rx.store(smoothed_us.max(100), Ordering::Relaxed);
+                                            last_reply_rx.store(batch_rx_us, Ordering::Relaxed);
+                                            ConnectivityMonitor::update_tunnel_rtt_ms(
+                                                Some((smoothed_us / 1000).max(1)),
+                                            );
+                                            match frame_reader.try_next_packet() {
+                                                Ok(next_opt) => {
+                                                    current_pkt = next_opt;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                                    *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                                    sig_t2.notify_one();
+                                                    break 'rx_loop;
+                                                }
+                                            }
+                                        }
+
+                                        if let Some((seq_idx, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
+                                            &packet,
+                                            c_ip,
+                                            PROBE_WORLD_IDENTIFIER,
+                                        ) {
+                                            let rtt_ms = (batch_rx_us.saturating_sub(sent_ts_us) / 1000).max(1);
+                                            let idx = seq_idx.saturating_sub(1) as usize;
+                                            ConnectivityMonitor::record_in_tunnel_global_probe(idx, rtt_ms);
+                                            match frame_reader.try_next_packet() {
+                                                Ok(next_opt) => {
+                                                    current_pkt = next_opt;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                                    *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                                    sig_t2.notify_one();
+                                                    break 'rx_loop;
+                                                }
+                                            }
+                                        }
+
+                                        if let Some((seq_idx, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
+                                            &packet,
+                                            c_ip,
+                                            PROBE_DOMESTIC_IDENTIFIER,
+                                        ) {
+                                            let rtt_ms = (batch_rx_us.saturating_sub(sent_ts_us) / 1000).max(1);
+                                            let idx = seq_idx.saturating_sub(1) as usize;
+                                            ConnectivityMonitor::record_in_tunnel_domestic_probe(idx, rtt_ms);
+                                            match frame_reader.try_next_packet() {
+                                                Ok(next_opt) => {
+                                                    current_pkt = next_opt;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                                    *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                                    sig_t2.notify_one();
+                                                    break 'rx_loop;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let packet = clamp_tcp_mss_bytes(packet, client_clamp_mtu);
+                                    let len = packet.len() as u64;
+                                    rx_bytes.fetch_add(len, Ordering::Relaxed);
+                                    rx_packets.fetch_add(1, Ordering::Relaxed);
+
+                                    // Если из туннеля пришел DNS-ответ для Direct-домена, прописываем /32 bypass-маршруты
+                                    // в таблицу маршрутизации ОС и сразу после этого отдаём DNS-ответ в TUN,
+                                    // чтобы первый же TCP SYN браузера пошёл в обход туннеля (и без блокировки 'rx_loop).
+                                    if let Some((qname, resolved_ips)) = dns_interceptor_rx
+                                        .inspect_dns_response(&packet, |domain| rule_cache_rx.lookup_domain(domain))
+                                    {
+                                        if !resolved_ips.is_empty() {
+                                            #[cfg(all(windows, feature = "per-app"))]
+                                            if let Some(ref bp) = app_filter_bypass_t2 {
+                                                for ip in &resolved_ips {
+                                                    bp.add_sync(*ip);
+                                                }
+                                            }
+                                            let routes: Vec<(IpAddr, u8)> = resolved_ips
+                                                .iter()
+                                                .map(|ip| (*ip, if ip.is_ipv4() { 32 } else { 128 }))
+                                                .collect();
+                                            let rm_bg = route_manager_rx.clone();
+                                            let tun_tx_bg = tx_to_tun.clone();
+                                            let pkt_bg = packet.clone();
+                                            let dns_rx_task = spawn(async move {
+                                                let _ = rm_bg.add_bypass_routes(&routes).await;
+                                                info!(
+                                                    "[DNS/Direct] Domain '{}' resolved via tunnel -> added OS bypass routes for {:?}",
+                                                    qname,
+                                                    resolved_ips
+                                                );
+                                                let _ = tun_tx_bg.send(pkt_bg).await;
+                                            });
+                                            {
+                                                let mut guard = dns_aborts_t2.lock().unwrap();
+                                                guard.retain(|h| !h.is_finished());
+                                                guard.push(dns_rx_task.abort_handle());
+                                            }
+                                            match frame_reader.try_next_packet() {
+                                                Ok(next_opt) => {
+                                                    current_pkt = next_opt;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                                    *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                                    sig_t2.notify_one();
+                                                    break 'rx_loop;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if tx_to_tun.send(packet).await.is_err() {
+                                        warn!("[Tunnel/Rx] Failed to send packet to TUN channel (channel closed or dropped).");
+                                        *reason_t2.lock().unwrap() = "Failed to send packet to TUN channel (channel closed or dropped)".to_string();
+                                        sig_t2.notify_one();
+                                        break 'rx_loop;
+                                    }
+
+                                    match frame_reader.try_next_packet() {
+                                        Ok(next_opt) => current_pkt = next_opt,
+                                        Err(e) => {
+                                            warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                            *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                            sig_t2.notify_one();
+                                            break 'rx_loop;
+                                        }
+                                    }
+                                }
                             }
                             Ok(None) => {
-                                info!("[Bridge] Transport closed (EOF)");
+                                info!("[Tunnel/Rx] VPN stream reached EOF (server or remote transport closed stream).");
+                                *reason_t2.lock().unwrap() = "VPN stream reached EOF (server or remote transport closed stream)".to_string();
+                                sig_t2.notify_one();
                                 break;
                             }
                             Err(e) => {
-                                error!("[Bridge] Read from transport error: {}", e);
+                                warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                sig_t2.notify_one();
                                 break;
                             }
                         }
                     }
-                    _ = notify_rx.notified() => { break; }
+                    _ = notify_rx.notified() => {
+                        info!("[Tunnel/Rx] Worker received shutdown notification.");
+                        break;
+                    }
                 }
             }
         });
 
-        let main_task = tokio::spawn(async move {
-            let _ = tokio::join!(t1, t2);
-            info!("[Core] Bridge tasks finished");
-        });
+        let per_app_active = _app_filter.is_some();
 
-        // --- ЛОГИКА МАРШРУТИЗАЦИИ (Split / Global) ---
-
-        if !self.config.main.route_for.is_empty() {
-            // MODE 1: INCLUDE (Whitelist)
-            info!("[Core] Mode: Split Tunneling (INCLUDE).");
-
-            for net in include_routes.iter() {
-                self.route_manager
-                    .add_specific_route(
-                        net.addr(),
-                        net.prefix_len(),
-                        &result.auth_response.gateway,
-                        &iface_name,
-                    )
-                    .await?;
-            }
-        } else {
-            // MODE 2: GLOBAL VPN
-            info!("[Core] Mode: Global VPN.");
-
-            // Исключения
-            if !self.config.main.exclude_route_for.is_empty() {
-                info!(
-                    "[Core] Found {} exclusion rules.",
-                    self.config.main.exclude_route_for.len()
-                );
-
-                for net in exclude_routes.iter() {
+        if !per_app_active {
+            let route_setup_res: Result<()> = async {
+                if !config_clone.main.route_for.is_empty() {
+                    let include_routes = self.resolve_list(&config_clone.main.route_for).await;
+                    for net in include_routes.iter() {
+                        self.route_manager
+                            .add_specific_route(
+                                net.network(),
+                                net.prefix_len(),
+                                &result.auth_response.gateway,
+                                &iface_name,
+                            )
+                            .await?;
+                    }
+                } else {
                     self.route_manager
-                        .add_bypass_route(net.addr(), net.prefix_len())
+                        .set_default_route(&result.auth_response.gateway, &iface_name)
                         .await?;
                 }
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = route_setup_res {
+                warn!("[Core] Failed to configure routes on '{}': {e:#}. Cleaning up session...", iface_name);
+                shutdown_notify.notify_waiters();
+                t1.abort();
+                t2.abort();
+                for h in aux_aborts.drain(..) {
+                    h.abort();
+                }
+                for h in dns_aborts.lock().unwrap().drain(..) {
+                    h.abort();
+                }
+                if let Some(hook) = result.shutdown_hook.take() {
+                    let _ = timeout(Duration::from_millis(1200), hook).await;
+                }
+                if let Some(ref endpoint) = result.endpoint {
+                    endpoint.close(0u32.into(), b"route_failed");
+                }
+                let _ = self.route_manager.restore_routes().await;
+                return Err(e);
             }
 
-            // Весь трафик в туннель
-            self.route_manager
-                .set_default_route(&result.auth_response.gateway, &iface_name)
-                .await?;
-        }
+            if !config_clone.main.dns_server_list.is_empty() {
+                let dns_ips: Vec<IpAddr> = config_clone
+                    .main
+                    .dns_server_list
+                    .iter()
+                    .filter_map(|s| IpAddr::from_str(s).ok())
+                    .collect();
+                let dns_ipv4: Vec<Ipv4Addr> = dns_ips
+                    .iter()
+                    .filter_map(|ip| match ip {
+                        IpAddr::V4(addr) => Some(*addr),
+                        _ => None,
+                    })
+                    .collect();
 
-        // --- DNS ---
-        if !self.config.main.dns_server_list.is_empty() {
-            // Преобразуем строки в IP
-            let dns_ips: Vec<IpAddr> = self
-                .config
-                .main
-                .dns_server_list
-                .iter()
-                .filter_map(|s| IpAddr::from_str(s).ok())
-                .collect();
-
-            // Фильтруем IPv4 (для текущего менеджера)
-            let dns_ipv4: Vec<std::net::Ipv4Addr> = dns_ips
-                .iter()
-                .filter_map(|ip| match ip {
-                    IpAddr::V4(addr) => Some(*addr),
-                    _ => None,
-                })
-                .collect();
-
-            if !dns_ipv4.is_empty() {
-                if let Err(e) = self.dns_manager.set_dns(&iface_name, &dns_ipv4) {
-                    warn!("[Core] Failed to configure DNS: {}", e);
+                if !dns_ipv4.is_empty() {
+                    let _ = self.dns_manager.set_dns(&iface_name, &dns_ipv4);
                 }
             }
         }
 
-        info!("[Core] VPN Tunnel UP.");
-        status("[Core] VPN UP");
-        status("VPN Tunnel UP");
+        let monitor_shutdown = shutdown_notify.clone();
+        let monitor_reconnect = reconnect_signal.clone();
+        let rx_check = last_rx_time.clone();
+        let tx_check = last_tx_time.clone();
+        let health_start = session_start;
+        let quic_conn = result.connection.clone();
+        let reason_health = disconnect_reason.clone();
+        let tx_probe_health = tx_probe.clone();
 
-        if self.config.stats.enabled {
-            if let Some(conn) = result.connection {
-                statistic::start_stats_monitor(conn, self.config.stats.interval_minutes);
-            } else {
-                info!("Stats are not available for this transport mode.");
+        let health_pause = result.health_pause.clone();
+        let health_task = spawn(async move {
+            let check_interval = Duration::from_secs(3);
+            let has_probes = client_ip_opt.is_some() && gateway_ip_opt.is_some();
+            let mut is_initial_phase = true;
+            let mut stalled_counter: u32 = 0;
+            let mut probe_seq: u16 = 50000;
+            let mut last_wall_clock = SystemTime::now();
+            let mut last_mono_instant = Instant::now();
+
+            loop {
+                select! {
+                    _ = sleep(check_interval) => {}
+                    _ = monitor_shutdown.notified() => {
+                        break;
+                    }
+                }
+
+                let now_wall = SystemTime::now();
+                let wall_elapsed = now_wall
+                    .duration_since(last_wall_clock)
+                    .unwrap_or(check_interval);
+                let mono_elapsed = last_mono_instant.elapsed();
+                last_wall_clock = now_wall;
+                last_mono_instant = Instant::now();
+
+                if health_pause.as_ref().is_some_and(|pause| pause.load(Ordering::Acquire)) {
+                    let now_us = health_start.elapsed().as_micros() as u64;
+                    rx_check.store(now_us, Ordering::Relaxed);
+                    tx_check.store(now_us, Ordering::Relaxed);
+                    stalled_counter = 0;
+                    continue;
+                }
+
+                if let Some(ref conn) = quic_conn {
+                    if let Some(reason) = conn.close_reason() {
+                        let stats = conn.stats();
+                        warn!(
+                            "[Health] Underlying QUIC connection closed: {:?}. Stats: RTT={:?}, Lost(Tx)={}, UDP Tx={}/Rx={} datagrams, Cwnd={} B. Triggering reconnect...",
+                            reason, stats.path.rtt, stats.path.lost_packets, stats.udp_tx.datagrams, stats.udp_rx.datagrams, stats.path.cwnd
+                        );
+                        *reason_health.lock().unwrap() = format!("Underlying QUIC connection closed: {reason:?}");
+                        client_state(ClientState::Reconnecting, format!("Connection closed: {reason:?}"), None);
+                        monitor_reconnect.notify_one();
+                        break;
+                    }
+                }
+
+                // 1. Детектор выхода из глубокого сна ОС (Suspend-to-RAM / Android Doze Mode).
+                // В спящем режиме CLOCK_MONOTONIC (Instant) останавливается или таймер замораживается,
+                // поэтому wall_elapsed оказывается значительно больше интервала проверки (3 сек).
+                if wall_elapsed > mono_elapsed + Duration::from_secs(8)
+                    || wall_elapsed > Duration::from_secs(15)
+                {
+                    info!(
+                        "[Health] System wakeup / Doze pause detected (wall={:.1}s, mono={:.1}s). Probing tunnel liveness...",
+                        wall_elapsed.as_secs_f64(),
+                        mono_elapsed.as_secs_f64()
+                    );
+                    status("[Health] Wakeup from sleep detected, verifying tunnel...");
+
+                    let baseline_rx = rx_check.load(Ordering::Relaxed);
+                    if let (Some(c_ip), Some(gw_ip)) = (client_ip_opt, gateway_ip_opt) {
+                        for _ in 0..2 {
+                            probe_seq = probe_seq.wrapping_add(1);
+                            let now_us = health_start.elapsed().as_micros() as u64;
+                            let pkt = build_ipv4_icmp_echo_request(
+                                c_ip,
+                                gw_ip,
+                                PROBE_IDENTIFIER,
+                                probe_seq,
+                                now_us,
+                            );
+                            let _ = tx_probe_health.try_send(pkt);
+                        }
+                    }
+
+                    let mut alive = false;
+                    for _ in 0..16 {
+                        select! {
+                            _ = sleep(Duration::from_millis(250)) => {}
+                            _ = monitor_shutdown.notified() => return,
+                        }
+                        if rx_check.load(Ordering::Relaxed) > baseline_rx {
+                            alive = true;
+                            break;
+                        }
+                    }
+
+                    last_wall_clock = SystemTime::now();
+                    last_mono_instant = Instant::now();
+
+                    if !alive {
+                        warn!(
+                            "[Health] Tunnel unresponsive after system sleep/Doze wakeup (no RX within 4s). Triggering immediate reconnect..."
+                        );
+                        status("[Health] Tunnel dead after sleep. Reconnecting...");
+                        *reason_health.lock().unwrap() =
+                            "Tunnel unresponsive after system sleep/Doze wakeup".to_string();
+                        client_state(
+                            ClientState::Reconnecting,
+                            "Tunnel unresponsive after sleep; reconnecting".to_string(),
+                            None,
+                        );
+                        monitor_reconnect.notify_one();
+                        break;
+                    } else {
+                        info!("[Health] Tunnel confirmed alive after wakeup.");
+                        stalled_counter = 0;
+                        continue;
+                    }
+                }
+
+                // 2. Универсальный сторожевой таймер трафика для ВСЕХ транспортов (QUIC, SSH, VNC, AHTTP, DoH, ASTP-L, WRTC)
+                let now_us = health_start.elapsed().as_micros() as u64;
+                let last_rx_us = rx_check.load(Ordering::Relaxed);
+                let last_tx_us = tx_check.load(Ordering::Relaxed);
+                let elapsed_rx = Duration::from_micros(now_us.saturating_sub(last_rx_us));
+                let elapsed_tx = Duration::from_micros(now_us.saturating_sub(last_tx_us));
+
+                if is_initial_phase {
+                    if elapsed_rx > Duration::from_secs(12)
+                        && (elapsed_tx < Duration::from_secs(5) || has_probes)
+                    {
+                        warn!(
+                            "[Health] Connection established, but payload traffic is blocked (no RX for {:.1}s)!",
+                            elapsed_rx.as_secs_f64()
+                        );
+                        status("[Health] Payload traffic blocked (no response). Reconnecting...");
+                        *reason_health.lock().unwrap() =
+                            "Connection established, but payload traffic is blocked (0 RX in 12s)"
+                                .to_string();
+                        client_state(
+                            ClientState::Reconnecting,
+                            "Payload traffic blocked; reconnecting".to_string(),
+                            None,
+                        );
+                        monitor_reconnect.notify_one();
+                        break;
+                    }
+                    if last_rx_us > 0 || now_us >= 12_000_000 {
+                        is_initial_phase = false;
+                    }
+                } else {
+                    // Поскольку tx_probe отправляет ICMP Echo Request каждые 2 секунды (или идёт пользовательский TX),
+                    // отсутствие любого RX дольше 15 секунд означает отвал NAT/сессии ("чёрную дыру").
+                    if (elapsed_tx < Duration::from_secs(6) || has_probes)
+                        && elapsed_rx > Duration::from_secs(15)
+                    {
+                        stalled_counter += 1;
+                        if stalled_counter == 1 {
+                            if let (Some(c_ip), Some(gw_ip)) = (client_ip_opt, gateway_ip_opt) {
+                                probe_seq = probe_seq.wrapping_add(1);
+                                let pkt = build_ipv4_icmp_echo_request(
+                                    c_ip,
+                                    gw_ip,
+                                    PROBE_IDENTIFIER,
+                                    probe_seq,
+                                    now_us,
+                                );
+                                let _ = tx_probe_health.try_send(pkt);
+                            }
+                        }
+                        if stalled_counter >= 2 {
+                            warn!(
+                                "[Health] Dead connection detected: active TX/probes (last TX {:.1}s ago), but no RX for {:.1}s. Triggering reconnect...",
+                                elapsed_tx.as_secs_f64(),
+                                elapsed_rx.as_secs_f64()
+                            );
+                            status("[Health] Connection stalled (no response). Reconnecting...");
+                            *reason_health.lock().unwrap() = format!(
+                                "Dead connection: no RX for {:.1}s despite active TX/probes",
+                                elapsed_rx.as_secs_f64()
+                            );
+                            client_state(
+                                ClientState::Reconnecting,
+                                "Connection stalled; reconnecting".to_string(),
+                                None,
+                            );
+                            monitor_reconnect.notify_one();
+                            break;
+                        }
+                    } else {
+                        stalled_counter = 0;
+                    }
+                }
             }
+        });
+
+        let stats_shutdown = shutdown_notify.clone();
+        {
+            let provider: Arc<dyn StatsProvider> =
+                if let Some(ref conn) = result.connection {
+                    Arc::new(QuicStatsProvider::new(conn.clone()))
+                } else {
+                    Arc::new(StreamStatsProvider::new(
+                        total_rx_bytes.clone(),
+                        total_tx_bytes.clone(),
+                        total_rx_packets.clone(),
+                        total_tx_packets.clone(),
+                    ))
+                };
+
+            // Оборачиваем provider в PingStatsProvider с общим атомиком задержки.
+            // Для QUIC: если Quinn нативно возвращает RTT, он используется в первую очередь.
+            // Для всех остальных транспортов (SSH/VNC/AHTTP/WS/WRTC): честный сквозной RTT
+            // берется из внутритуннельного замера ICMP Echo Reply от ядра сервера.
+            let full_provider: Arc<dyn StatsProvider> =
+                PingStatsProvider::new_with_atomic(
+                    provider.clone(),
+                    last_rtt_us.clone(),
+                    last_reply_us.clone(),
+                    session_start,
+                );
+
+            let fast_handle =
+                start_fast_stats_monitor(full_provider.clone(), stats_shutdown.clone());
+            aux_aborts.push(fast_handle.abort_handle());
+
+            let slow_handle = if config_clone.stats.enabled {
+                let h = start_stats_monitor(
+                    full_provider,
+                    config_clone.stats.interval_minutes,
+                    stats_shutdown,
+                );
+                aux_aborts.push(h.abort_handle());
+                Some(h)
+            } else {
+                None
+            };
+
+            let joined = spawn(async move {
+                if let Some(slow) = slow_handle {
+                    let _ = tokio::join!(fast_handle, slow);
+                } else {
+                    let _ = fast_handle.await;
+                }
+            });
+            aux_aborts.push(joined.abort_handle());
+        };
+
+        let t1_abort = t1.abort_handle();
+        let t2_abort = t2.abort_handle();
+        let health_abort = health_task.abort_handle();
+        let main_task = spawn(async move {
+            let _ = tokio::join!(t1, t2);
+        });
+
+        let running_session = RunningSession {
+            endpoint: result.endpoint,
+            shutdown_notify: shutdown_notify.clone(),
+            reconnect_signal: reconnect_signal.clone(),
+            disconnect_reason: disconnect_reason.clone(),
+            main_task,
+            t1_abort,
+            t2_abort,
+            health_abort: health_abort.clone(),
+            aux_aborts,
+            dns_aborts,
+            iface_name: iface_name.clone(),
+            shutdown_hook: result.shutdown_hook,
+        };
+
+        if self.stop_requested.load(Ordering::SeqCst) {
+            info!("[Core] Connection cancelled before storing session.");
+            status("[Core] Connection cancelled before storing session.");
+            self.cleanup_running_session(running_session).await;
+            return Ok(());
         }
 
+        {
+            let mut state = self.session.lock().unwrap();
+            *state = Some(running_session);
+        }
 
-        // 5. Сохраняем сессию
-        let mut state = self.session.lock().unwrap();
-        *state = Some(RunningSession {
-            endpoint: result.endpoint,
-            shutdown_notify,
-            main_task,
-            iface_name: iface_name.clone(),
+        let billing_str =
+            match ProtoBillingType::try_from(result.auth_response.billing_type).unwrap() {
+                ProtoBillingType::NoTariffNoGroup => "Без тарифа и группы",
+                ProtoBillingType::Group => "Группа",
+                ProtoBillingType::Individual => "Индивидуальный тариф",
+                ProtoBillingType::GroupAndIndividual => "Группа + индивидуальный тариф",
+                _ => "Не указан",
+            };
+
+        let group_str = result.auth_response.group_name.as_deref().unwrap_or("—");
+
+        let consumed_str = result
+            .auth_response
+            .traffic_consumed
+            .map(|c| format_bytes(c.max(0) as u64))
+            .unwrap_or_else(|| "0 B".to_string());
+
+        let limit_str = result
+            .auth_response
+            .traffic_limit
+            .map(|l| format_bytes(l.max(0) as u64))
+            .unwrap_or_else(|| "Безлимит".to_string());
+
+        let speed_str = match result.auth_response.speed_limit_kbps {
+            Some(kbps) if kbps > 0 => {
+                if kbps >= 1024 {
+                    format!("{:.2} Мбит/с", kbps as f64 / 1024.0)
+                } else {
+                    format!("{} Кбит/с", kbps)
+                }
+            }
+            _ => "Безлимит".to_string(),
+        };
+
+        let expires_str = result
+            .auth_response
+            .expires_at
+            .as_deref()
+            .unwrap_or("Бессрочно");
+
+        let sessions_str = if result.auth_response.allowed_sessions > 0 {
+            format!(
+                "{} / {}",
+                result.auth_response.active_sessions, result.auth_response.allowed_sessions
+            )
+        } else {
+            format!("{} / Безлимит", result.auth_response.active_sessions)
+        };
+
+        let format_tariff_row = |label: &str, val: &str| -> String {
+            let left_part = format!("  {:<18}", label);
+            let prefix_len = left_part.chars().count();
+            let total_content_width: usize = 71;
+            let val_space = total_content_width.saturating_sub(prefix_len);
+            let val_chars = val.chars().count();
+            if val_chars > val_space {
+                let truncated: String = val.chars().take(val_space.saturating_sub(3)).collect();
+                format!("             ║{}{:<width$}║", left_part, format!("{}...", truncated), width = val_space)
+            } else {
+                let pad = val_space - val_chars;
+                format!("             ║{}{}{}║", left_part, val, " ".repeat(pad))
+            }
+        };
+
+        info!(
+            "\n            ╔═══════════════════════════════════════════════════════════════════════╗\n             ║                         ACCOUNT & TARIFF INFO                         ║\n             ╠═══════════════════════════════════════════════════════════════════════╣\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n             ╚═══════════════════════════════════════════════════════════════════════╝",
+            format_tariff_row("Тарификация:", billing_str),
+            format_tariff_row("Группа:", group_str),
+            format_tariff_row("Сессии:", &sessions_str),
+            format_tariff_row("Скорость:", &speed_str),
+            format_tariff_row("Трафик за период:", &consumed_str),
+            format_tariff_row("Лимит трафика:", &limit_str),
+            format_tariff_row("Действует до:", expires_str),
+        );
+
+        status(format!(
+            "Тариф: {} | Группа: {} | Трафик: {} / {}",
+            billing_str, group_str, consumed_str, limit_str
+        ));
+
+        account_info(AccountInfo {
+            billing_str: billing_str.to_string(),
+            group_str: group_str.to_string(),
+            sessions_str: sessions_str.clone(),
+            speed_str: speed_str.clone(),
+            consumed_str: consumed_str.clone(),
+            limit_str: limit_str.clone(),
+            expires_str: expires_str.to_string(),
+            active_sessions: result.auth_response.active_sessions,
+            allowed_sessions: result.auth_response.allowed_sessions,
+            speed_limit_kbps: result.auth_response.speed_limit_kbps.map(|k| k as u64),
+            traffic_consumed_bytes: result.auth_response.traffic_consumed.map(|c| c.max(0) as u64),
+            traffic_limit_bytes: result.auth_response.traffic_limit.map(|l| l.max(0) as u64),
+            expires_at: result.auth_response.expires_at.clone(),
         });
+
+        let active_node_name = match result.effective_mode.as_deref() {
+            Some(mode) => format!("{} ({})", server.get_name(), mode),
+            None => server.get_name(),
+        };
+
+        info!(
+            "[Core] VPN interface configured. Tunnel UP. Active node: {}",
+            active_node_name
+        );
+        status(format!(
+            "[Core] VPN interface configured. Tunnel UP. Active node: {}",
+            active_node_name
+        ));
+        status(format!("Connected. Local IP: {}", result.auth_response.ip));
+        status("VPN Tunnel UP");
+        client_state(
+            ClientState::Connected,
+            format!("Connected. Local IP: {}", result.auth_response.ip),
+            Some(active_node_name.clone()),
+        );
+        ConnectivityMonitor::set_vpn_connected(true);
+
+        if !self.stop_requested.load(Ordering::SeqCst) {
+            select! {
+                _ = reconnect_signal.notified() => {}
+                _ = self.cancel_signal.notified() => {}
+            }
+        }
+        ConnectivityMonitor::set_vpn_connected(false);
+
+        let duration = session_start.elapsed();
+        let now_us = duration.as_micros() as u64;
+        let last_rx = Duration::from_micros(now_us.saturating_sub(last_rx_time.load(Ordering::Relaxed)));
+        let last_tx = Duration::from_micros(now_us.saturating_sub(last_tx_time.load(Ordering::Relaxed)));
+        let rx_b = total_rx_bytes.load(Ordering::Relaxed);
+        let rx_p = total_rx_packets.load(Ordering::Relaxed);
+        let tx_b = total_tx_bytes.load(Ordering::Relaxed);
+        let tx_p = total_tx_packets.load(Ordering::Relaxed);
+        let final_reason = disconnect_reason.lock().unwrap().clone();
+
+        warn!(
+            "[Core] ==================== SESSION DISCONNECT REPORT ====================\n\
+             [Core] Active Server: '{}' ({})\n\
+             [Core] Assigned IP: {}\n\
+             [Core] Session Duration: {:.1}s ({:.2} min)\n\
+             [Core] Disconnect Trigger: {}\n\
+             [Core] Traffic Statistics:\n\
+             [Core]   -> Tx (Uploaded):   {} in {} packets (last packet sent {:.3}s ago)\n\
+             [Core]   <- Rx (Downloaded): {} in {} packets (last packet received {:.3}s ago)\n\
+             [Core] ===================================================================",
+            active_node_name,
+            server.endpoint().unwrap_or_default(),
+            result.auth_response.ip,
+            duration.as_secs_f64(),
+            duration.as_secs_f64() / 60.0,
+            final_reason,
+            format_bytes(tx_b),
+            tx_p,
+            last_tx.as_secs_f64(),
+            format_bytes(rx_b),
+            rx_p,
+            last_rx.as_secs_f64(),
+        );
+
+        info!("[Core] Cleaning up dead session...");
+        status("[Core] Cleaning up dead session...");
+        shutdown_notify.notify_waiters();
+        health_abort.abort();
+
+        let session_to_clean = {
+            let mut state = self.session.lock().unwrap();
+            state.take()
+        };
+        if let Some(sess) = session_to_clean {
+            self.cleanup_running_session(sess).await;
+        }
 
         Ok(())
     }
 
-    /// Остановка VPN
-    pub async fn stop(&self) -> anyhow::Result<()> {
+    async fn cleanup_running_session(&self, mut running: RunningSession) {
+        running.shutdown_notify.notify_waiters();
+        running.health_abort.abort();
+        for h in running.aux_aborts.drain(..) {
+            h.abort();
+        }
+        {
+            let mut dns_guard = running.dns_aborts.lock().unwrap();
+            for h in dns_guard.drain(..) {
+                h.abort();
+            }
+        }
+
+        if let Some(hook) = running.shutdown_hook.take() {
+            let _ = timeout(Duration::from_millis(450), hook).await;
+        }
+
+        if let Some(ref endpoint) = running.endpoint {
+            endpoint.close(0u32.into(), b"session closed");
+        }
+
+        if timeout(Duration::from_millis(150), &mut running.main_task)
+            .await
+            .is_err()
+        {
+            warn!("[Core] Main task did not finish in 150ms, aborting tunnel workers...");
+            running.t1_abort.abort();
+            running.t2_abort.abort();
+            let _ = timeout(Duration::from_millis(100), &mut running.main_task).await;
+        }
+
+        let _ = self.dns_manager.restore_dns(&running.iface_name);
+        let _ = self.route_manager.restore_routes().await;
+    }
+
+    pub fn trigger_reconnect(&self) {
+        if self.stop_requested.load(Ordering::SeqCst) {
+            return;
+        }
+        let state = self.session.lock().unwrap();
+        if let Some(ref running) = *state {
+            info!("[Core] Reconnect requested externally (network switch or watchdog).");
+            *running.disconnect_reason.lock().unwrap() = "External reconnect request (network switch or watchdog)".to_string();
+            running.shutdown_notify.notify_waiters();
+            running.reconnect_signal.notify_one();
+        }
+    }
+
+    pub async fn stop(&self) -> Result<()> {
+        self.stop_requested.store(true, Ordering::SeqCst);
+        self.cancel_signal.notify_waiters();
+
         let session = {
             let mut state = self.session.lock().unwrap();
             state.take()
@@ -329,31 +1827,221 @@ impl AnetClient {
 
         if let Some(running) = session {
             info!("[Core] Stopping VPN...");
-
-            // 1. Говорим задачам остановиться
+            status("[Core] Stopping VPN...");
+            client_state(ClientState::Stopping, "Stopping VPN", None);
+            *running.disconnect_reason.lock().unwrap() = "User requested stop".to_string();
             running.shutdown_notify.notify_waiters();
+            running.reconnect_signal.notify_one();
 
-            // 2. Ждем пока байты перестанут летать
-            let _ = running.main_task.await;
-
-            // 3. Если есть QUIC Endpoint - закрываем
-            if let Some(endpoint) = running.endpoint {
-                endpoint.close(0u32.into(), b"Disconnected by user");
-            }
-
-            // 4. Restore DNS
-            if let Err(e) = self.dns_manager.restore_dns(&running.iface_name) {
-                error!("Failed to restore DNS: {}", e);
-            }
-
-            // 5. Restore routes
-            if let Err(e) = self.route_manager.restore_routes().await {
-                error!("Failed to restore routes: {}", e);
-            }
-
-            info!("[Core] VPN Stopped.");
+            self.cleanup_running_session(running).await;
+        } else if self.is_active.load(Ordering::SeqCst) {
+            info!("[Core] Stopping VPN (cancelling active connection attempt)...");
+            status("[Core] Stopping VPN...");
+            client_state(ClientState::Stopping, "Stopping VPN", None);
+            let _ = self.route_manager.restore_routes().await;
+        } else {
+            info!("[Core] VPN Stopped (no active session).");
         }
+
+        let wait_start = Instant::now();
+        while self.is_active.load(Ordering::SeqCst)
+            && wait_start.elapsed() < Duration::from_millis(800)
+        {
+            select! {
+                _ = self.active_finished_notify.notified() => {}
+                _ = sleep(Duration::from_millis(25)) => {}
+            }
+        }
+
+        info!("[Core] VPN Stopped.");
+        status("[Core] VPN Stopped.");
+        ConnectivityMonitor::set_vpn_connected(false);
+        client_state(ClientState::Stopped, "VPN stopped", None);
         Ok(())
     }
-
 }
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    let b = bytes as f64;
+    if b < KIB {
+        format!("{} B", bytes)
+    } else if b < MIB {
+        format!("{:.2} KiB", b / KIB)
+    } else if b < GIB {
+        format!("{:.2} MiB", b / MIB)
+    } else {
+        format!("{:.2} GiB", b / GIB)
+    }
+}
+
+fn should_abort_on_auth_deny(err: &AnyhowError, server_count: usize) -> Option<&AuthDenyError> {
+    let auth_err = err.downcast_ref::<AuthDenyError>()?;
+    if !auth_err.is_node_transient() || server_count <= 1 {
+        Some(auth_err)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anet_common::consts::NONCE_LEN;
+    use anet_common::crypto_utils;
+    use anet_common::protocol::{
+        AuthDenyNotification, Message as AnetMessage, message::Content,
+    };
+    use async_trait::async_trait;
+    use base64::prelude::*;
+    use ed25519_dalek::SigningKey;
+    use prost::Message;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::net::UdpSocket;
+    use tokio::sync::mpsc;
+
+    struct DummyRouteManager;
+
+    #[async_trait]
+    impl RouteManager for DummyRouteManager {
+        async fn backup_routes(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn add_bypass_route(&self, _target: IpAddr, _prefix: u8) -> Result<()> {
+            Ok(())
+        }
+        async fn set_default_route(&self, _gateway: &str, _interface_name: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn add_specific_route(
+            &self,
+            _target: IpAddr,
+            _prefix: u8,
+            _gateway: &str,
+            _interface_name: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn restore_routes(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct DummyTunFactory;
+
+    #[async_trait]
+    impl TunFactory for DummyTunFactory {
+        async fn create_tun(
+            &self,
+            _auth: &AuthResponse,
+        ) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, String)> {
+            let (tx, rx) = mpsc::channel(8);
+            Ok((tx, rx, "tun0".to_string()))
+        }
+    }
+
+    #[test]
+    fn test_should_abort_on_auth_deny_account_errors() {
+        let limit_err: AnyhowError =
+            AuthDenyError::new("Достигнут лимит одновременных подключений").into();
+        assert!(should_abort_on_auth_deny(&limit_err, 1).is_some());
+        assert!(should_abort_on_auth_deny(&limit_err, 5).is_some());
+
+        let banned_err: AnyhowError =
+            AuthDenyError::new("Учетная запись заблокирована").into();
+        assert!(should_abort_on_auth_deny(&banned_err, 3).is_some());
+    }
+
+    #[test]
+    fn test_should_abort_on_auth_deny_node_transient_errors() {
+        let drain_err: AnyhowError =
+            AuthDenyError::new("Node is not accepting new connections").into();
+        // Если нода всего одна — останавливаемся, чтобы не крутиться в бесконечном цикле
+        assert!(should_abort_on_auth_deny(&drain_err, 1).is_some());
+        // Если нод несколько — разрешаем failover на следующую ноду
+        assert!(should_abort_on_auth_deny(&drain_err, 2).is_none());
+
+        let auth_down_err: AnyhowError =
+            AuthDenyError::new("Все сервера авторизации недоступны").into();
+        assert!(should_abort_on_auth_deny(&auth_down_err, 1).is_some());
+        assert!(should_abort_on_auth_deny(&auth_down_err, 3).is_none());
+    }
+
+    #[test]
+    fn test_should_abort_on_auth_deny_ignores_network_errors() {
+        let net_err = anyhow::anyhow!("Connection handshake timed out");
+        assert!(should_abort_on_auth_deny(&net_err, 1).is_none());
+        assert!(should_abort_on_auth_deny(&net_err, 3).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_client_start_exits_loop_immediately_on_auth_error() {
+        let client_signing = SigningKey::from_bytes(&[33u8; 32]);
+        let server_signing = SigningKey::from_bytes(&[44u8; 32]);
+        let server_pub_bytes = server_signing.verifying_key().to_bytes().to_vec();
+
+        // Поднимаем локальный UDP-сокет, имитирующий QUIC-сервер, который отвечает AuthError
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let packets_received = Arc::new(AtomicUsize::new(0));
+        let packets_received_clone = packets_received.clone();
+        let server_pub_clone = server_pub_bytes.clone();
+
+        let server_task = spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            if let Ok((_len, peer_addr)) = server_sock.recv_from(&mut buf).await {
+                packets_received_clone.fetch_add(1, Ordering::SeqCst);
+                let deny_msg = AnetMessage {
+                    content: Some(Content::AuthError(AuthDenyNotification {
+                        message: "Достигнут лимит одновременных подключений".to_string(),
+                    })),
+                    padding: vec![],
+                };
+                let mut raw = Vec::new();
+                deny_msg.encode(&mut raw).unwrap();
+                let cipher = crypto_utils::create_handshake_cipher(&server_pub_clone);
+                let nonce = [9u8; NONCE_LEN];
+                let ct = cipher.encrypt(&nonce, Bytes::from(raw)).unwrap();
+                let mut pkt = BytesMut::with_capacity(NONCE_LEN + ct.len());
+                pkt.extend_from_slice(&nonce);
+                pkt.extend_from_slice(&ct);
+                let _ = server_sock.send_to(&pkt, peer_addr).await;
+            }
+        });
+
+        let mut cfg = CoreConfig::default();
+        cfg.keys.private_key = BASE64_STANDARD.encode(client_signing.to_bytes());
+        cfg.keys.server_pub_key = BASE64_STANDARD.encode(&server_pub_bytes);
+        cfg.servers = vec![
+            ServerConfig {
+                dsn: format!("quic://{}?name=Node1&timeout=5", server_addr),
+                ..Default::default()
+            },
+            ServerConfig {
+                dsn: format!("quic://{}?name=Node2&timeout=5", server_addr),
+                ..Default::default()
+            },
+        ];
+
+        let client = AnetClient::new(
+            cfg,
+            Box::new(DummyTunFactory),
+            Box::new(DummyRouteManager),
+        );
+
+        // Запускаем start() с жестким таймаутом 1.5с (если бы сработал sleep(2s) реконнекта или ретраи — тест бы упал по таймауту)
+        let res = timeout(Duration::from_millis(1500), client.start())
+            .await
+            .expect("client.start() must not enter reconnect sleep on fatal AuthError");
+        assert!(res.is_ok());
+        assert!(!client.is_running());
+        assert_eq!(packets_received.load(Ordering::SeqCst), 1);
+
+        let _ = server_task.await;
+    }
+}
+
+

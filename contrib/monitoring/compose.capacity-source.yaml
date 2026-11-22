@@ -1,0 +1,8 @@
+services:
+  blackbox:
+    volumes:
+      - type: bind
+        source: ${CAPACITY_CLIENT_TLS_DIR:?set capacity client TLS directory}
+        target: /etc/anet/capacity-tls
+        read_only: true
+        bind: {create_host_path: false}

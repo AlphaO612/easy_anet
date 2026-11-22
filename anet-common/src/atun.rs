@@ -1,10 +1,10 @@
 use crate::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use crate::tun_params::TunParams;
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use log::{error, info, warn};
 #[cfg(target_os = "macos")]
-use log::warn;
-use log::{error, info};
+use std::process::Stdio;
 #[cfg(target_os = "macos")]
 use tokio::process::Command;
 
@@ -33,18 +33,16 @@ impl TunChannels {
     }
 }
 
-/// Result of TUN device creation
+/// Результат успешного создания TUN устройства
 pub struct TunCreationResult {
     pub tx: mpsc::Sender<Bytes>,
     pub rx: mpsc::Receiver<Bytes>,
-    /// The actual interface name (may differ from requested on macOS)
     pub interface_name: String,
 }
 
 pub struct TunManager {
     params: TunParams,
     tun_index: Option<u32>,
-    /// The actual interface name after creation
     actual_name: Option<String>,
 }
 
@@ -75,12 +73,10 @@ impl TunManager {
         self.tun_index.unwrap()
     }
 
-    /// Get the actual interface name after creation
     pub fn get_actual_name(&self) -> Option<&str> {
         self.actual_name.as_deref()
     }
 
-    /// Run the TUN device and return channels + actual interface name
     pub async fn run_with_name(&mut self) -> Result<TunCreationResult> {
         let (tx, rx) = self.run().await?;
         let interface_name = self
@@ -104,21 +100,22 @@ impl TunManager {
             Err(e) => anyhow::bail!("Failed to create async TUN device: {}", e),
         };
 
-        // Get the TUN index
         self.tun_index = Some(device.tun_index()? as u32);
 
-        // Get the actual interface name (important for macOS where names are dynamic)
         let actual_name = device
             .tun_name()
             .unwrap_or_else(|_| self.params.name.clone());
 
         self.actual_name = Some(actual_name.clone());
 
-        // On macOS, we may need to configure the interface manually
         #[cfg(target_os = "macos")]
         self.configure_macos_interface(&actual_name).await?;
 
-        let (mut reader, mut writer) = tokio::io::split(device);
+        // Нативный split устройства: reader и writer получают независимые
+        // регистрации AsyncFd. Раньше здесь был tokio::io::split(), который
+        // оборачивает устройство в BiLock — чтение и запись конкурировали
+        // за один лок на каждом пакете (а VPN-трафик всегда двунаправленный).
+        let (mut writer, mut reader) = device.split()?;
 
         info!(
             "Created TUN with: [{}] (actual name: {})",
@@ -126,36 +123,80 @@ impl TunManager {
             actual_name
         );
 
-        // Task for reading from TUN
+        // Задача чтения из TUN устройства (TUN -> NETWORK)
+        let tx_clone = tx_from_tun.clone();
         tokio::spawn(async move {
-            let mut buffer = [0u8; MAX_PACKET_SIZE];
+            // Читаем в переиспользуемый BytesMut: одно выделение памяти
+            // амортизируется на ~64 пакета, а split().freeze() отдает пакет
+            // без дополнительного memcpy (раньше было: ядро -> стек-буфер,
+            // затем стек -> Bytes::copy_from_slice, т.е. лишняя копия на пакет).
+            const READ_CHUNK: usize = 64 * MAX_PACKET_SIZE;
+            let mut buf = BytesMut::with_capacity(READ_CHUNK);
             loop {
-                match reader.read(&mut buffer).await {
-                    Ok(0) => {
-                        info!("TUN reader stream ended.");
-                        break;
-                    }
-                    Ok(n) => {
-                        let packet = Bytes::copy_from_slice(&buffer[..n]);
-                        if let Err(e) = tx_from_tun.send(packet).await {
-                            error!("Failed send to channel, error: {}", e);
-                            break;
+                // Гарантируем, что в буфере всегда есть место под целый пакет,
+                // иначе read() на TUN обрежет пакет.
+                if buf.capacity() < MAX_PACKET_SIZE {
+                    buf = BytesMut::with_capacity(READ_CHUNK);
+                }
+                tokio::select! {
+                    // Читаем входящие пакеты от операционной системы
+                    res = reader.read_buf(&mut buf) => {
+                        match res {
+                            Ok(0) => {
+                                info!("TUN reader stream ended.");
+                                break;
+                            }
+                            Ok(_) => {
+                                let packet = buf.split().freeze();
+                                if tx_clone.send(packet).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to read from TUN: {}", e);
+                                break;
+                            }
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to read from TUN: {}", e);
+                    // ВАЖНО: Мониторим закрытие канала на стороне клиента.
+                    // Как только клиент дропнет приемник, этот фьючерс мгновенно разрешится,
+                    // прервав висящий вызов read и освободив файловый дескриптор устройства.
+                    _ = tx_clone.closed() => {
+                        info!("TUN reader channel closed, stopping read task.");
                         break;
                     }
                 }
             }
         });
 
-        // Task for writing to TUN
+        // Задача записи в TUN устройство (NETWORK -> TUN)
         tokio::spawn(async move {
-            while let Some(packet) = rx_to_tun.recv().await {
-                if let Err(e) = writer.write_all(&packet).await {
-                    error!("Failed to write to TUN: {}, bytes: {:?}", e, packet);
-                    break;
+            'outer: while let Some(mut packet) = rx_to_tun.recv().await {
+                // Пишем бурст целиком: после первого пакета выгребаем всё,
+                // что уже накопилось в канале, через try_recv(), не отдавая
+                // управление планировщику между пакетами одного бурста.
+                // (Каждый write в TUN обязан оставаться отдельным вызовом —
+                // это один пакет на write() без IFF_VNET_HDR.)
+                loop {
+                    if let Err(e) = writer.write_all(&packet).await {
+                        let raw_os = e.raw_os_error();
+                        // Выходим из цикла только при закрытии дескриптора устройства (EBADF=9, ENXIO=6, ENODEV=19, EIO=5).
+                        // Ошибки отдельного пакета (EMSGSIZE=90, EINVAL=22, EAFNOSUPPORT=97, ENOBUFS=105) пропускаем,
+                        // чтобы один нестандартный пакет от клиента не убивал TUN-интерфейс сервера!
+                        if matches!(raw_os, Some(9 | 6 | 19 | 5)) {
+                            error!("Fatal TUN write error (device closed): {}", e);
+                            break 'outer;
+                        }
+                        warn!(
+                            "Skipped packet on TUN write (len={}): {}",
+                            packet.len(),
+                            e
+                        );
+                    }
+                    match rx_to_tun.try_recv() {
+                        Ok(next) => packet = next,
+                        Err(_) => break,
+                    }
                 }
             }
         });
@@ -163,16 +204,8 @@ impl TunManager {
         Ok((tx_to_tun, rx_from_tun))
     }
 
-    /// Configure the macOS utun interface using ifconfig
-    ///
-    /// The tun crate may not fully configure the interface on macOS,
-    /// so we use ifconfig to ensure proper configuration.
     #[cfg(target_os = "macos")]
     async fn configure_macos_interface(&self, interface_name: &str) -> Result<()> {
-        use std::process::Stdio;
-
-        // Configure IP address and peer (point-to-point)
-        // ifconfig utunX inet <local_ip> <peer_ip> netmask <mask>
         let output = Command::new("ifconfig")
             .args([
                 interface_name,
@@ -195,7 +228,6 @@ impl TunManager {
             );
         }
 
-        // Set MTU
         let output = Command::new("ifconfig")
             .args([interface_name, "mtu", &self.params.mtu.to_string()])
             .stdout(Stdio::piped())

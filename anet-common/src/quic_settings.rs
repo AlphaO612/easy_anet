@@ -1,11 +1,14 @@
 // Файл: anet-common/src/quic_settings.rs
 
+use crate::consts::{PADDING_MTU, TRANSPORT_ENVELOPE_OVERHEAD};
 use anyhow::Result;
 use log::info;
 use quinn::congestion::{BbrConfig, ControllerFactory, CubicConfig};
 use quinn::{IdleTimeout, MtuDiscoveryConfig, TransportConfig, VarInt};
 use serde::Deserialize;
+use socket2::SockRef;
 use std::{sync::Arc, time::Duration};
+use tokio::net::UdpSocket;
 
 const BYTES_IN_MEGABIT: u64 = 125_000;
 
@@ -33,6 +36,7 @@ pub struct QuicConfig {
 
     pub enable_gso: bool,
     pub idle_timeout_seconds: Option<u64>,
+    pub keep_alive_interval_seconds: Option<u64>,
 }
 
 impl Default for QuicConfig {
@@ -48,6 +52,7 @@ impl Default for QuicConfig {
             enable_gso: true,
             idle_timeout_seconds: Some(3600),
             max_mtu: 1500,
+            keep_alive_interval_seconds: Some(20),
         }
     }
 }
@@ -77,26 +82,15 @@ pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportCon
         .send_window
         .unwrap_or_else(|| calculate_window_from_bdp(cfg.bandwidth_up_mbps, cfg.expected_rtt_ms));
 
-    // Stream window is usually a fraction of the connection window.
-    let final_stream_receive_window = cfg.stream_receive_window.unwrap_or_else(|| {
-        (final_receive_window / 4).max(262_144) // 1/4 of conn window, min 256KB
-    });
+    // The VPN uses one long-lived bidirectional stream, so its flow-control window must not
+    // become the connection bottleneck.
+    let final_stream_receive_window = cfg.stream_receive_window.unwrap_or(final_receive_window);
 
     let factory: Arc<dyn ControllerFactory + Send + Sync> =
         match cfg.algorithm.to_lowercase().as_str() {
             "bbr" => {
                 info!("QUIC Transport using BBR Congestion Control.");
-                let mut bbr_config = BbrConfig::default();
-                // "Подсказываем" BBR начальное окно, чтобы он быстрее вышел на крейсерскую скорость.
-                // Это 2 * BDP, как рекомендуется в документации.
-                let initial_window =
-                    calculate_window_from_bdp(cfg.bandwidth_up_mbps, cfg.expected_rtt_ms) * 2;
-                bbr_config.initial_window(initial_window.try_into()?);
-                info!(
-                    "BBR configured with initial window of {} bytes.",
-                    initial_window
-                );
-                Arc::new(bbr_config)
+                Arc::new(BbrConfig::default())
             }
             _ => {
                 // "cubic" or default
@@ -107,7 +101,12 @@ pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportCon
 
     config.congestion_controller_factory(factory);
     config.initial_rtt(rtt_duration);
-    config.enable_segmentation_offload(cfg.enable_gso);
+    // The encrypted UDP adapter advertises one datagram per transmit. A GSO super-packet cannot
+    // be encrypted as one datagram without changing QUIC packet boundaries.
+    config.enable_segmentation_offload(false);
+    if cfg.enable_gso {
+        info!("QUIC GSO disabled: the encrypted UDP adapter requires per-datagram nonces.");
+    }
 
     // --- ПРИМЕНЯЕМ РАЗДЕЛЬНЫЕ ОКНА ---
     info!(
@@ -119,23 +118,58 @@ pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportCon
         .stream_receive_window(VarInt::from_u64(final_stream_receive_window)?)
         .send_window(final_send_window);
 
-    // Настройка MTU Discovery (без изменений)
+    // Настройка MTU Discovery
+    let envelope_limit = (PADDING_MTU - TRANSPORT_ENVELOPE_OVERHEAD) as u16;
+    let initial_mtu = mtu.min(envelope_limit).max(1200);
+    let max_mtu = cfg.max_mtu.min(envelope_limit).max(initial_mtu);
     let mut mtu_config = MtuDiscoveryConfig::default();
-    mtu_config.upper_bound(cfg.max_mtu);
+    mtu_config.upper_bound(max_mtu);
     config
-        .initial_mtu(mtu.into())
+        .initial_mtu(initial_mtu)
         .mtu_discovery_config(Some(mtu_config));
+    info!(
+        "QUIC MTU: initial {}, discovery ceiling {} ({} bytes reserved for encryption).",
+        initial_mtu, max_mtu, TRANSPORT_ENVELOPE_OVERHEAD
+    );
 
-    // Таймаут (без изменений)
-    if let Some(timeout_secs) = cfg.idle_timeout_seconds {
-        if timeout_secs > 0 {
-            let timeout = IdleTimeout::try_from(Duration::from_secs(timeout_secs))?;
-            config.max_idle_timeout(Some(timeout));
-            info!(
-                "QUIC Transport: Max Idle Timeout set to {} seconds.",
-                timeout_secs
-            );
-        }
+    // Таймаут
+    if let Some(timeout_secs) = cfg.idle_timeout_seconds
+        && timeout_secs > 0
+    {
+        let timeout = IdleTimeout::try_from(Duration::from_secs(timeout_secs))?;
+        config.max_idle_timeout(Some(timeout));
+        info!(
+            "QUIC Transport: Max Idle Timeout set to {} seconds.",
+            timeout_secs
+        );
     }
+
+    // Настройка Keep-Alive (Пингов) во избежание протухания NAT-таблиц провайдеров
+    if let Some(interval_secs) = cfg.keep_alive_interval_seconds
+        && interval_secs > 0
+    {
+        config.keep_alive_interval(Some(Duration::from_secs(interval_secs)));
+        info!(
+            "QUIC Transport: Keep-Alive Interval set to {} seconds.",
+            interval_secs
+        );
+    }
+
     Ok(config)
 }
+
+pub const QUIC_UDP_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+pub fn tune_udp_socket_buffers(sock: &UdpSocket, buffer_size: usize) {
+    let sock_ref = SockRef::from(sock);
+    let _ = sock_ref.set_recv_buffer_size(buffer_size);
+    let _ = sock_ref.set_send_buffer_size(buffer_size);
+    if let (Ok(rcv), Ok(snd)) = (sock_ref.recv_buffer_size(), sock_ref.send_buffer_size()) {
+        info!(
+            "[QUIC UDP] Tuned UDP socket buffers: SO_RCVBUF={} KiB, SO_SNDBUF={} KiB",
+            rcv / 1024,
+            snd / 1024
+        );
+    }
+}
+

@@ -7,6 +7,9 @@ license = "MIT"
 [dependencies]
 eframe = "0.33.3"
 egui = "0.33.3"
+egui_extras = { version = "0.33.3", features = ["svg"] }
+sysinfo = "0.30"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 tokio = { workspace = true }
 anyhow = { workspace = true }
@@ -20,23 +23,27 @@ async-trait = "0.1.89"
 serde_json = "1.0.147"
 image = { version = "0.25.9", features = ["ico", "png"] }
 
+
 anet-client-core = { path = "../anet-client-core" }
 anet-common = { path = "../anet-common" }
-rfd = "0.17.2"
 
-notify-rust = "4.11.3"
-tray-icon = "0.21.3"
+rfd = "0.17.2"
+notify-rust = "4.12.0"
+tray-icon = "0.23.1"
 
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
+libc = "0.2.175"
 # Windows-specific dependencies
 [target.'cfg(windows)'.dependencies]
-wintun = "0.5.1"
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+windows-sys = {  workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
 
 # Platform-specific dependencies for route management
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 net-route = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
 
 # netdev is needed on all desktop platforms for interface discovery
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
@@ -49,6 +56,8 @@ libc = "0.2"
 [features]
 default = []
 console = []
+# Включить per-app split tunneling (Windows + WinDivert SDK при сборке).
+per-app = ["anet-client-core/per-app"]
 
 [package.metadata.winres]
 Manifest = "app.manifest"
@@ -61,3 +70,4 @@ winres = "0.1"
 [[bin]]
 name = "anet-gui"
 path = "src/main.rs"
+

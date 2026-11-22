@@ -1,13 +1,337 @@
+use std::time::Duration;
+
 // Все константы обсалютно научны, и соответствуют числу тараканов на лолу и кол-ву бычков в пепельнице.
 // Не научные - числу мух на потолке.
 
 pub const MAX_PACKET_SIZE: usize = 2048;
-pub const CHANNEL_BUFFER_SIZE: usize = 1024;
+// Увеличено с 1024 до 4096 для сглаживания сетевого джиттера
+pub const CHANNEL_BUFFER_SIZE: usize = 4096;
 pub const NONCE_PREFIX_LEN: usize = 4;
 pub const NONCE_LEN: usize = 12;
+/// Начальное значение 64-битного счётчика пакетов (`sequence`) на стороне сервера (бит 63 = 0).
+pub const SERVER_SEQUENCE_START: u64 = 0;
+/// Начальное значение 64-битного счётчика пакетов (`sequence`) на стороне клиента (бит 63 = 1).
+/// Разводит полупространства 12-байтовых AEAD-нонсов `[nonce_prefix (4B)][sequence (8B)]`
+/// между потоками Client -> Server (`>= 2^63`) и Server -> Client (`< 2^63`) при общем
+/// сессионном ключе `shared_key` и `nonce_prefix`, полностью исключая коллизию `(Key, Nonce)`.
+pub const CLIENT_SEQUENCE_START: u64 = 1u64 << 63;
 pub const PADDING_MTU: usize = 1450;
+/// Nonce (12) + Poly1305 tag (16) + sequence (8) + payload length (2).
+pub const TRANSPORT_ENVELOPE_OVERHEAD: usize = 38;
 pub const PROTO_PAD_FIELD_OVERHEAD: usize = 3;
 
 // Минимальный размер пакета рукопожатия для фильтрации мусора на сервере
 // Nonce (12) + Tag (16) + Min Protobuf (~50)
 pub const MIN_HANDSHAKE_LEN: usize = 78;
+
+/// Бюджет коалесценции для группировки мелких IP-пакетов перед записью в сокет.
+pub const COALESCE_BUDGET_BYTES: usize = 64 * 1024;
+
+/// Безопасный бюджет коалесценции для SSH/VNC (16 KB)
+/// Гарантирует, что размер пакета никогда не превысит стандартное окно SSH-канала (32 KB),
+/// предотвращая переполнение буферов и панику CryptoVec::resize.
+pub const CRYPTO_COALESCE_BUDGET_BYTES: usize = 16 * 1024;
+
+pub const MAX_UDP_PAYLOAD_SIZE: usize = 1450;
+
+// =========================================================================
+// Константы транспорта WebRTC (Ktalk / Jitsi JVB / VP8 Media Video)
+// =========================================================================
+
+/// Валидный заголовок ключевого кадра VP8 с разрешением 1920x1080 (FullHD, 20 байт).
+/// Позволяет мосту JVB / SFU валидировать битовый поток VP8 без занижения целевого битрейта
+/// в BitrateController и гарантирует независимую доставку каждого RTP-пакета без каскадных
+/// дропов в Vp8AdaptiveTrackProjectionContext при одиночных потерях UDP.
+pub const VP8_KEYFRAME_1080P_HEADER: [u8; 20] = [
+    0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x07,
+    0x38, 0x04, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
+    0x99, 0x84, 0x88, 0xfc,
+];
+
+/// Валидный заголовок межкадра VP8 (Interframe, бит `P=1`, `0x31`) с теми же параметрами 1920x1080.
+/// Чередуется с ключевыми кадрами (`VP8_KEYFRAME_1080P_HEADER`), чтобы SFU JVB не сбрасывал
+/// `Vp8FrameMap` и не пересоздавал контекст проекции потока на каждом пакете.
+pub const VP8_INTERFRAME_HEADER: [u8; 20] = [
+    0x31, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x07,
+    0x38, 0x04, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
+    0x99, 0x84, 0x88, 0xfc,
+];
+
+/// Общая 10-байтная сигнатура хвоста заголовка ANet VP8 (байты 10..20).
+pub const VP8_HEADER_TAIL_MAGIC: [u8; 10] = [
+    0x00, 0x47, 0x08, 0x85, 0x85, 0x88, 0x99, 0x84, 0x88, 0xfc,
+];
+
+/// Маркер микро-батча нескольких IP-пакетов внутри одного VP8 RTP кадра.
+/// Любой валидный IPv4 (0x4x) или IPv6 (0x6x) пакет гарантированно не начинается с 0x00.
+pub const VIDEO_BATCH_MARKER: u8 = 0x00;
+
+/// Верхний предел размера полезной нагрузки микро-батча для одного VP8 RTP пакета (в байтах).
+/// При оверхеде 110 байт даёт не более 1370 байт на физическом UDP-сокете (безопасно для PMTU 1400).
+pub const MAX_VIDEO_BATCH_BYTES: usize = 1260;
+
+/// Дефолтный полный сетевой оверхед инкапсуляции WebRTC Video (в байтах):
+/// 20B (IPv4) + 8B (UDP) + 16B (SRTP) + 12B (RTP) + 4B (VP8 Desc) + 20B (VP8 Hdr) + 2B (Tag) + 28B (ASTP) = 110 байт.
+pub const WRTC_VIDEO_MTU_OVERHEAD: u16 = 110;
+
+/// Минимально допустимый MTU TUN-интерфейса после вычета заголовков WebRTC Video.
+pub const WRTC_MIN_TUN_MTU: i32 = 900;
+
+/// Размер префикса VP8 + Client Tag перед зашифрованным ASTP-кадром в RTP-пакете:
+/// 4B (VP8 Payload Descriptor) + 20B (VP8 Frame Header) + 2B (Client Tag) = 26 байт.
+pub const VP8_ASTP_PREFIX_LEN: usize = 4 + VP8_KEYFRAME_1080P_HEADER.len() + 2;
+
+/// Зарезервированный тег для широковещательных или нетегированных кадров.
+pub const TAG_UNTAGGED: u16 = 0x0000;
+
+/// Минимальная длина валидного тегированного ASTP-кадра внутри видеопотока:
+/// 2B (Client Tag) + 12B (Nonce) + 20B (Min IPv4) + 16B (Poly1305 MAC) = 50 байт.
+pub const WRTC_MIN_ASTP_VIDEO_FRAME_LEN: usize = 50;
+
+/// Минимальный размер корректного IPv4-пакета (без опций).
+pub const WRTC_MIN_IP_PACKET_LEN: usize = 20;
+
+/// Параметры кодеков WebRTC (Opus / VP8).
+pub const WRTC_OPUS_PAYLOAD_TYPE: u8 = 111;
+pub const WRTC_OPUS_CLOCK_RATE: u32 = 48000;
+pub const WRTC_OPUS_CHANNELS: u16 = 2;
+pub const WRTC_OPUS_SILENCE_FRAME: [u8; 3] = [0xf8, 0xff, 0xfe];
+
+pub const WRTC_VP8_PRIMARY_PAYLOAD_TYPE: u8 = 100;
+pub const WRTC_VP8_FALLBACK_PAYLOAD_TYPE: u8 = 96;
+pub const WRTC_VP8_CLOCK_RATE: u32 = 90000;
+pub const WRTC_DEFAULT_MAX_VIDEO_HEIGHT: u32 = 2160;
+
+/// Параметры генерации ключевых кадров VP8 для прохождения фильтрации JVB SFU.
+pub const WRTC_INITIAL_FORCE_KEYFRAMES: u32 = 8;
+pub const WRTC_REASSERT_FORCE_KEYFRAMES: u32 = 16;
+pub const WRTC_KEYFRAME_INTERVAL_MASK: u32 = 31;
+
+/// Мягкий EDT micro-pacer для сглаживания мгновенных микровсплесков TUN -> UDP:
+/// предотвращает переполнение буфера приёма клиента (`SO_RCVBUF`) и очереди `wgcf-profile`,
+/// сохраняя высокий потолок пропускной способности (~360–440 Мбит/с).
+pub const WRTC_UPLINK_PACING_NS_PER_BYTE: u64 = 22;
+pub const WRTC_DOWNLINK_PACING_NS_PER_BYTE: u64 = 18;
+pub const WRTC_PACING_HORIZON_NS: u64 = 3_000_000;
+
+/// Размеры внутренних очередей и буферов подсистемы WebRTC.
+pub const WRTC_COLIBRI_CHANNEL_CAPACITY: usize = 16384;
+pub const WRTC_VIDEO_CHANNEL_CAPACITY: usize = 32768;
+pub const WRTC_WS_FALLBACK_CHANNEL_CAPACITY: usize = 8192;
+pub const WRTC_P2P_CHANNEL_CAPACITY: usize = 4096;
+pub const WRTC_XMPP_CHANNEL_CAPACITY: usize = 128;
+pub const WRTC_XMPP_RAW_WS_CHANNEL_CAPACITY: usize = 32;
+pub const WRTC_DUPLEX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+/// Параметры микро-батчирования и коалесценции пакетов в WebRTC.
+pub const WRTC_BATCHER_MAX_BYTES: usize = 4096;
+pub const WRTC_BATCHER_MAX_DELAY_MS: u64 = 2;
+pub const WRTC_VIDEO_BATCH_MAX_PACKETS: usize = 16;
+pub const WRTC_UPLINK_BURST_MAX_PACKETS: usize = 64;
+
+/// Внутренние интервалы опроса ICE, ретраев DataChannel и фоновых задач.
+pub const WRTC_ICE_GATHER_POLL_ATTEMPTS: usize = 50;
+pub const WRTC_ICE_GATHER_POLL_INTERVAL_MS: u64 = 30;
+pub const WRTC_P2P_ICE_GATHER_POLL_ATTEMPTS: usize = 60;
+pub const WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS: u64 = 50;
+pub const WRTC_DC_SEND_MAX_RETRIES: usize = 3;
+pub const WRTC_DC_SEND_RETRY_DELAY_MS: u64 = 10;
+pub const WRTC_CONSTRAINTS_RETRY_ATTEMPTS: usize = 30;
+pub const WRTC_CONSTRAINTS_RETRY_INTERVAL_MS: u64 = 100;
+pub const WRTC_CLIENT_CONSTRAINTS_REASSERT_COUNT: usize = 10;
+pub const WRTC_CLIENT_CONSTRAINTS_REASSERT_INTERVAL_SECS: u64 = 2;
+pub const WRTC_WATCHDOG_TICK_SECS: u64 = 2;
+pub const WRTC_DISCOVER_BROADCAST_INTERVAL_SECS: u64 = 2;
+pub const WRTC_SERVER_RETRY_DELAY_SECS: u64 = 5;
+pub const WRTC_SERVER_RECONNECT_PAUSE_SECS: u64 = 2;
+pub const WRTC_HANDSHAKE_PROCESS_TIMEOUT_SECS: u64 = 10;
+pub const WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS: u64 = 5;
+
+/// Таймаут чтения входящих кадров из канала Colibri WebSocket до его фонового переподключения (в секундах).
+pub const WRTC_COLIBRI_WS_READ_TIMEOUT_SECS: u64 = 15;
+/// Таймаут ожидания входящего ответа/трафика по Colibri WebSocket после отправки активного зонда (Ping / ASTP).
+pub const WRTC_COLIBRI_WS_PROBE_TIMEOUT_SECS: u64 = 6;
+
+/// Параметры обхода L4 ECMP / LAG Hash Slicing (Fast TCP Ephemeral Port Hopping и Multi-Socket UDP ICE).
+pub const WRTC_TCP_PORT_HOP_ATTEMPTS: usize = 8;
+pub const WRTC_TCP_PORT_HOP_TIMEOUT_MS: u64 = 1000;
+pub const WRTC_UDP_ICE_SOCKET_COUNT: usize = 6;
+
+/// Специальный 16-байтный холостой кадр прогрева видеоканала (`media_video`),
+/// распознаваемый клиентом и сервером как внутритуннельный keepalive без декодирования IP-пакета.
+pub const VIDEO_WARMUP_MARKER_HI: u8 = 0xFF;
+pub const VIDEO_WARMUP_MARKER_LO: u8 = 0xFF;
+pub const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [
+    VIDEO_BATCH_MARKER,
+    VIDEO_WARMUP_MARKER_HI,
+    VIDEO_WARMUP_MARKER_LO,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+
+/// Подтверждающий 16-байтный кадр прогрева видеоканала от сервера к клиенту (`byte[3] == 1`),
+/// сигнализирующий, что сервер успешно принял и расшифровал входящий RTP Video поток от клиента.
+pub const VIDEO_WARMUP_ACK_PAYLOAD: [u8; 16] = [
+    VIDEO_BATCH_MARKER,
+    VIDEO_WARMUP_MARKER_HI,
+    VIDEO_WARMUP_MARKER_LO,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+
+/// Дефолтные резервные реквизиты JVB при отсутствии кандидатов в Jingle.
+pub const WRTC_DEFAULT_FALLBACK_JVB_IP: &str = "89.169.16.6";
+pub const WRTC_DEFAULT_FALLBACK_JVB_PORT: u16 = 10002;
+// =========================================================================
+// Константы протоколов SSH и VNC (ASTP туннелирование и защита от ТСПУ)
+// =========================================================================
+
+/// Таймаут ASTP-аутентификации для потоковых транспортов (SSH / VNC).
+/// Если клиент не завершает рукопожатие за это время, сессия сбрасывается.
+pub const ASTP_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Таймаут TCP-подключения к SSH-серверу.
+pub const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Таймаут RFB-рукопожатия для VNC-транспорта.
+pub const RFB_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Параметры генерации защитного чёрного кадра RFB Raw 32bpp (1024x768) при зондировании VNC.
+pub const VNC_RFB_BLACK_SCREEN_CHUNK_SIZE: usize = 64 * 1024;
+pub const VNC_RFB_BLACK_SCREEN_TOTAL_BYTES: usize = 1024 * 768 * 4;
+
+/// Таймаут сборки фрагментированного UDP-хендшейка QUIC и лимит параллельных задач авторизации.
+pub const QUIC_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(5);
+pub const QUIC_HANDSHAKE_CONCURRENCY_LIMIT: usize = 128;
+
+/// Размер окна входящего SSH-канала (4 MB) для обеспечения высокой пропускной способности.
+pub const SSH_CHANNEL_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
+
+/// Максимальный размер пакета SSH-канала (32 KB по стандарту RFC 4253).
+pub const SSH_MAX_PACKET_SIZE: u32 = 32 * 1024;
+
+/// Дефолтный идентификационный баннер SSHv2 (RFC 4253), маскирующий библиотеку `russh`
+/// под стандартный демон/клиент OpenSSH Ubuntu LTS для обхода сигнатурных правил ТСПУ.
+pub const DEFAULT_SSH_BANNER: &str = "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5";
+
+/// Нормализует пользовательскую строку SSH-баннера (гарантирует префикс `SSH-2.0-` и отсутствие `\r\n`).
+pub fn normalize_ssh_banner(custom: Option<&str>) -> String {
+    let raw = custom
+        .map(|s| s.trim_matches(|c: char| c == '\r' || c == '\n' || c.is_whitespace()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_SSH_BANNER);
+    if raw.starts_with("SSH-2.0-") {
+        raw.to_string()
+    } else {
+        format!("SSH-2.0-{raw}")
+    }
+}
+
+/// Максимальное количество пакетов в очереди джиттера до принудительного сброса.
+pub const MAX_PENDING_JITTER_PACKETS: usize = 256;
+
+// =========================================================================
+// Константы пула WebSocket-транспорта (WSS ?pool=N)
+// =========================================================================
+
+/// Магический заголовок кадра привязки вторичного сокета к существующей сессии WS (`MUX_BIND`).
+pub const WS_MUX_BIND_MAGIC: &[u8; 8] = b"ANETMUX1";
+/// Магический заголовок подтверждения привязки вторичного сокета (`MUX_ACK`).
+pub const WS_MUX_ACK_MAGIC: &[u8; 8] = b"ANETOK01";
+/// Количество параллельных WebSocket-соединений в пуле по умолчанию и потолок.
+pub const WS_DEFAULT_POOL_SIZE: usize = 4;
+pub const WS_MAX_POOL_SIZE: usize = 8;
+/// Бюджет коалесценции на один сокет при активном мульти-сокетном пуле (16 КБ позволяет
+/// распределять крупные пачки параллельно между всеми сокетами пула).
+pub const WS_POOL_COALESCE_BUDGET_BYTES: usize = 16 * 1024;
+/// Бюджет коалесценции при одном активном сокете (64 КБ).
+pub const WS_DEFAULT_SINGLE_COALESCE_BUDGET_BYTES: usize = COALESCE_BUDGET_BYTES;
+/// Параметры окна переупорядочивания входящих пакетов для пула WebSocket.
+pub const WS_REASSEMBLY_QUEUE_MAX_SIZE: usize = 2048;
+pub const WS_REASSEMBLY_GAP_TIMEOUT_MS: u64 = 60;
+/// Таймауты записи, закрытия и рукопожатия WebSocket.
+pub const WS_DEFAULT_WRITE_TIMEOUT_MS: u64 = 10_000;
+pub const WS_DEFAULT_CLOSE_TIMEOUT_MS: u64 = 2_000;
+pub const WS_DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 15;
+/// Интервалы keepalive Ping для сервера и клиента WebSocket.
+pub const WS_DEFAULT_SERVER_PING_MIN_SECS: u64 = 22;
+pub const WS_DEFAULT_SERVER_PING_MAX_SECS: u64 = 52;
+pub const WS_DEFAULT_CLIENT_PING_MIN_SECS: u64 = 25;
+pub const WS_DEFAULT_CLIENT_PING_MAX_SECS: u64 = 50;
+/// Размеры фреймов и буферов tokio-tungstenite WebSocket.
+pub const WS_DEFAULT_MAX_MESSAGE_SIZE: usize = 256 * 1024;
+pub const WS_DEFAULT_READ_BUFFER_SIZE: usize = 128 * 1024;
+pub const WS_DEFAULT_WRITE_BUFFER_SIZE: usize = 128 * 1024;
+pub const WS_DEFAULT_MAX_WRITE_BUFFER_SIZE: usize = 512 * 1024;
+/// Размеры клиентских очередей пакетов для WebSocket-транспорта.
+pub const WS_DEFAULT_TX_QUEUE_CAPACITY: usize = 512;
+pub const WS_DEFAULT_DOWNLINK_QUEUE_CAPACITY: usize = 1024;
+/// Лимиты и задержки ретраев `WS_MUX_BIND` до эскалации к полному ASTP-реконнекту.
+pub const WS_DEFAULT_BIND_MAX_RETRIES: u32 = 3;
+pub const WS_DEFAULT_BIND_REJECT_MAX_RETRIES: u32 = 2;
+pub const WS_DEFAULT_BIND_RETRY_MIN_MS: u64 = 500;
+pub const WS_DEFAULT_BIND_RETRY_MAX_MS: u64 = 1_500;
+/// Задержки между попытками `reconnect_astp_session` и окно resume-сессии на сервере.
+pub const WS_DEFAULT_RECONNECT_RETRY_MIN_MS: u64 = 350;
+pub const WS_DEFAULT_RECONNECT_RETRY_MAX_MS: u64 = 1_400;
+pub const WS_DEFAULT_RESUME_WINDOW_SECS: u64 = 45;
+
+// =========================================================================
+// Константы HTTP-транспорта (AHTTP / Cloudflare & CDN friendly)
+// =========================================================================
+
+pub const AHTTP_DEFAULT_HANDSHAKE_PATH: &str = "/handshake";
+pub const AHTTP_DEFAULT_AUTH_PATH: &str = "/auth";
+pub const AHTTP_DEFAULT_TRAFFIC_PATH: &str = "/traffic";
+pub const AHTTP_DEFAULT_SESSION_ID_HEADER: &str = "X-Session-Id";
+pub const AHTTP_DEFAULT_SESSION_ID_QUERY_PARAM: &str = "session_id";
+pub const AHTTP_DEFAULT_MAX_HEADER_BYTES: usize = 16 * 1024;
+pub const AHTTP_DEFAULT_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+pub const AHTTP_DEFAULT_READ_TIMEOUT_MS: u64 = 15_000;
+pub const AHTTP_DEFAULT_WRITE_TIMEOUT_MS: u64 = 15_000;
+pub const AHTTP_DEFAULT_IDLE_KEEPALIVE_TIMEOUT_SECS: u64 = 75;
+pub const AHTTP_DEFAULT_SESSION_GC_INTERVAL_SECS: u64 = 15;
+pub const AHTTP_DEFAULT_REASSEMBLY_QUEUE_MAX_SIZE: usize = 1024;
+pub const AHTTP_DEFAULT_REASSEMBLY_GAP_TIMEOUT_MS: u64 = 150;
+pub const AHTTP_DEFAULT_SERVER_COALESCE_BUDGET_BYTES: usize = 131_072;
+pub const AHTTP_DEFAULT_SERVER_POLL_TIMEOUT_MS: u64 = 25;
+pub const AHTTP_DEFAULT_SERVER_IDLE_POLL_TIMEOUT_MS: u64 = 1_500;
+pub const AHTTP_DEFAULT_SERVER_HEAVY_UPLINK_THRESHOLD_BYTES: usize = 8192;
+pub const AHTTP_DEFAULT_SERVER_COALESCE_MAX_WAIT_MS: u64 = 4;
+pub const AHTTP_DEFAULT_SERVER_COALESCE_GAP_TIMEOUT_US: u64 = 1_000;
+
+pub const AHTTP_DEFAULT_TX_QUEUE_CAPACITY: usize = 256;
+pub const AHTTP_DEFAULT_DOWNLINK_QUEUE_CAPACITY: usize = 512;
+pub const AHTTP_DEFAULT_MICRO_COALESCE_US: u64 = 500;
+pub const AHTTP_DEFAULT_MICRO_COALESCE_MIN_BYTES: usize = 256;
+pub const AHTTP_DEFAULT_MAX_IDLE_POLLS: usize = 1;
+pub const AHTTP_DEFAULT_IDLE_POLL_INTERVAL_MS: u64 = 25;
+pub const AHTTP_DEFAULT_IDLE_BACKOFF_MAX_MS: u64 = 500;
+pub const AHTTP_DEFAULT_MAX_RETRIES: u32 = 4;
+pub const AHTTP_DEFAULT_RETRY_BASE_MS: u64 = 100;
+pub const AHTTP_DEFAULT_RETRY_MAX_MS: u64 = 3_000;
+pub const AHTTP_DEFAULT_MAX_CONSECUTIVE_FAILURES: u32 = 6;
+pub const AHTTP_DEFAULT_RECONNECT_RETRY_MIN_MS: u64 = 350;
+pub const AHTTP_DEFAULT_RECONNECT_RETRY_MAX_MS: u64 = 1_500;

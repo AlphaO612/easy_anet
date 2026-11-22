@@ -1,87 +1,103 @@
 use crate::config::StealthConfig;
-use crate::stream_framing::frame_packet;
-use bytes::Bytes;
-use log::{error, info, warn};
+use crate::consts::{
+    COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES, MAX_PENDING_JITTER_PACKETS, PADDING_MTU,
+};
+use crate::encryption::Cipher;
+use crate::padding_utils::calculate_padding_needed;
+use crate::stream_framing::{FrameReader, frame_packet_into};
+use crate::transport::{unwrap_packet_bytes_in_place, wrap_packet};
+use anyhow::{Result, anyhow};
+use bytes::{Bytes, BytesMut};
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
+use log::{info, warn};
 use rand::Rng;
-use rand::rngs::OsRng;
-use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use crate::consts::CHANNEL_BUFFER_SIZE;
-use crate::encryption::Cipher;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use crate::padding_utils::calculate_padding_needed;
 
-
-
-/// Читает пакеты из канала `rx`, добавляет случайную задержку (parallel jitter),
-/// и пишет их в QUIC стрим `stream`.
-///
-/// * `rx`: Источник пакетов (например, из TUN).
-/// * `stream`: QUIC SendStream.
-/// * `min_jitter`: Минимальная задержка (ns).
-/// * `max_jitter`: Максимальная задержка (ns).
 pub async fn bridge_with_jitter<S>(
     mut rx: mpsc::Receiver<Bytes>,
     mut stream: S,
     config: StealthConfig,
-) -> anyhow::Result<()>
+) -> Result<()>
 where
     S: AsyncWriteExt + Unpin + Send + 'static,
 {
-    // Промежуточный канал для пакетов, которые "проснулись" после джиттера
-    let (tx_ready, mut rx_ready) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+    let jitter_enabled = config.max_jitter_ns > config.min_jitter_ns;
+    let mut rng = StdRng::from_entropy();
+    let mut pending = FuturesUnordered::<BoxFuture<'static, Bytes>>::new();
+    let mut input_open = true;
+    let mut buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
 
-    // Задача 1: Диспетчер (Прием -> Sleep -> ReadyChannel)
-    let dispatch_task = tokio::spawn(async move {
-        let mut rng = OsRng;
-        while let Some(packet) = rx.recv().await {
-            if packet.len() < 20 {
-                continue;
-            } // Фильтр мусора (опционально)
-
-            let tx = tx_ready.clone();
-            let delay = if config.max_jitter_ns > config.min_jitter_ns {
-                rng.gen_range(config.min_jitter_ns..=config.max_jitter_ns)
-            } else {
-                0
-            };
-
-            // Спавним микро-задачу на каждый пакет
-            tokio::spawn(async move {
-                if delay > 0 {
-                    sleep(Duration::from_nanos(delay)).await;
+    while input_open || !pending.is_empty() {
+        let packet = if !jitter_enabled {
+            match rx.recv().await {
+                Some(packet) => packet,
+                None => break,
+            }
+        } else if pending.is_empty() {
+            match rx.recv().await {
+                Some(packet) => {
+                    schedule_with_jitter(&mut pending, packet, &config, &mut rng);
+                    continue;
                 }
-                // Если получатель умер, просто выходим
-                let _ = tx.send(packet).await;
-            });
-        }
-    });
+                None => {
+                    input_open = false;
+                    continue;
+                }
+            }
+        } else if !input_open || pending.len() >= MAX_PENDING_JITTER_PACKETS {
+            pending.next().await.expect("jitter queue is not empty")
+        } else {
+            tokio::select! {
+                packet = rx.recv() => {
+                    match packet {
+                        Some(packet) => {
+                            schedule_with_jitter(&mut pending, packet, &config, &mut rng);
+                            continue;
+                        }
+                        None => {
+                            input_open = false;
+                            continue;
+                        }
+                    }
+                }
+                packet = pending.next() => packet.expect("jitter queue is not empty"),
+            }
+        };
 
-    // Задача 2: Отправщик (ReadyChannel -> QUIC Stream)
-    // Этот цикл работает в текущем таске и ждет завершения
-    while let Some(packet) = rx_ready.recv().await {
-        let framed = frame_packet(packet);
-        if stream.write_all(&framed).await.is_err() || stream.flush().await.is_err() {
-            error!("Stream write failed");
-            break;
+        if packet.len() < 20 {
+            continue;
+        }
+
+        buf.clear();
+        frame_packet_into(&mut buf, &packet);
+
+        while !jitter_enabled && buf.len() < COALESCE_BUDGET_BYTES {
+            match rx.try_recv() {
+                Ok(packet) if packet.len() >= 20 => frame_packet_into(&mut buf, &packet),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        if !buf.is_empty() {
+            stream.write_all(&buf).await?;
+            // FLUSH УДАЛЕН
         }
     }
 
-    // Закрываем стрим корректно
-    let _ = stream.shutdown().await;
-
-    // Ждем завершения диспетчера (хотя он скорее всего уже умер из-за закрытия канала)
-    dispatch_task.abort();
-
+    stream.shutdown().await?;
     Ok(())
 }
 
-
-/// Читает IP-пакеты, применяет Jitter, шифрует XChaCha20, добавляет фрейминг длины и пишет в TCP-Стрим.
-/// Используется для SSH, VNC и других стримовых протоколов.
 pub async fn bridge_crypto_stream_with_jitter<S>(
     mut rx: mpsc::Receiver<Bytes>,
     mut stream: S,
@@ -89,84 +105,158 @@ pub async fn bridge_crypto_stream_with_jitter<S>(
     cipher: Arc<Cipher>,
     sequence: Arc<AtomicU64>,
     nonce_prefix: [u8; 4],
-) -> anyhow::Result<()>
+) -> Result<()>
 where
     S: AsyncWriteExt + Unpin + Send + 'static,
 {
-    let (tx_ready, mut rx_ready) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
-
-    let stealth_cfg = config.clone();
-    let dispatch_task = tokio::spawn(async move {
-        let mut rng = OsRng;
-        while let Some(packet) = rx.recv().await {
-            if packet.len() < 20 { continue; }
-
-            let tx = tx_ready.clone();
-            let delay = if stealth_cfg.max_jitter_ns > stealth_cfg.min_jitter_ns {
-                rng.gen_range(stealth_cfg.min_jitter_ns..=stealth_cfg.max_jitter_ns)
-            } else { 0 };
-
-            tokio::spawn(async move {
-                if delay > 0 { tokio::time::sleep(Duration::from_nanos(delay)).await; }
-                let _ = tx.send(packet).await;
-            });
-        }
-    });
-
     let padding_step = config.padding_step;
-    while let Some(packet) = rx_ready.recv().await {
+    let jitter_enabled = config.max_jitter_ns > config.min_jitter_ns;
+    let mut rng = StdRng::from_entropy();
+    let mut pending = FuturesUnordered::<BoxFuture<'static, Bytes>>::new();
+    let mut input_open = true;
+    let mut buf = BytesMut::with_capacity(CRYPTO_COALESCE_BUDGET_BYTES);
+
+    let encrypt_into = |packet: Bytes, buf: &mut BytesMut| -> Result<()> {
         let seq = sequence.fetch_add(1, Ordering::Relaxed);
         let total_len = packet.len() + 38;
         let pad = calculate_padding_needed(total_len, padding_step);
-        let safe_pad = if total_len + (pad as usize) > crate::consts::PADDING_MTU { 0 } else { pad };
+        let safe_pad = if total_len + (pad as usize) > PADDING_MTU {
+            0
+        } else {
+            pad
+        };
 
-        if let Ok(crypted) = crate::transport::wrap_packet(&cipher, &nonce_prefix, seq, packet, safe_pad) {
-            let framed = frame_packet(crypted);
-            if stream.write_all(&framed).await.is_err() || stream.flush().await.is_err() {
+        let encrypted = wrap_packet(&cipher, &nonce_prefix, seq, packet, safe_pad)?;
+        frame_packet_into(buf, &encrypted);
+        Ok(())
+    };
+
+    let mut pkt_count = 0u64;
+    let mut byte_count = 0u64;
+    let start = Instant::now();
+
+    while input_open || !pending.is_empty() {
+        let mut packet = if !jitter_enabled {
+            match rx.recv().await {
+                Some(packet) => packet,
+                None => break,
+            }
+        } else if pending.is_empty() {
+            match rx.recv().await {
+                Some(packet) => {
+                    schedule_with_jitter(&mut pending, packet, &config, &mut rng);
+                    continue;
+                }
+                None => {
+                    input_open = false;
+                    continue;
+                }
+            }
+        } else if !input_open || pending.len() >= MAX_PENDING_JITTER_PACKETS {
+            pending.next().await.expect("очередь джиттера не пуста")
+        } else {
+            tokio::select! {
+                packet = rx.recv() => {
+                    match packet {
+                        Some(packet) => {
+                            schedule_with_jitter(&mut pending, packet, &config, &mut rng);
+                            continue;
+                        }
+                        None => {
+                            input_open = false;
+                            continue;
+                        }
+                    }
+                }
+                packet = pending.next() => packet.expect("очередь джиттера не пуста"),
+            }
+        };
+
+        buf.clear();
+
+        loop {
+            if packet.len() >= 20 {
+                pkt_count += 1;
+                encrypt_into(packet, &mut buf)?;
+            }
+
+            if buf.len() >= CRYPTO_COALESCE_BUDGET_BYTES {
                 break;
             }
+
+            packet = match rx.try_recv() {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+        }
+
+        if !buf.is_empty() {
+            byte_count += buf.len() as u64;
+            if let Err(e) = stream.write_all(&buf).await {
+                warn!(
+                    "[CryptoStream/Tx] Stream write failed: {e:#}. Sent so far: {} packets, {} bytes in {:.1}s",
+                    pkt_count, byte_count, start.elapsed().as_secs_f64()
+                );
+                return Err(e.into());
+            }
+            // FLUSH УДАЛЕН
         }
     }
 
-    let _ = stream.shutdown().await;
-    dispatch_task.abort();
+    info!(
+        "[CryptoStream/Tx] Finished outbound crypto stream. Total sent: {} packets, {} bytes in {:.1}s",
+        pkt_count, byte_count, start.elapsed().as_secs_f64()
+    );
+    stream.shutdown().await?;
     Ok(())
 }
 
+fn schedule_with_jitter(
+    pending: &mut FuturesUnordered<BoxFuture<'static, Bytes>>,
+    packet: Bytes,
+    config: &StealthConfig,
+    rng: &mut StdRng,
+) {
+    let delay = rng.gen_range(config.min_jitter_ns..=config.max_jitter_ns);
+    pending.push(
+        async move {
+            if delay > 0 {
+                sleep(Duration::from_nanos(delay)).await;
+            }
+            packet
+        }
+        .boxed(),
+    );
+}
 
 pub async fn receive_crypto_stream<R>(
     mut reader: R,
     tx: mpsc::Sender<Bytes>,
     cipher: Arc<Cipher>,
-) -> anyhow::Result<()>
+) -> Result<()>
 where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
 {
-    loop {
-        match crate::stream_framing::read_next_packet(&mut reader).await {
-            Ok(Some(framed_packet)) => {
-                match crate::transport::unwrap_packet(&cipher, &framed_packet) {
-                    Ok(tun_data) => {
-                        if tx.send(tun_data).await.is_err() {
-                            error!("[Crypto Stream RX] Failed to send to TUN queue. Inner router channel closed!");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("[Crypto Stream RX] Packet Decryption Failed (Dropped): {}", e);
-                        // Продолжаем читать, не убиваем туннель из-за одного битого пакета
-                    }
-                }
-            }
-            Ok(None) => {
-                info!("[Crypto Stream RX] Clean EOF received. Remote peer closed connection.");
-                break;
-            }
-            Err(e) => {
-                error!("[Crypto Stream RX] Frame Reader Fault: {}", e);
-                break;
-            }
-        }
+    let mut pkt_count = 0u64;
+    let mut byte_count = 0u64;
+    let start = Instant::now();
+    let mut last_pkt = start;
+
+    let mut frame_reader = FrameReader::new();
+    while let Some(encrypted) = frame_reader.read_next_packet(&mut reader).await? {
+        pkt_count += 1;
+        byte_count += encrypted.len() as u64;
+        last_pkt = Instant::now();
+
+        let packet = unwrap_packet_bytes_in_place(&cipher, encrypted)?;
+        tx.send(packet)
+            .await
+            .map_err(|_| anyhow!("очередь входящих пакетов закрыта"))?;
     }
+
+    info!(
+        "[CryptoStream/Rx] Reached EOF on inbound stream. Read: {} packets ({} bytes) in {:.1}s (last packet {:.3}s ago)",
+        pkt_count, byte_count, start.elapsed().as_secs_f64(), last_pkt.elapsed().as_secs_f64()
+    );
     Ok(())
 }

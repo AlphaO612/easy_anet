@@ -1,0 +1,53 @@
+use poem_openapi::Enum;
+use sea_orm::entity::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum, Serialize, Deserialize, Enum)]
+#[sea_orm(rs_type = "String", db_type = "Enum", enum_name = "protocol_type")]
+#[oai(rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum ProtocolType {
+    #[sea_orm(string_value = "quic")]
+    Quic,
+    #[sea_orm(string_value = "ssh")]
+    Ssh,
+    #[sea_orm(string_value = "vnc")]
+    Vnc,
+    #[sea_orm(string_value = "ws")]
+    Ws,
+    #[sea_orm(string_value = "ahttp")]
+    Ahttp,
+    #[sea_orm(string_value = "wrtc")]
+    Wrtc,
+    #[sea_orm(string_value = "imap")]
+    Imap,
+    #[sea_orm(string_value = "doh")]
+    Doh,
+}
+
+impl ProtocolType {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "ssh" => Self::Ssh,
+            "vnc" => Self::Vnc,
+            "ws" | "wss" => Self::Ws,
+            "ahttp" => Self::Ahttp,
+            "wrtc" => Self::Wrtc,
+            "imap" | "imaps" => Self::Imap,
+            _ => Self::Quic,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Quic => "quic",
+            Self::Ssh => "ssh",
+            Self::Vnc => "vnc",
+            Self::Ws => "ws",
+            Self::Ahttp => "ahttp",
+            Self::Wrtc => "wrtc",
+            Self::Imap => "imap",
+            Self::Doh => "doh",
+        }
+    }
+}

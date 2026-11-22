@@ -1,0 +1,8 @@
+services:
+  agent:
+    volumes:
+      - probe-targets:/etc/prometheus/targets:ro
+volumes:
+  probe-targets:
+    external: true
+    name: ${PROBE_VOLUME:-anet-probe-targets}

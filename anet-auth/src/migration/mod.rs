@@ -1,5 +1,46 @@
+pub mod m20261018_000030_create_rule_providers_and_custom_overrides;
+pub mod m20261019_000031_add_provider_action_and_items_table;
+pub mod m20261103_000032_add_imap_to_protocol_type;
+pub mod m20261103_000033_create_imap_mailboxes;
 pub mod m20240101_000001_create_users;
 pub mod m20240319_000002_create_admins;
+pub mod m20240401_000003_create_rates;
+pub mod m20240501_000004_create_active_sessions;
+pub mod m20260504_152844_add_ipv4_to_user;
+pub mod m20260714_000006_add_keys_to_user;
+pub mod m20260714_000007_create_servers;
+pub mod m20260714_000008_create_user_servers;
+pub mod m20260714_000009_add_is_active_to_servers;
+pub mod m20260814_000010_add_websocket_url_to_servers;
+pub mod m20260815_000011_create_node_runtime_states;
+pub mod m20260815_000012_create_node_commands;
+pub mod m20260815_000013_create_traffic_totals;
+pub mod m20260815_000014_create_traffic_hourly;
+pub mod m20260815_000015_create_node_pools;
+pub mod m20260815_000016_create_route_maps;
+pub mod m20260815_000017_add_control_token_to_servers;
+pub mod m20260815_000018_add_dsn_to_servers;
+pub mod m20260820_000019_refactor_route_maps;
+pub mod m20260828_000020_remove_dsn_from_servers;
+pub mod m20260829_000021_add_protocol_to_traffic;
+pub mod m20260830_000022_add_groups_and_update_rates;
+pub mod m20260901_000023_add_target_fingerprint_to_commands;
+pub mod m20260902_000024_add_ahttp_to_protocol_type;
+pub mod m20260902_000025_add_ahttp_url_to_servers;
+pub mod m20260909_000026_link_server_groups_and_add_protocols;
+pub mod m20260929_000027_add_wrtc_to_protocol_type;
+pub mod m20260929_000028_add_wrtc_url_to_servers;
+pub mod m20261002_000029_add_wrtc_mode;
+
+mod m20261122_000034_node_enrollment;
+mod m20261122_000035_probe_revision;
+mod m20261122_000036_probe_publications;
+mod m20261122_000037_topology_publications;
+mod m20261122_000039_flow_reports;
+mod m20261122_000040_uplink_keys;
+mod m20261122_000041_profile_credentials;
+mod m20261122_000042_flow_history;
+mod m20261122_000038_operator_incidents;
 
 use sea_orm_migration::prelude::*;
 
@@ -11,6 +52,47 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20240101_000001_create_users::Migration),
             Box::new(m20240319_000002_create_admins::Migration),
+            Box::new(m20240401_000003_create_rates::Migration),
+            Box::new(m20240501_000004_create_active_sessions::Migration),
+            Box::new(m20260504_152844_add_ipv4_to_user::Migration),
+            Box::new(m20260714_000007_create_servers::Migration),
+            Box::new(m20260714_000008_create_user_servers::Migration),
+            Box::new(m20260714_000006_add_keys_to_user::Migration),
+            Box::new(m20260714_000009_add_is_active_to_servers::Migration),
+            Box::new(m20260814_000010_add_websocket_url_to_servers::Migration),
+            Box::new(m20260815_000011_create_node_runtime_states::Migration),
+            Box::new(m20260815_000012_create_node_commands::Migration),
+            Box::new(m20260815_000013_create_traffic_totals::Migration),
+            Box::new(m20260815_000014_create_traffic_hourly::Migration),
+            Box::new(m20260815_000015_create_node_pools::Migration),
+            Box::new(m20260815_000016_create_route_maps::Migration),
+            Box::new(m20260815_000017_add_control_token_to_servers::Migration),
+            Box::new(m20260815_000018_add_dsn_to_servers::Migration),
+            Box::new(m20260820_000019_refactor_route_maps::Migration),
+            Box::new(m20260828_000020_remove_dsn_from_servers::Migration),
+            Box::new(m20260829_000021_add_protocol_to_traffic::Migration),
+            Box::new(m20260830_000022_add_groups_and_update_rates::Migration),
+            Box::new(m20260901_000023_add_target_fingerprint_to_commands::Migration),
+            Box::new(m20260902_000024_add_ahttp_to_protocol_type::Migration),
+            Box::new(m20260902_000025_add_ahttp_url_to_servers::Migration),
+            Box::new(m20260909_000026_link_server_groups_and_add_protocols::Migration),
+            Box::new(m20260929_000027_add_wrtc_to_protocol_type::Migration),
+            Box::new(m20260929_000028_add_wrtc_url_to_servers::Migration),
+            Box::new(m20261002_000029_add_wrtc_mode::Migration),
+            Box::new(m20261018_000030_create_rule_providers_and_custom_overrides::Migration),
+            Box::new(m20261019_000031_add_provider_action_and_items_table::Migration),
+            Box::new(m20261103_000032_add_imap_to_protocol_type::Migration),
+            Box::new(m20261103_000033_create_imap_mailboxes::Migration),
+            Box::new(m20261122_000034_node_enrollment::Migration),
+            Box::new(m20261122_000035_probe_revision::Migration),
+            Box::new(m20261122_000036_probe_publications::Migration),
+            Box::new(m20261122_000037_topology_publications::Migration),
+            Box::new(m20261122_000038_operator_incidents::Migration),
+            Box::new(m20261122_000039_flow_reports::Migration),
+            Box::new(m20261122_000040_uplink_keys::Migration),
+            Box::new(m20261122_000041_profile_credentials::Migration),
+            Box::new(m20261122_000042_flow_history::Migration),
         ]
     }
 }
+

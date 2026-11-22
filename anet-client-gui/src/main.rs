@@ -1,11 +1,21 @@
+#![allow(float_literal_f32_fallback)]
+
+// src/main.rs
 #![cfg_attr(not(feature = "console"), windows_subsystem = "windows")]
 
-use anet_client_gui::app::ANetApp;
+use anet_client_gui::{
+    app::ANetApp,
+    icons,
+    theme::{configure_styles, load_fonts},
+    GIT_TAG, COMMIT_HASH,
+};
 use eframe::egui;
-use anet_client_gui::icons;
+
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 fn main() -> Result<(), eframe::Error> {
-    // On macOS, check if we need to escalate privileges for utun access
+    // 1. Проверка прав администратора на macOS для TUN
     #[cfg(target_os = "macos")]
     {
         if !is_root() {
@@ -13,10 +23,9 @@ fn main() -> Result<(), eframe::Error> {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "anet-gui".to_string());
 
-            // Ask user if they want to open Terminal with sudo command
             let script = format!(
                 r#"
-                set theResult to display dialog "ANet VPN requires administrator privileges to create network tunnels.\n\nWould you like to open Terminal with the sudo command?" with title "ANet VPN" buttons {{"Cancel", "Open Terminal"}} default button "Open Terminal" with icon caution
+                set theResult to display dialog "ANet VPN requires administrator privileges to create network tunnels.\n\nWould you like to open Terminal with the sudo command?" with title "ANet VPN {}" buttons {{"Cancel", "Open Terminal"}} default button "Open Terminal" with icon caution
                 if button returned of theResult is "Open Terminal" then
                     tell application "Terminal"
                         activate
@@ -24,10 +33,11 @@ fn main() -> Result<(), eframe::Error> {
                     end tell
                 end if
                 "#,
+                GIT_TAG,
                 exe.replace("'", "'\\''")
             );
 
-            let _ = std::process::Command::new("osascript")
+            let _ = Command::new("osascript")
                 .arg("-e")
                 .arg(&script)
                 .output();
@@ -36,16 +46,26 @@ fn main() -> Result<(), eframe::Error> {
         }
     }
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // 2. Инициализация логгера (подавляем гигабайтные дампы сырых RTP-пакетов из webrtc/rtc при микробёрстах)
+    env_logger::Builder::from_env(
+        env_logger::Env::default()
+            .default_filter_or("info,rtc::peer_connection::handler=error,webrtc::peer_connection::driver=off"),
+    )
+    .init();
+
+    // 3. Иконка и заголовок
     let icon = icons::load_icon();
+    let window_title = format!("ANet VPN {} ({})", GIT_TAG, COMMIT_HASH);
 
     let options = eframe::NativeOptions {
-        // Настраиваем Viewport (само окно)
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 600.0]) // Твои размеры
+            .with_title(window_title)
+            .with_inner_size([400.0, 760.0])
+            .with_min_inner_size([400.0, 760.0])
             .with_icon(icon)
-            .with_resizable(false) // Фиксированный размер
-            .with_drag_and_drop(true), // DnD,
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_transparent(true),
         ..Default::default()
     };
 
@@ -53,36 +73,13 @@ fn main() -> Result<(), eframe::Error> {
         "ANet VPN",
         options,
         Box::new(|cc| {
-            // Настройка стилей при старте
+            load_fonts(&cc.egui_ctx);
             configure_styles(&cc.egui_ctx);
             Ok(Box::new(ANetApp::new(cc)))
         }),
     )
 }
 
-fn configure_styles(ctx: &egui::Context) {
-    // 1. Сначала берем стандартную темную тему как базу
-    let style = (*ctx.style()).clone();
-    let mut visuals = egui::Visuals::dark(); // Жестко включаем Dark Mode
-
-    // 2. Настраиваем цвета фона
-    let dark_bg = egui::Color32::from_rgb(18, 18, 18); // Onyx Black
-    visuals.window_fill = dark_bg;
-    visuals.panel_fill = dark_bg;
-
-    // 3. Настраиваем цвета элементов
-    visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(40);
-
-    // Цвет обводки и текста
-    visuals.selection.bg_fill = egui::Color32::from_rgb(76, 175, 80); // Акцентный зеленый
-    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-
-    ctx.set_visuals(visuals);
-    ctx.set_style(style);
-}
-
-/// Check if running as root (UID 0)
 #[cfg(target_os = "macos")]
 fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }

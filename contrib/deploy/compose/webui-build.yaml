@@ -1,0 +1,11 @@
+services:
+  auth:
+    build:
+      context: ../../..
+      dockerfile: contrib/deploy/images/Dockerfile.auth
+  webui:
+    build:
+      context: ../../..
+      dockerfile: contrib/deploy/images/Dockerfile.webui
+      args:
+        VITE_ANET_GRAFANA_URL: ${VITE_ANET_GRAFANA_URL:-}

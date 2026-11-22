@@ -1,0 +1,32 @@
+---
+- name: Reconcile the profile topology published by one ANet panel
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check controller and operation
+      ansible.builtin.assert:
+        that:
+          - groups.get('anet_topology', []) == ['localhost']
+          - anet_topology_action | default('diff') in ['diff', 'apply']
+          - anet_base_revision is integer and anet_base_revision >= 0
+          - anet_topology_api is defined
+          - anet_topology_token_file is defined
+    - name: Compare inventory with the published revision
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ playbook_dir }}/reconcile.py"
+          - "{{ 'diff' if ansible_check_mode else anet_topology_action | default('diff') }}"
+          - "{{ anet_topology_api }}"
+          - "{{ anet_topology_token_file }}"
+          - "{{ anet_base_revision | string }}"
+        stdin: "{{ anet_topology_manifest | from_json | to_json }}"
+      register: result
+      check_mode: false
+      changed_when: result.rc == 0 and (result.stdout | from_json).changed
+    - name: Show active revision and inventory differences
+      ansible.builtin.debug:
+        msg:
+          revision: "{{ (result.stdout | from_json).revision }}"
+          diff: "{{ (result.stdout | from_json).diff.splitlines() }}"

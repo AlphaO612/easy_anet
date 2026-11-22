@@ -1,7 +1,8 @@
-use crate::consts::{NONCE_LEN, NONCE_PREFIX_LEN};
+use crate::consts::{NONCE_LEN, NONCE_PREFIX_LEN, PADDING_MTU, TRANSPORT_ENVELOPE_OVERHEAD};
 use crate::encryption::{Cipher, EncryptionError};
+use crate::padding_utils::calculate_padding_needed;
 use anyhow::{Result, anyhow};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 /// Упаковывает и шифрует QUIC-пакет с новым протоколом
 pub fn wrap_packet(
@@ -11,14 +12,34 @@ pub fn wrap_packet(
     quic_payload: Bytes,
     padding_size: u16,
 ) -> Result<Bytes, EncryptionError> {
-    let payload_len = quic_payload.len();
-    let total_capacity = 8 + 2 + payload_len + padding_size as usize;
+    wrap_packet_slice(cipher, nonce_prefix, sequence, &quic_payload, padding_size)
+}
 
-    let mut plaintext = BytesMut::with_capacity(total_capacity);
-    plaintext.put_u64(sequence);
-    plaintext.put_u16(payload_len as u16); // Записываем длину данных
-    plaintext.put(quic_payload);
-    plaintext.put_bytes(0u8, padding_size as usize); // Добиваем нулями (станут шумом)
+/// Sentinel length written into the 2-byte header field when an unpadded batch payload
+/// is >= 65,535 bytes. Because ChaCha20-Poly1305 authenticates the exact ciphertext boundary,
+/// the receiver reconstructs `data_len = plaintext_len - 10` whenever `raw_len == LARGE_PACKET_LEN_SENTINEL`.
+pub const LARGE_PACKET_LEN_SENTINEL: u16 = u16::MAX;
+
+/// Packs and encrypts a packet using a single output allocation.
+/// Supports both standard MTU packets (with optional padding) and large coalesced batches (> 64 KB).
+pub fn wrap_packet_slice(
+    cipher: &Cipher,
+    nonce_prefix: &[u8; NONCE_PREFIX_LEN],
+    sequence: u64,
+    payload: &[u8],
+    padding_size: u16,
+) -> Result<Bytes, EncryptionError> {
+    let payload_len = payload.len();
+    let effective_padding = if payload_len >= usize::from(LARGE_PACKET_LEN_SENTINEL) {
+        0usize
+    } else {
+        padding_size as usize
+    };
+    let header_len_field = if payload_len >= usize::from(LARGE_PACKET_LEN_SENTINEL) {
+        LARGE_PACKET_LEN_SENTINEL
+    } else {
+        payload_len as u16
+    };
 
     // Nonce = [prefix][sequence]
     let mut nonce = [0u8; NONCE_LEN];
@@ -26,43 +47,119 @@ pub fn wrap_packet(
     // Последние 8 байт nonce - это сам sequence, для уникальности
     nonce[NONCE_PREFIX_LEN..].copy_from_slice(&sequence.to_be_bytes());
 
-    // Шифруем
-    let ciphertext = cipher.encrypt(&nonce, plaintext.freeze())?;
-
-    // Финальный пакет = [полный nonce][зашифрованные данные]
-    // Nonce теперь идет в открытом виде для O(1) поиска на сервере
-    let mut final_packet = BytesMut::with_capacity(NONCE_LEN + ciphertext.len());
+    // Reserve the final wire buffer once: nonce + plaintext + authentication tag.
+    let mut final_packet =
+        BytesMut::with_capacity(NONCE_LEN + 10 + payload_len + effective_padding + 16);
     final_packet.put_slice(&nonce);
-    final_packet.put(ciphertext);
+    final_packet.put_u64(sequence);
+    final_packet.put_u16(header_len_field);
+    final_packet.put_slice(payload);
+    if effective_padding > 0 {
+        final_packet.put_bytes(0, effective_padding);
+    }
+
+    let tag = {
+        let plaintext = &mut final_packet[NONCE_LEN..];
+        cipher.encrypt_in_place_detached(&nonce, plaintext)?
+    };
+    final_packet.put_slice(&tag);
 
     Ok(final_packet.freeze())
 }
 
-/// Расшифровывает пакет, полученный от сервера
-pub fn unwrap_packet(cipher: &Cipher, raw_packet: &[u8]) -> Result<Bytes> {
-    if raw_packet.len() < NONCE_LEN + 1 {
-        // Nonce + минимум 1 байт payload
+/// Упаковывает и шифрует пакет в единый буфер `BytesMut` с зарезервированным префиксом `headroom` байт в начале.
+/// Позволяет `send_video_frame_preallocated` записать 26-байтный заголовок VP8 + Client Tag напрямую в начало
+/// буфера без повторной аллокации и без копирования (`memcpy`) зашифрованного пакета.
+#[inline]
+pub fn wrap_packet_slice_with_headroom(
+    cipher: &Cipher,
+    nonce_prefix: &[u8; NONCE_PREFIX_LEN],
+    sequence: u64,
+    payload: &[u8],
+    headroom: usize,
+) -> Result<BytesMut, EncryptionError> {
+    let payload_len = payload.len();
+    let header_len_field = if payload_len >= usize::from(LARGE_PACKET_LEN_SENTINEL) {
+        LARGE_PACKET_LEN_SENTINEL
+    } else {
+        payload_len as u16
+    };
+
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce[..NONCE_PREFIX_LEN].copy_from_slice(nonce_prefix);
+    nonce[NONCE_PREFIX_LEN..].copy_from_slice(&sequence.to_be_bytes());
+
+    let mut final_packet =
+        BytesMut::with_capacity(headroom + NONCE_LEN + 10 + payload_len + 16);
+    final_packet.put_bytes(0, headroom);
+    final_packet.put_slice(&nonce);
+    final_packet.put_u64(sequence);
+    final_packet.put_u16(header_len_field);
+    final_packet.put_slice(payload);
+
+    let tag = {
+        let plaintext = &mut final_packet[headroom + NONCE_LEN..];
+        cipher.encrypt_in_place_detached(&nonce, plaintext)?
+    };
+    final_packet.put_slice(&tag);
+
+    Ok(final_packet)
+}
+
+/// Applies the configured transport padding and encrypts an owned packet.
+#[inline]
+pub fn wrap_packet_padded(
+    cipher: &Cipher,
+    nonce_prefix: &[u8; NONCE_PREFIX_LEN],
+    sequence: u64,
+    payload: Bytes,
+    padding_step: u16,
+) -> Result<Bytes, EncryptionError> {
+    let wire_len_without_padding = payload.len() + TRANSPORT_ENVELOPE_OVERHEAD;
+    let requested_padding = calculate_padding_needed(wire_len_without_padding, padding_step);
+    let padding = if wire_len_without_padding + usize::from(requested_padding) <= PADDING_MTU {
+        requested_padding
+    } else {
+        0
+    };
+    wrap_packet_slice(cipher, nonce_prefix, sequence, &payload, padding)
+}
+
+/// Расшифровывает пакет, полученный от удаленной стороны, и возвращает `(sequence, payload)`.
+pub fn unwrap_packet_with_seq(cipher: &Cipher, raw_packet: &[u8]) -> Result<(u64, Bytes)> {
+    if raw_packet.len() < NONCE_LEN + 10 + 16 {
         return Err(anyhow!("Packet too short"));
     }
 
-    // Извлекаем nonce и зашифрованные данные
     let (nonce, ciphertext) = raw_packet.split_at(NONCE_LEN);
+    let mut buf = BytesMut::from(ciphertext);
+    cipher.decrypt_in_place(nonce, &mut buf)?;
 
-    // Расшифровываем
-    let mut plaintext = cipher.decrypt(nonce, Bytes::copy_from_slice(ciphertext))?;
-
-    if plaintext.len() < 10 {
+    let plaintext_len = buf.len() - 16;
+    if plaintext_len < 10 {
         return Err(anyhow!("Payload too short"));
     }
 
-    let _seq = plaintext.get_u64();
-    let data_len = plaintext.get_u16() as usize; // Читаем длину
-
-    if data_len > plaintext.remaining() {
+    let seq = u64::from_be_bytes(buf[..8].try_into().unwrap());
+    let raw_len = u16::from_be_bytes([buf[8], buf[9]]);
+    let data_len = if raw_len == LARGE_PACKET_LEN_SENTINEL
+        && plaintext_len >= 10 + usize::from(LARGE_PACKET_LEN_SENTINEL)
+    {
+        plaintext_len - 10
+    } else {
+        usize::from(raw_len)
+    };
+    if 10 + data_len > plaintext_len {
         return Err(anyhow!("Malformed packet length"));
     }
-    // Обрезаем паддинг
-    Ok(plaintext.copy_to_bytes(data_len))
+
+    buf.truncate(10 + data_len);
+    Ok((seq, buf.freeze().slice(10..10 + data_len)))
+}
+
+/// Расшифровывает пакет, полученный от сервера (одна аллокация + decrypt_in_place)
+pub fn unwrap_packet(cipher: &Cipher, raw_packet: &[u8]) -> Result<Bytes> {
+    unwrap_packet_with_seq(cipher, raw_packet).map(|(_, payload)| payload)
 }
 
 /// Расшифровывает пакет на месте (без выделения памяти).
@@ -95,7 +192,14 @@ pub fn unwrap_packet_in_place<'a>(cipher: &Cipher, buffer: &'a mut [u8]) -> Resu
     }
 
     // Читаем длину (offset 8, 2 байта) вручную, чтобы не использовать Buf
-    let data_len = u16::from_be_bytes([plaintext[8], plaintext[9]]) as usize;
+    let raw_len = u16::from_be_bytes([plaintext[8], plaintext[9]]);
+    let data_len = if raw_len == LARGE_PACKET_LEN_SENTINEL
+        && plaintext_len >= 10 + usize::from(LARGE_PACKET_LEN_SENTINEL)
+    {
+        plaintext_len - 10
+    } else {
+        usize::from(raw_len)
+    };
 
     if 10 + data_len > plaintext.len() {
         return Err(anyhow!("Malformed packet length"));
@@ -103,4 +207,132 @@ pub fn unwrap_packet_in_place<'a>(cipher: &Cipher, buffer: &'a mut [u8]) -> Resu
 
     // Возвращаем срез чистого пейлоуда
     Ok(&plaintext[10..10 + data_len])
+}
+
+/// Decrypts an owned packet in place and returns a zero-copy view of its IP payload.
+///
+/// Unlike [`unwrap_packet`], this reuses the receive buffer for both ciphertext and
+/// plaintext. `Bytes` produced directly from a freshly read `Vec` is normally unique;
+/// a shared buffer is rejected rather than silently copied.
+pub fn unwrap_packet_bytes_in_place(cipher: &Cipher, raw_packet: Bytes) -> Result<Bytes> {
+    let mut buffer = match raw_packet.try_into_mut() {
+        Ok(buffer) => buffer,
+        Err(shared) => return unwrap_packet(cipher, &shared),
+    };
+
+    let payload = unwrap_packet_in_place(cipher, &mut buffer)?;
+    let payload_len = payload.len();
+    let payload_start = NONCE_LEN + 10;
+    let payload_end = payload_start + payload_len;
+    buffer.truncate(payload_end);
+    Ok(buffer.freeze().slice(payload_start..payload_end))
+}
+
+/// Decrypts an owned packet in place when its buffer is unique and falls back to the
+/// allocating path for shared buffers such as slices owned by a WebSocket frame parser.
+pub fn unwrap_packet_bytes(cipher: &Cipher, raw_packet: Bytes) -> Result<Bytes> {
+    let mut buffer = match raw_packet.try_into_mut() {
+        Ok(buffer) => buffer,
+        Err(shared) => return unwrap_packet(cipher, &shared),
+    };
+
+    let payload = unwrap_packet_in_place(cipher, &mut buffer)?;
+    let payload_len = payload.len();
+    let payload_start = NONCE_LEN + 10;
+    let payload_end = payload_start + payload_len;
+    buffer.truncate(payload_end);
+    Ok(buffer.freeze().slice(payload_start..payload_end))
+}
+
+#[cfg(test)]
+mod in_place_tests {
+    use super::*;
+
+    #[test]
+    fn owned_in_place_unwrap_matches_allocating_path() {
+        let cipher = Cipher::new(&[9; 32]);
+        let payload = Bytes::from_static(b"test IP packet payload");
+        let encrypted = wrap_packet(&cipher, &[1, 2, 3, 4], 7, payload.clone(), 13).unwrap();
+
+        let allocating = unwrap_packet(&cipher, &encrypted).unwrap();
+        let in_place = unwrap_packet_bytes_in_place(&cipher, encrypted).unwrap();
+
+        assert_eq!(allocating, payload);
+        assert_eq!(in_place, payload);
+    }
+
+    #[test]
+    fn padded_wrap_round_trips_without_changing_payload() {
+        let cipher = Cipher::new(&[3; 32]);
+        let payload = Bytes::from(vec![7; 1400]);
+        let encrypted = wrap_packet_padded(&cipher, &[4, 3, 2, 1], 9, payload.clone(), 64)
+            .expect("packet must encrypt");
+
+        assert!(encrypted.len() <= PADDING_MTU);
+        assert_eq!(unwrap_packet(&cipher, &encrypted).unwrap(), payload);
+    }
+
+    #[test]
+    fn owned_unwrap_falls_back_for_shared_buffers() {
+        let cipher = Cipher::new(&[8; 32]);
+        let payload = Bytes::from_static(b"shared WebSocket frame payload");
+        let encrypted = wrap_packet(&cipher, &[9, 8, 7, 6], 11, payload.clone(), 0).unwrap();
+        let shared = encrypted.clone();
+
+        assert_eq!(unwrap_packet_bytes(&cipher, encrypted).unwrap(), payload);
+        assert!(!shared.is_empty());
+    }
+
+    #[test]
+    fn large_batch_over_64kb_round_trips() {
+        let cipher = Cipher::new(&[5; 32]);
+        for size in [65_535usize, 65_536, 131_072, 262_144] {
+            let mut data = vec![0u8; size];
+            for (i, b) in data.iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+            let encrypted = wrap_packet_slice(&cipher, &[1, 2, 3, 4], 42, &data, 0).unwrap();
+            let unpacked = unwrap_packet(&cipher, &encrypted).unwrap();
+            assert_eq!(unpacked.len(), size);
+            assert_eq!(unpacked.as_ref(), data.as_slice());
+
+            let in_place = unwrap_packet_bytes_in_place(&cipher, encrypted).unwrap();
+            assert_eq!(in_place.len(), size);
+            assert_eq!(in_place.as_ref(), data.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_directional_nonce_separation_c2s_vs_s2c() {
+        use crate::consts::{CLIENT_SEQUENCE_START, NONCE_LEN, SERVER_SEQUENCE_START};
+
+        let key = [0x55u8; 32];
+        let cipher = Cipher::new(&key);
+        let prefix = [0xAA, 0xBB, 0xCC, 0xDD];
+
+        let c2s_pkt = wrap_packet_slice(&cipher, &prefix, CLIENT_SEQUENCE_START, b"uplink", 0)
+            .expect("wrap c2s");
+        let s2c_pkt = wrap_packet_slice(&cipher, &prefix, SERVER_SEQUENCE_START, b"downlink", 0)
+            .expect("wrap s2c");
+
+        assert_eq!(&c2s_pkt[..4], &prefix);
+        assert_eq!(&s2c_pkt[..4], &prefix);
+        assert_ne!(&c2s_pkt[..NONCE_LEN], &s2c_pkt[..NONCE_LEN]);
+        assert_eq!(c2s_pkt[4] & 0x80, 0x80);
+        assert_eq!(s2c_pkt[4] & 0x80, 0x00);
+
+        let dec_c2s = unwrap_packet(&cipher, &c2s_pkt).expect("unwrap c2s");
+        let dec_s2c = unwrap_packet(&cipher, &s2c_pkt).expect("unwrap s2c");
+        assert_eq!(dec_c2s.as_ref(), b"uplink");
+        assert_eq!(dec_s2c.as_ref(), b"downlink");
+
+        let (seq_c2s, payload_c2s) =
+            unwrap_packet_with_seq(&cipher, &c2s_pkt).expect("unwrap_with_seq c2s");
+        let (seq_s2c, payload_s2c) =
+            unwrap_packet_with_seq(&cipher, &s2c_pkt).expect("unwrap_with_seq s2c");
+        assert_eq!(seq_c2s, CLIENT_SEQUENCE_START);
+        assert_eq!(seq_s2c, SERVER_SEQUENCE_START);
+        assert_eq!(payload_c2s.as_ref(), b"uplink");
+        assert_eq!(payload_s2c.as_ref(), b"downlink");
+    }
 }

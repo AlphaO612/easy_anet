@@ -1,0 +1,49 @@
+//! Зарегистрированная VPN-нода и её параметры подключения.
+//!
+//! `control_token_hash` используется только для исходящих heartbeat/command/
+//! traffic запросов и никогда не возвращается обычному списку нод.
+
+use sea_orm::entity::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[sea_orm(table_name = "servers")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub id: Uuid,
+    pub name: String,
+    pub address: String,
+    pub public_key: String,
+    pub quic_port: Option<i32>,
+    pub ssh_port: Option<i32>,
+    pub vnc_port: Option<i32>,
+    pub websocket_url: Option<String>,
+    pub ahttp_url: Option<String>,
+    pub wrtc_url: Option<String>,
+    pub wrtc_mode: Option<String>,
+    pub ssh_user: Option<String>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    pub is_active: bool,
+    pub control_token_hash: Option<String>,
+    pub enrollment_token_hash: Option<String>,
+    pub enrollment_expires_at: Option<DateTime>,
+    pub probe_revision: i64,
+    pub probe_manifest: Option<String>,
+    pub probe_applied: i64,
+    pub probe_error: Option<String>,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl Related<super::users::Entity> for Entity {
+    fn to() -> RelationDef {
+        super::user_servers::Relation::User.def()
+    }
+    fn via() -> Option<RelationDef> {
+        Some(super::user_servers::Relation::Server.def().rev())
+    }
+}
+
+impl ActiveModelBehavior for ActiveModel {}

@@ -1,0 +1,19 @@
+services:
+  prometheus:
+    volumes:
+      - ./alertmanager-targets.yml:/etc/prometheus/alertmanager/active.yml:ro
+  alertmanager:
+    image: prom/alertmanager:v0.28.1@sha256:27c475db5fb156cab31d5c18a4251ac7ed567746a2483ff264516437a39b15ba
+    command: [--config.file=/etc/alertmanager/anet.yml, --storage.path=/alertmanager, --cluster.listen-address=]
+    volumes:
+      - ${ALERTMANAGER_CONFIG:?Set ALERTMANAGER_CONFIG}:/etc/alertmanager/anet.yml:ro
+      - alert_state:/alertmanager
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    pids_limit: 96
+    mem_limit: ${ALERTMANAGER_MEMORY:-128m}
+    cpus: ${ALERTMANAGER_CPUS:-0.5}
+volumes:
+  alert_state:

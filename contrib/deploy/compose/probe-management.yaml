@@ -1,0 +1,29 @@
+services:
+  auth:
+    environment:
+      ANET_PROBE_SIGNING_KEY_FILE: /run/anet/probe-seed
+    volumes:
+      - ${STATE_DIR:?}/probe-signing/seed:/run/anet/probe-seed:ro
+  probe-storage:
+    image: ${NETNS_IMAGE:?}
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    restart: "no"
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    entrypoint: ["/bin/chown", "65532:65532", "/probes"]
+    volumes: [probe-targets:/probes]
+  server:
+    environment:
+      ANET_PROBE_ALLOWED_TARGETS_JSON: ${PROBE_ALLOWED_TARGETS_JSON:-[]}
+      ANET_PROBE_PUBLIC_KEY_FILE: /etc/anet/probe-public
+    volumes:
+      - ${STATE_DIR:?}/probe-signing/public:/etc/anet/probe-public:ro
+      - probe-targets:/var/lib/anet/probes
+    depends_on:
+      probe-storage: {condition: service_completed_successfully}
+volumes:
+  probe-targets:
+    name: ${PROBE_VOLUME:-anet-probe-targets}

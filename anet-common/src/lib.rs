@@ -4,6 +4,7 @@ pub mod consts;
 pub mod crypto_utils;
 pub mod encryption;
 pub mod generated;
+pub mod handshake_fragmentation;
 pub mod jitter;
 pub mod padding_utils;
 pub mod quic_settings;
@@ -12,6 +13,19 @@ pub mod transport;
 pub mod transport_trait;
 pub mod tun_params;
 pub mod udp_poller;
+pub mod vnc;
+pub mod dto;
+pub mod reassembly;
+pub mod http_help;
+pub mod boring_tls;
+pub mod wrtc;
+pub mod icmp_probe;
+pub mod connectivity;
+pub mod probe_revision;
+pub mod probe_nodes;
+pub mod imap_conn;
+pub mod batcher;
+
 pub use generated::*;
 pub mod protocol {
     pub use super::*;

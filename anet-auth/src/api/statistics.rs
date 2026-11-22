@@ -1,0 +1,599 @@
+use crate::api::api::{cumulative_delta, validate_admin_session};
+use crate::api::dto::{
+    ActiveConnectionDto, AdminToken, GetNodeTrafficStatsResponse, GetTrafficHistoryResponse,
+    GetUserTrafficStatsResponse, NodeTrafficReport, TrafficHistoryPointDto, TrafficReportResponse,
+    UserTrafficStatDto, NodeTrafficStatDto, DisconnectMemberRequest
+};
+use crate::entities::{servers, traffic_hourly, traffic_totals, users, node_commands};
+use chrono::{NaiveDateTime, Timelike, Utc};
+use poem::Result;
+use poem_openapi::{param::Query, payload::Json, OpenApi, ApiResponse};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, Set,
+    QueryFilter, QueryOrder, TransactionTrait, QuerySelect
+};
+use std::collections::HashMap;
+use log::info;
+use uuid::Uuid;
+use chrono::Datelike;
+
+pub struct StatisticsApi {
+    pub db: DatabaseConnection,
+}
+
+#[derive(ApiResponse)]
+pub enum DisconnectConnectionResponse {
+    #[oai(status = 200)]
+    Ok,
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[OpenApi]
+impl StatisticsApi {
+    /// Принять накопительные счётчики полезного VPN-трафика от ноды (С авто-блокировкой по лимиту)
+    #[oai(path = "/control/nodes/traffic", method = "post")]
+    async fn report_node_traffic(
+        &self,
+        #[oai(name = "X-Node-Token")] node_token: poem_openapi::param::Header<String>,
+        req: Json<NodeTrafficReport>,
+    ) -> TrafficReportResponse {
+        let node_id = match Uuid::parse_str(&req.0.node_id) {
+            Ok(id) => id,
+            Err(_) => {
+                return TrafficReportResponse::BadRequest(Json("Invalid node_id".to_string()));
+            }
+        };
+        match crate::api::api::node_token_is_valid(&self.db, node_id, &node_token.0).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return TrafficReportResponse::Unauthorized(Json(
+                    "Invalid node credential".to_string(),
+                ));
+            }
+            Err(e) => return TrafficReportResponse::Error(Json(e.to_string())),
+        }
+        if req.0.boot_id.is_empty() || req.0.boot_id.len() > 128 || req.0.samples.len() > 10_000 {
+            return TrafficReportResponse::BadRequest(Json("Invalid traffic report".to_string()));
+        }
+        match servers::Entity::find_by_id(node_id).one(&self.db).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return TrafficReportResponse::NotFound(Json("Node not found".to_string())),
+            Err(e) => return TrafficReportResponse::Error(Json(e.to_string())),
+        }
+
+        let txn = match self.db.begin().await {
+            Ok(txn) => txn,
+            Err(e) => return TrafficReportResponse::Error(Json(e.to_string())),
+        };
+        let now = chrono::Utc::now().naive_utc();
+
+        let minute = (now.minute() / 15) * 15;
+        let bucket_start = now
+            .date()
+            .and_hms_opt(now.hour(), minute, 0)
+            .expect("valid bucket");
+
+        // Декларативная синхронизация сессий (Единый источник истины — отчёты живых нод):
+        // Если нода ещё работает на старом бинарнике (присылает samples без active_session_counts),
+        // автоматически формируем снимок живых сессий из активных сэмплов трафика этой ноды.
+        let effective_counts: Vec<anet_common::dto::NodeSessionCountItem> =
+            if req.0.active_session_counts.is_empty() && !req.0.samples.is_empty() {
+                let mut by_fp: HashMap<String, u32> = HashMap::new();
+                for s in &req.0.samples {
+                    if !s.fingerprint.is_empty() {
+                        *by_fp.entry(s.fingerprint.clone()).or_insert(0) += 1;
+                    }
+                }
+                by_fp
+                    .into_iter()
+                    .map(|(fingerprint, count)| anet_common::dto::NodeSessionCountItem {
+                        fingerprint,
+                        count,
+                        oldest_created_at: 0,
+                    })
+                    .collect()
+            } else {
+                req.0.active_session_counts.clone()
+            };
+
+        let live_totals = crate::api::api::update_node_live_sessions(node_id, effective_counts);
+        crate::api::api::sync_active_sessions_db(&txn, &live_totals).await;
+
+        for sample in req.0.samples {
+            if sample.fingerprint.is_empty() {
+                return TrafficReportResponse::BadRequest(Json("Empty fingerprint".to_string()));
+            }
+
+            let raw_proto = sample.protocol.clone().unwrap_or_else(|| "quic".to_string());
+            let protocol = crate::entities::ProtocolType::from_str(&raw_proto);
+
+            let user_id = match sample.user_id {
+                Some(id) => match Uuid::parse_str(&id) {
+                    Ok(id) => Some(id),
+                    Err(_) => {
+                        return TrafficReportResponse::BadRequest(Json(
+                            "Invalid user_id".to_string(),
+                        ));
+                    }
+                },
+                None => None,
+            };
+            let rx_bytes = sample.rx_bytes.min(u64::MAX) as i64;
+            let tx_bytes = sample.tx_bytes.min(u64::MAX) as i64;
+
+            let existing = match traffic_totals::Entity::find()
+                .filter(traffic_totals::Column::ServerId.eq(node_id))
+                .filter(traffic_totals::Column::BootId.eq(&req.0.boot_id))
+                .filter(traffic_totals::Column::Fingerprint.eq(&sample.fingerprint))
+                .filter(traffic_totals::Column::Protocol.eq(protocol))
+                .one(&txn)
+                .await
+            {
+                Ok(existing) => existing,
+                Err(e) => return TrafficReportResponse::Error(Json(e.to_string())),
+            };
+
+            let (rx_delta, tx_delta, total_result) = if let Some(existing) = existing {
+                let rx_delta = cumulative_delta(existing.rx_bytes, rx_bytes);
+                let tx_delta = cumulative_delta(existing.tx_bytes, tx_bytes);
+                let mut total = existing.into_active_model();
+                total.rx_bytes = Set(rx_bytes as i64);
+                total.tx_bytes = Set(tx_bytes as i64);
+                total.user_id = Set(user_id);
+                total.updated_at = Set(now);
+                (rx_delta, tx_delta, total.update(&txn).await.map(|_| ()))
+            } else {
+                let result = traffic_totals::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    server_id: Set(node_id),
+                    boot_id: Set(req.0.boot_id.clone()),
+                    user_id: Set(user_id),
+                    fingerprint: Set(sample.fingerprint.clone()),
+                    rx_bytes: Set(rx_bytes),
+                    tx_bytes: Set(tx_bytes),
+                    protocol: Set(protocol),
+                    updated_at: Set(now),
+                }
+                    .insert(&txn)
+                    .await
+                    .map(|_| ());
+                (rx_bytes, tx_bytes, result)
+            };
+            if let Err(e) = total_result {
+                return TrafficReportResponse::Error(Json(e.to_string()));
+            }
+
+            if let Ok(Some(user_model)) = users::Entity::find()
+                .filter(users::Column::Fingerprint.eq(&sample.fingerprint))
+                .one(&txn)
+                .await
+            {
+                let usr_id = user_model.id;
+
+                // Загружаем тариф и группу
+                let rate_opt = crate::entities::rates::Entity::find()
+                    .filter(crate::entities::rates::Column::UserId.eq(usr_id))
+                    .one(&txn)
+                    .await
+                    .unwrap_or(None);
+
+                let group_opt = if let Some(group_id) = user_model.group_id {
+                    crate::entities::groups::Entity::find_by_id(group_id)
+                        .one(&txn)
+                        .await
+                        .unwrap_or(None)
+                } else {
+                    None
+                };
+
+                let now = chrono::Utc::now().naive_utc();
+
+                // 1. Вычисляем календарное начало текущего месяца на случай отсутствия личного тарифа
+                let first_day_current_month = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap();
+
+                // 2. Определяем временную границу начала расчетного цикла
+                let mut cycle_start = first_day_current_month;
+
+                if let Some(ref rate) = rate_opt {
+                    let duration_days = group_opt.as_ref().map(|g| g.duration_days).unwrap_or(30).max(1) as i64;
+                    cycle_start = rate.date_end - chrono::Duration::days(duration_days);
+                }
+
+                // Определение лимита трафика
+                let mut limit: i64 = 0;
+                let mut has_traffic_limit = false;
+
+                let rate_has_limits = rate_opt.as_ref().is_some_and(|r| r.sessions > 0 || r.traffic_limit > 0 || r.speed_limit > 0);
+
+                if rate_has_limits {
+                    let rate = rate_opt.as_ref().unwrap();
+                    if rate.traffic_limit > 0 {
+                        limit = rate.traffic_limit;
+                        has_traffic_limit = true;
+                    }
+                } else if let Some(ref group) = group_opt {
+                    if group.traffic_limit > 0 {
+                        limit = group.traffic_limit;
+                        has_traffic_limit = true;
+                    }
+                }
+
+                // Сверяем трафик за ТЕКУЩИЙ расчетный период с лимитом
+                if has_traffic_limit {
+                    // ИСПРАВЛЕНО: Считаем дельты из почасовой таблицы вместо накопительных сессий
+                    let sum_result = traffic_hourly::Entity::find()
+                        .filter(traffic_hourly::Column::UserId.eq(usr_id))
+                        .filter(traffic_hourly::Column::BucketStart.gte(cycle_start)) // Считаем строго от начала периода
+                        .select_only()
+                        .column_as(sea_orm::sea_query::Expr::cust("CAST(SUM(rx_bytes) + SUM(tx_bytes) AS BIGINT)"), "total")
+                        .into_tuple::<Option<i64>>()
+                        .one(&txn)
+                        .await;
+
+                    if let Ok(Some(Some(total_bytes))) = sum_result {
+                        if total_bytes >= limit {
+                            info!("[Billing] Client {} (FP: {}) exceeded traffic limit ({} >= {}). Enqueuing disconnect.", usr_id, sample.fingerprint, total_bytes, limit);
+
+                            let disconnect_cmd = node_commands::ActiveModel {
+                                id: Set(Uuid::new_v4()),
+                                server_id: Set(node_id),
+                                command_type: Set("disconnect_user".to_string()),
+                                accepting_connections: Set(None),
+                                target_fingerprint: Set(Some(sample.fingerprint.clone())),
+                                status: Set("pending".to_string()),
+                                created_at: Set(Utc::now().naive_utc()),
+                                started_at: Set(None),
+                                completed_at: Set(None),
+                                error: Set(None),
+                            };
+                            let _ = disconnect_cmd.insert(&txn).await;
+                        }
+                    }
+                }
+            }
+
+            if rx_delta == 0 && tx_delta == 0 {
+                continue;
+            }
+            let hourly = match traffic_hourly::Entity::find()
+                .filter(traffic_hourly::Column::BucketStart.eq(bucket_start))
+                .filter(traffic_hourly::Column::ServerId.eq(node_id))
+                .filter(traffic_hourly::Column::Fingerprint.eq(&sample.fingerprint))
+                .filter(traffic_hourly::Column::Protocol.eq(protocol))
+                .one(&txn)
+                .await
+            {
+                Ok(hourly) => hourly,
+                Err(e) => return TrafficReportResponse::Error(Json(e.to_string())),
+            };
+            let hourly_result = if let Some(hourly) = hourly {
+                let mut aggregate = hourly.into_active_model();
+                aggregate.rx_bytes = Set(aggregate.rx_bytes.as_ref().saturating_add(rx_delta));
+                aggregate.tx_bytes = Set(aggregate.tx_bytes.as_ref().saturating_add(tx_delta));
+                aggregate.user_id = Set(user_id);
+                aggregate.updated_at = Set(now);
+                aggregate.update(&txn).await.map(|_| ())
+            } else {
+                traffic_hourly::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    bucket_start: Set(bucket_start),
+                    server_id: Set(node_id),
+                    user_id: Set(user_id),
+                    fingerprint: Set(sample.fingerprint),
+                    rx_bytes: Set(rx_delta),
+                    tx_bytes: Set(tx_delta),
+                    protocol: Set(protocol),
+                    updated_at: Set(now),
+                }
+                    .insert(&txn)
+                    .await
+                    .map(|_| ())
+            };
+            if let Err(e) = hourly_result {
+                return TrafficReportResponse::Error(Json(e.to_string()));
+            }
+        }
+        match txn.commit().await {
+            Ok(()) => TrafficReportResponse::Accepted,
+            Err(e) => TrafficReportResponse::Error(Json(e.to_string())),
+        }
+    }
+
+    /// Принудительный сброс сессии (Disconnect) из Админки (Через POST body)
+    #[oai(path = "/statistics/active-connections/disconnect", method = "post")]
+    async fn disconnect_active_connection(
+        &self,
+        auth: AdminToken,
+        req: Json<DisconnectMemberRequest>, // <-- Изменено: параметры принимаются в body
+    ) -> DisconnectConnectionResponse {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return DisconnectConnectionResponse::Unauthorized(Json(err));
+        }
+
+        let command_id = Uuid::new_v4();
+        let command = node_commands::ActiveModel {
+            id: Set(command_id),
+            server_id: Set(req.0.server_id),
+            command_type: Set("disconnect_user".to_string()),
+            accepting_connections: Set(None),
+            target_fingerprint: Set(Some(req.0.fingerprint)),
+            status: Set("pending".to_string()),
+            created_at: Set(Utc::now().naive_utc()),
+            started_at: Set(None),
+            completed_at: Set(None),
+            error: Set(None),
+        };
+
+        match command.insert(&self.db).await {
+            Ok(_) => DisconnectConnectionResponse::Ok,
+            Err(e) => DisconnectConnectionResponse::Error(Json(e.to_string())),
+        }
+    }
+
+    /// Статистика по нодам
+    #[oai(path = "/statistics/nodes", method = "get")]
+    async fn get_node_traffic_stats(&self, auth: AdminToken) -> GetNodeTrafficStatsResponse {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return GetNodeTrafficStatsResponse::Unauthorized(Json(err));
+        }
+        let nodes = match servers::Entity::find().all(&self.db).await {
+            Ok(nodes) => nodes,
+            Err(e) => return GetNodeTrafficStatsResponse::Error(Json(e.to_string())),
+        };
+        let totals = match traffic_totals::Entity::find().all(&self.db).await {
+            Ok(totals) => totals,
+            Err(e) => return GetNodeTrafficStatsResponse::Error(Json(e.to_string())),
+        };
+        let mut aggregate: HashMap<Uuid, (i64, i64)> = HashMap::new();
+        for total in totals {
+            let entry = aggregate.entry(total.server_id).or_default();
+            entry.0 = entry.0.saturating_add(total.rx_bytes.max(0) as i64);
+            entry.1 = entry.1.saturating_add(total.tx_bytes.max(0) as i64);
+        }
+        GetNodeTrafficStatsResponse::Ok(Json(
+            nodes
+                .into_iter()
+                .map(|node| {
+                    let (rx_bytes, tx_bytes) = aggregate.get(&node.id).copied().unwrap_or((0, 0));
+                    NodeTrafficStatDto {
+                        node_id: node.id,
+                        name: node.name,
+                        rx_bytes,
+                        tx_bytes,
+                    }
+                })
+                .collect(),
+        ))
+    }
+
+    /// Статистика по пользователям
+    #[oai(path = "/statistics/users", method = "get")]
+    async fn get_user_traffic_stats(&self, auth: AdminToken) -> GetUserTrafficStatsResponse {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return GetUserTrafficStatsResponse::Unauthorized(Json(err));
+        }
+        let user_models = match users::Entity::find().all(&self.db).await {
+            Ok(users) => users,
+            Err(e) => return GetUserTrafficStatsResponse::Error(Json(e.to_string())),
+        };
+        let users_by_id: HashMap<Uuid, users::Model> =
+            user_models.into_iter().map(|u| (u.id, u)).collect();
+        let totals = match traffic_totals::Entity::find().all(&self.db).await {
+            Ok(totals) => totals,
+            Err(e) => return GetUserTrafficStatsResponse::Error(Json(e.to_string())),
+        };
+        let mut aggregate: HashMap<String, UserTrafficStatDto> = HashMap::new();
+        for total in totals {
+            let entry = aggregate.entry(total.fingerprint.clone()).or_insert_with(|| {
+                let user = total.user_id.and_then(|id| users_by_id.get(&id));
+                UserTrafficStatDto {
+                    user_id: total.user_id,
+                    uid: user.and_then(|u| u.uid.clone()),
+                    fingerprint: total.fingerprint.clone(),
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                }
+            });
+            entry.rx_bytes = entry.rx_bytes.saturating_add(total.rx_bytes.max(0) as i64);
+            entry.tx_bytes = entry.tx_bytes.saturating_add(total.tx_bytes.max(0) as i64);
+        }
+        let mut stats: Vec<_> = aggregate.into_values().collect();
+        stats.sort_by_key(|item| std::cmp::Reverse(item.rx_bytes.saturating_add(item.tx_bytes)));
+        GetUserTrafficStatsResponse::Ok(Json(stats))
+    }
+
+    /// График истории
+    #[oai(path = "/statistics/traffic/history", method = "get")]
+    async fn get_traffic_history(
+        &self,
+        auth: AdminToken,
+        hours: Query<Option<u32>>,
+        server_id: Query<Option<Uuid>>,
+        user_id: Query<Option<Uuid>>,
+        fingerprint: Query<Option<String>>,
+        protocol: Query<Option<String>>,
+    ) -> GetTrafficHistoryResponse {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return GetTrafficHistoryResponse::Unauthorized(Json(err));
+        }
+        let hours = hours.0.unwrap_or(24).clamp(1, 24 * 90);
+        let now = chrono::Utc::now().naive_utc();
+
+        let step_minutes = 15;
+        let total_steps = (hours * 60) / step_minutes;
+
+        let current_minute = (now.minute() / step_minutes) * step_minutes;
+        let current_bucket = now
+            .date()
+            .and_hms_opt(now.hour(), current_minute, 0)
+            .expect("valid hour");
+
+        let first_bucket = current_bucket
+            - chrono::Duration::minutes((total_steps - 1) as i64 * step_minutes as i64);
+
+        let mut query = traffic_hourly::Entity::find()
+            .filter(traffic_hourly::Column::BucketStart.gte(first_bucket));
+
+        if let Some(srv_id) = server_id.0 {
+            query = query.filter(traffic_hourly::Column::ServerId.eq(srv_id));
+        }
+        if let Some(usr_id) = user_id.0 {
+            query = query.filter(traffic_hourly::Column::UserId.eq(usr_id));
+        }
+        if let Some(ref fp) = fingerprint.0 {
+            if !fp.trim().is_empty() {
+                query = query.filter(traffic_hourly::Column::Fingerprint.eq(fp));
+            }
+        }
+        if let Some(ref proto) = protocol.0 {
+            if !proto.trim().is_empty() {
+                let db_proto = crate::entities::ProtocolType::from_str(proto);
+                query = query.filter(traffic_hourly::Column::Protocol.eq(db_proto));
+            }
+        }
+
+        let rows = match query
+            .order_by_asc(traffic_hourly::Column::BucketStart)
+            .all(&self.db)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => return GetTrafficHistoryResponse::Error(Json(e.to_string())),
+        };
+
+        let mut aggregate: HashMap<NaiveDateTime, (i64, i64)> = HashMap::new();
+        for row in rows {
+            let entry = aggregate.entry(row.bucket_start).or_default();
+            entry.0 = entry.0.saturating_add(row.rx_bytes.max(0) as i64);
+            entry.1 = entry.1.saturating_add(row.tx_bytes.max(0) as i64);
+        }
+
+        let points = (0..total_steps)
+            .map(|offset| {
+                let bucket = first_bucket
+                    + chrono::Duration::minutes(offset as i64 * step_minutes as i64);
+                let (rx_bytes, tx_bytes) = aggregate.get(&bucket).copied().unwrap_or((0, 0));
+                TrafficHistoryPointDto {
+                    bucket_start: bucket.and_utc().to_rfc3339(),
+                    rx_bytes,
+                    tx_bytes,
+                }
+            })
+            .collect();
+
+        GetTrafficHistoryResponse::Ok(Json(points))
+    }
+
+    /// Получить подробный список активных подключений в реальном времени
+    #[oai(path = "/statistics/active-connections", method = "get")]
+    async fn get_active_connections(
+        &self,
+        auth: AdminToken,
+    ) -> Result<Json<Vec<ActiveConnectionDto>>, poem::Error> {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return Err(poem::Error::from_string(
+                err,
+                poem::http::StatusCode::UNAUTHORIZED,
+            ));
+        }
+
+        let now = chrono::Utc::now().naive_utc();
+        let threshold = now - chrono::Duration::seconds(90);
+
+        let mut active_totals = crate::entities::traffic_totals::Entity::find()
+            .filter(crate::entities::traffic_totals::Column::UpdatedAt.gte(threshold))
+            .all(&self.db)
+            .await
+            .map_err(poem::error::InternalServerError)?;
+
+        active_totals.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+        let mut user_connection_limits: HashMap<Uuid, i32> = HashMap::new();
+        let mut added_user_counts: HashMap<Uuid, i32> = HashMap::new();
+        let mut dtos = Vec::new();
+
+        for total in active_totals {
+            let Some(user_id) = total.user_id else {
+                continue;
+            };
+
+            // Если от этой ноды есть свежий декларативный снимок и на ней у ключа 0 сессий — пропускаем
+            if let Some(node_live) = crate::api::api::get_live_node_sessions_for_fingerprint(
+                total.server_id,
+                &total.fingerprint,
+            ) {
+                if node_live <= 0 {
+                    continue;
+                }
+            }
+
+            let max_allowed_connections =
+                if let Some(&count) = user_connection_limits.get(&user_id) {
+                    count
+                } else {
+                    let live_opt =
+                        crate::api::api::get_live_sessions_for_fingerprint(&total.fingerprint);
+                    let sessions_in_db = crate::entities::active_sessions::Entity::find()
+                        .filter(crate::entities::active_sessions::Column::UserId.eq(user_id))
+                        .one(&self.db)
+                        .await
+                        .map_err(poem::error::InternalServerError)?
+                        .map(|s| s.sessions)
+                        .unwrap_or(1) as i32;
+
+                    let actual = live_opt.unwrap_or(sessions_in_db);
+                    let limit = actual.max(1);
+                    user_connection_limits.insert(user_id, limit);
+                    limit
+                };
+
+            let already_added = added_user_counts.entry(user_id).or_insert(0);
+
+            if *already_added >= max_allowed_connections {
+                continue;
+            }
+
+            *already_added += 1;
+
+            let username = crate::entities::users::Entity::find_by_id(user_id)
+                .one(&self.db)
+                .await
+                .map_err(poem::error::InternalServerError)?
+                .and_then(|u| u.uid)
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            let server_name = crate::entities::servers::Entity::find_by_id(total.server_id)
+                .one(&self.db)
+                .await
+                .map_err(poem::error::InternalServerError)?
+                .map(|s| s.name)
+                .unwrap_or_else(|| "Unknown Server".to_string());
+
+            let node_conn_count = crate::api::api::get_live_node_sessions_for_fingerprint(
+                total.server_id,
+                &total.fingerprint,
+            )
+            .unwrap_or(max_allowed_connections);
+
+            dtos.push(ActiveConnectionDto {
+                user_id,
+                username,
+                server_id: total.server_id,
+                server_name,
+                rx_bytes: total.rx_bytes.max(0) as i64,
+                tx_bytes: total.tx_bytes.max(0) as i64,
+                connection_count: node_conn_count,
+                protocol: total.protocol.as_str().to_string(),
+                fingerprint: total.fingerprint, // <-- Передаем отпечаток
+            });
+        }
+
+        Ok(Json(dtos))
+    }
+}

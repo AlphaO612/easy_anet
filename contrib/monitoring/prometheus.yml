@@ -1,0 +1,7 @@
+global:
+  evaluation_interval: 10s
+rule_files: [/etc/prometheus/rules.yml]
+alerting:
+  alertmanagers:
+    - file_sd_configs:
+        - files: [/etc/prometheus/alertmanager/*.yml]

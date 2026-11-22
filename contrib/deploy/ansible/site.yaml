@@ -1,0 +1,66 @@
+---
+- name: Deploy ANet to existing hosts
+  hosts: anet
+  gather_facts: true
+  serial: 1
+  vars:
+    release_root: "{{ deploy_root | default(ansible_user_dir + '/anet-releases') }}"
+    deployment_state: "{{ state_dir | default(ansible_user_dir + '/.local/state/anet') }}"
+    repo: "{{ playbook_dir }}/../../.."
+  tasks:
+    - name: Read checkout revision
+      ansible.builtin.command:
+        argv: [git, -C, "{{ repo }}", rev-parse, HEAD]
+      delegate_to: localhost
+      register: release_revision
+      changed_when: false
+    - name: Create release directory
+      ansible.builtin.file:
+        path: "{{ release_root }}/{{ release_revision.stdout }}"
+        state: directory
+        mode: "0700"
+    - name: Check for completed extraction of this revision
+      ansible.builtin.stat:
+        path: "{{ release_root }}/{{ release_revision.stdout }}/.anet-extracted"
+      register: extracted
+    - name: Transfer exact committed release
+      when: not extracted.stat.exists
+      block:
+        - name: Allocate local archive
+          ansible.builtin.tempfile:
+            suffix: .tar.gz
+          delegate_to: localhost
+          register: archive
+        - name: Archive source at revision
+          ansible.builtin.command:
+            argv: [git, -C, "{{ repo }}", archive, --format=tar.gz, -o, "{{ archive.path }}", "{{ release_revision.stdout }}"]
+          delegate_to: localhost
+        - name: Extract release
+          ansible.builtin.unarchive:
+            src: "{{ archive.path }}"
+            dest: "{{ release_root }}/{{ release_revision.stdout }}"
+        - name: Mark successful extraction
+          ansible.builtin.copy:
+            content: "{{ release_revision.stdout }}\n"
+            dest: "{{ release_root }}/{{ release_revision.stdout }}/.anet-extracted"
+            mode: "0600"
+      always:
+        - name: Remove temporary archive
+          ansible.builtin.file:
+            path: "{{ archive.path }}"
+            state: absent
+          delegate_to: localhost
+          when: archive.path is defined
+    - name: Transfer offline image bundle over SSH
+      when: anet_bundle_src is defined
+      ansible.builtin.copy:
+        src: "{{ anet_bundle_src }}/"
+        dest: "{{ release_root }}/{{ release_revision.stdout }}/image-bundle/"
+        directory_mode: "0700"
+        mode: "0600"
+    - name: Apply installation profile
+      ansible.builtin.command:
+        argv: "{{ [release_root + '/' + release_revision.stdout + '/contrib/deploy/install.sh', '--profile', anet_profile, '--mode', anet_mode, '--host', anet_host, '--state', deployment_state] + (['--config'] if anet_config_only | default(false) | bool else []) + (['--install-docker'] if anet_install_docker | default(anet_bundle_src is not defined and anet_bundle_dir is not defined) | bool and not anet_config_only | default(false) | bool else []) + (['--probe-management'] if anet_probe_management | default(false) | bool else []) + (['--capacity-probes'] if anet_capacity_probes | default(false) | bool else []) + (['--metrics-panel'] if anet_metrics_panel | default(false) | bool else []) + (['--join-panel', anet_join_panel] if anet_join_panel is defined else []) + (['--flow-agent', anet_flow_agent] if anet_flow_agent is defined else []) + (['--env', anet_env_file] if anet_env_file is defined else []) + (['--bundle', release_root + '/' + release_revision.stdout + '/image-bundle'] if anet_bundle_src is defined else (['--bundle', anet_bundle_dir] if anet_bundle_dir is defined else [])) + (['--release', anet_release_manifest] if anet_release_manifest is defined else []) }}"
+      environment: "{{ anet_environment | default({}) }}"
+      register: deployment
+      changed_when: "'Creating' in deployment.stderr or 'Recreating' in deployment.stderr or 'Started' in deployment.stderr"

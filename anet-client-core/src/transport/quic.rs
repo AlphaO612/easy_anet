@@ -1,15 +1,21 @@
 use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthHandler, UdpAuthChannel};
-use crate::config::CoreConfig;
+use crate::config::{CoreConfig, ServerConfig};
 use crate::socket::AnetUdpSocket;
+use anet_common::consts::PADDING_MTU;
 use anet_common::encryption::Cipher;
-use anet_common::quic_settings::build_transport_config;
-use anyhow::Result;
+use anet_common::quic_settings::{
+    build_transport_config, tune_udp_socket_buffers, QUIC_UDP_SOCKET_BUFFER_SIZE,
+};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use log::info;
+use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, TokioRuntime};
-use rustls::RootCertStore;
-use std::net::SocketAddr;
+use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
+use rustls_pemfile::certs;
+use std::io::{Error as IoError, Result as IoResult};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -20,109 +26,113 @@ pub struct QuicDuplexStream {
     send: SendStream,
     recv: RecvStream,
 }
-// ... (impl AsyncRead/Write те же) ...
+
 impl AsyncRead for QuicDuplexStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<IoResult<()>> {
         Pin::new(&mut self.recv).poll_read(cx, buf)
     }
 }
+
 impl AsyncWrite for QuicDuplexStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match Pin::new(&mut self.send).poll_write(cx, buf) {
-            Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
-            Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
-            }
-            Poll::Pending => Poll::Pending,
-        }
+    ) -> Poll<IoResult<usize>> {
+        Pin::new(&mut self.send)
+            .poll_write(cx, buf)
+            .map(|result| result.map_err(IoError::other))
     }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match Pin::new(&mut self.send).poll_flush(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
-            }
-            Poll::Pending => Poll::Pending,
-        }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        Pin::new(&mut self.send)
+            .poll_flush(cx)
+            .map(|result| result.map_err(IoError::other))
     }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match Pin::new(&mut self.send).poll_shutdown(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
-            }
-            Poll::Pending => Poll::Pending,
-        }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        Pin::new(&mut self.send)
+            .poll_shutdown(cx)
+            .map(|result| result.map_err(IoError::other))
     }
 }
 
 pub struct QuicTransport {
     config: CoreConfig,
+    server: ServerConfig,
 }
 
 impl QuicTransport {
-    pub fn new(config: CoreConfig) -> Self {
-        Self { config }
+    pub fn new(config: CoreConfig, server: ServerConfig) -> Self {
+        Self { config, server }
     }
 }
 
 #[async_trait]
 impl ClientTransport for QuicTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
-        // 1. Создаем канал
-        let server_addr: SocketAddr = self.config.main.address.parse()?;
-        let udp_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        // Вытаскиваем адрес конкретной ноды
+        let addr_str = self.server.endpoint()?;
+        let server_addr: SocketAddr = addr_str
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| anyhow!("Invalid server address"))?;
+        let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+        tune_udp_socket_buffers(&udp_socket, QUIC_UDP_SOCKET_BUFFER_SIZE);
+        let udp_socket = Arc::new(udp_socket);
         let channel = UdpAuthChannel::new(udp_socket.clone(), server_addr);
 
-        // 2. Аутентификация
-        let auth_handler = AuthHandler::new(&self.config)?;
+        // Передаем опциональный ключ сервера для переопределения
+        let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
         let (auth_response, shared_key) = auth_handler.authenticate(&channel).await?;
 
-        // 3. QUIC
-        let transport_config =
-            build_transport_config(&self.config.quic_transport, auth_response.mtu as u16)?;
+        let mut quic_cfg = self.config.quic_transport.clone();
+        // Берем keep_alive_interval_seconds из конфигурации пользователя без принудительного
+        // занижения до 10 секунд (по умолчанию 7s при отсутствии значения в конфиге).
+        quic_cfg.keep_alive_interval_seconds =
+            Some(quic_cfg.keep_alive_interval_seconds.unwrap_or(7));
+        quic_cfg.idle_timeout_seconds = Some(quic_cfg.idle_timeout_seconds.unwrap_or(60));
+
+        let transport_config = build_transport_config(&quic_cfg, auth_response.mtu as u16)?;
 
         let cipher = Arc::new(Cipher::new(&shared_key));
         let nonce_prefix: [u8; 4] = auth_response
             .nonce_prefix
             .as_slice()
             .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid nonce prefix len"))?;
+            .map_err(|_| anyhow!("Invalid nonce prefix len"))?;
 
         let anet_socket = Arc::new(AnetUdpSocket::new(
-            udp_socket, // Используем тот же сокет
+            udp_socket,
             cipher,
             nonce_prefix,
             self.config.stealth.clone(),
         ));
 
+        let mut ep_config = EndpointConfig::default();
+        let _ = ep_config.max_udp_payload_size(PADDING_MTU as u16);
+
         let mut endpoint = Endpoint::new_with_abstract_socket(
-            EndpointConfig::default(),
+            ep_config,
             None,
             anet_socket,
             Arc::new(TokioRuntime),
         )?;
 
         let mut root_store = RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut auth_response.quic_cert.as_slice()) {
+        for cert in certs(&mut auth_response.quic_cert.as_slice()) {
             root_store.add(cert?)?;
         }
 
-        let client_crypto = rustls::ClientConfig::builder()
+        let client_crypto = RustlsClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
-        let mut client_config = ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
-        ));
+        let mut client_config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(
+            client_crypto,
+        )?));
         client_config.transport_config(Arc::new(transport_config));
         endpoint.set_default_client_config(client_config);
 
@@ -137,11 +147,16 @@ impl ClientTransport for QuicTransport {
         let (send, recv) = connection.open_bi().await?;
         let stream = QuicDuplexStream { send, recv };
 
-        Ok(ConnectionResult{
+        Ok(ConnectionResult {
             auth_response,
             vpn_stream: Box::new(stream),
             endpoint: Some(endpoint),
             connection: Some(connection),
+            health_pause: None,
+            remote_ip: Some(server_addr.ip()), // Передаем IP в bypass
+            bypass_ips: Vec::new(),
+            effective_mode: None,
+            shutdown_hook: None,
         })
     }
 }
