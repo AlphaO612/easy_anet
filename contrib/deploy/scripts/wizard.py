@@ -1,6 +1,6 @@
 """Interactive multi-VPS installation from a verified, locally delivered Linux bundle."""
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import fcntl
 import hashlib
 import pwd
@@ -18,6 +18,9 @@ import tempfile
 from topology import atomic_write
 from wizard_ui import Terminal, WizardError, failure_hint
 from wizard_tls import dns_name
+import wizard_edit
+from wizard_edit import active_profiles, hostname, normalize, validate
+from wizard_recovery import connect, credential_session, prompt_for_new_node, recovery_apply, resume_commands
 
 ui = Terminal()
 
@@ -40,11 +43,6 @@ def ask(label, default="", check=bool):
 
 def number(label, default, low, high):
     return int(ask(label, default, lambda s: s.isascii() and s.isdigit() and low <= int(s) <= high))
-
-
-def hostname(s):
-    return len(s) <= 253 and all(re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", x)
-                                 for x in s.split("."))
 
 
 def plan():
@@ -72,6 +70,7 @@ def plan():
             s["password"] = mode == 2
             if mode == 1:
                 s["key"] = ask("Путь к ключу (Enter — стандартный ключ или агент)", check=lambda v: not v or Path(v).expanduser().is_file())
+            prompt_for_new_node(s)
         servers.append(s)
         if i < entries:
             before = len(profiles)
@@ -91,7 +90,7 @@ def plan():
                 choice = ui.menu("Сертификат для VLESS", [
                     (1, "Let's Encrypt", "выпустить и продлевать автоматически; открыть HTTPS-сайт"),
                     (2, "Своя пара PEM", "использовать имеющийся сертификат и ключ на входном VPS")
-                ], 1)
+                ], 1, new_screen=False)
                 s["tls_mode"] = "acme" if choice == 1 else "existing"
                 if choice == 1:
                     print("Для выпуска сертификата откройте TCP 80 и 443. Проверьте записи A и AAAA домена.")
@@ -100,7 +99,7 @@ def plan():
                     template = ui.menu("Страница на HTTPS-порту 443", [
                         (1, "Студия", "обычный статический сайт"), (2, "Журнал", "статическая страница журнала"),
                         (3, "GitHub-профиль", "страница по публичным данным пользователя GitHub")
-                    ], 1)
+                    ], 1, new_screen=False)
                     s["template"] = ("studio", "journal", "github")[template - 1]
                     if template == 3:
                         s["github"] = ask("Имя публичного GitHub-профиля", check=lambda v: len(v) <= 39
@@ -113,7 +112,7 @@ def plan():
         raise ValueError("Для каждого выхода нужен хотя бы один входной профиль. Запустите мастер ещё раз и назначьте профиль каждому выходу.")
     port = number("Первый публичный VPN-порт", 48000, 1024, 63000) if expert else 48000
     panel = number("Порт панели (loopback)", 8088, 1024, 65535) if expert else 8088
-    return dict(installation=secrets.token_hex(5), servers=servers, profiles=profiles, local=local, base=port, panel=panel)
+    return normalize(dict(installation=secrets.token_hex(5), servers=servers, profiles=profiles, local=local, base=port, panel=panel))
 
 
 class Host:
@@ -123,19 +122,14 @@ class Host:
         if not node["local"]:
             self.ssh = ["ssh", "-p", str(node["port"]), "-o", "ControlPath=" + str(socket),
                         "-o", "ConnectTimeout=15"]
-            if node.get("password"):
-                self.ssh += ["-o", "PreferredAuthentications=keyboard-interactive,password"]
-            elif node.get("key"):
+            if node.get("key"):
                 self.ssh += ["-o", "IdentitiesOnly=yes", "-i", str(Path(node["key"]).expanduser())]
             self.target = node["user"] + "@" + node["address"]
 
     def __enter__(self):
         if self.ssh:
-            try:
-                with ui.activity(f"Вход по SSH на {self.target}, порт {self.node['port']}", interactive=True):
-                    subprocess.run([*self.ssh, "-M", "-fN", self.target], check=True)
-            except subprocess.CalledProcessError:
-                raise WizardError("Проверьте адрес, порт, имя пользователя и выбранный способ входа по SSH.") from None
+            with ui.activity(f"Вход по SSH на {self.target}, порт {self.node['port']}", interactive=True):
+                connect(self.node, self.ssh, self.target)
         return self
 
     def __exit__(self, *_):
@@ -265,7 +259,7 @@ def setup_vless(host, dest, ident, names):
                 print("Не удалось удалить приватный контактный файл ACME на входной VPS.", file=sys.stderr)
 
 
-def job(host, dest, ident, **task):
+def job(target, dest, ident, **task):
     raw = json.dumps(dict(task, installation=ident)).encode()
     action = task["action"]
     labels = {"images": "Проверка и загрузка образов", "exit": "Запуск выхода ANet",
@@ -276,10 +270,10 @@ def job(host, dest, ident, **task):
         "entry": "Проверьте доступность UDP-порта выхода, поддержку TUN и выбранного входного протокола.",
         "panel": "Проверьте порт панели и состояние PostgreSQL и auth."
     }
-    label = f"{labels[action]} · {host.node['host']}"
+    label = f"{labels[action]} · {target.node['host']}"
     with tempfile.TemporaryFile() as diagnostics, ui.activity(label):
         try:
-            result = host.run("/usr/bin/python3 " + shlex.quote(dest + "/src/deploy/scripts/wizard_node.py"),
+            result = target.run("/usr/bin/python3 " + shlex.quote(dest + "/src/deploy/scripts/wizard_node.py"),
                               deploy=True, input=raw, stdout=subprocess.PIPE, stderr=diagnostics)
         except subprocess.CalledProcessError:
             diagnostics.seek(max(0, diagnostics.tell() - 8192))
@@ -291,15 +285,22 @@ def job(host, dest, ident, **task):
 
 
 def apply(spec, bundle):
+    normalize(spec)
+    validate(spec, for_apply=True)
+    profiles = active_profiles(spec)
+    used = {spec["local"]} | {p[side] for p in profiles for side in ("entry", "exit")}
     ident = spec["installation"]
     directory = STATE / ident
     directory.mkdir(mode=0o700, exist_ok=True)
     dest = ".local/share/anet-wizard/" + ident
     with tempfile.TemporaryDirectory(prefix="anet-ssh-") as tmp, ExitStack() as stack:
         ui.stage(3, "Проверка доступа к VPS")
-        hosts = [stack.enter_context(Host(n, Path(tmp) / str(i))) for i, n in enumerate(spec["servers"])]
+        hosts = {i: stack.enter_context(Host(spec["servers"][i], Path(tmp) / str(i))) for i in sorted(used)}
         fingerprints = set()
-        for h in hosts:
+        pins_file = directory / "runtime-owners.json"
+        pins = json.loads(pins_file.read_text()) if pins_file.exists() else {}
+        observed = {}
+        for index, h in hosts.items():
             try:
                 fp = h.run('test "$(uname -m)" = x86_64; test -c /dev/net/tun; cat /etc/machine-id', capture_output=True).stdout.strip()
             except subprocess.CalledProcessError:
@@ -307,29 +308,40 @@ def apply(spec, bundle):
             if not fp or fp in fingerprints:
                 raise ValueError("Каждая роль требует отдельный VPS с уникальным machine-id.")
             fingerprints.add(fp)
+            owner = "anet-vpn" if h.node["user"] == "root" else h.node["user"]
+            identity = {"machine": hashlib.sha256(fp).hexdigest(), "owner": owner}
+            if str(index) in pins and pins[str(index)] != identity:
+                raise WizardError(f"{h.node['host']}: прежний запуск начат на другом VPS или от другой учётной записи Docker. "
+                                  "Исправьте SSH-доступ к прежнему узлу в редакторе плана.")
+            observed[index] = identity
+
+        def pin(index):
+            if str(index) not in pins:
+                pins[str(index)] = observed[index]
+                atomic_write(pins_file, json.dumps(pins))
+
         ui.stage(4, "Подготовка узлов и доставка образов")
         source = Path(tmp) / "runtime.tar.gz"
         sources(source)
-        for i,h in enumerate(hosts):
-            used = any(i in (p["entry"], p["exit"]) for p in spec["profiles"])
-            if not used and i != spec["local"]:
-                continue
+        for i,h in hosts.items():
             print(f"Подготовка {h.node['host']}…", flush=True)
-            entry = any(p["entry"] == i for p in spec["profiles"])
+            entry = any(p["entry"] == i for p in profiles)
             profile = "anet-easy" if entry else "webui" if i == spec["local"] else "standalone"
             prepare(h, dest, bundle, source, profile, ident,
-                    any(p["entry"] == i and p["protocol"] == "wireguard" for p in spec["profiles"]))
-            if h.node.get("tls_mode"):
-                names = [f"entry-{j + 1}" for j, row in enumerate(spec["profiles"])
+                    any(p["entry"] == i and p["protocol"] == "wireguard" for p in profiles))
+            if h.node.get("tls_mode") and any(p["entry"] == i and p["protocol"] == "vless" for p in profiles):
+                names = [f"entry-{row['slot']}" for row in profiles
                          if row["entry"] == i and row["protocol"] == "vless"]
                 setup_vless(h, dest, ident, names)
         ui.stage(5, "Запуск VPN и проверка маршрутов")
         catalog = []
-        for i,p in enumerate(spec["profiles"]):
+        for p in profiles:
+            slot = p["slot"]
             entry, exit_host = hosts[p["entry"]], hosts[p["exit"]]
-            port = spec["base"] + i
+            port = spec["base"] + slot - 1
             proto = p["protocol"]
-            uplink = job(exit_host, dest, ident, action="exit", name=f"exit-{i+1}",
+            pin(p["exit"])
+            uplink = job(exit_host, dest, ident, action="exit", name=f"exit-{slot}",
                          native_port=port, host=exit_host.node["host"])["config"]
             tls = {}
             endpoint = entry.node.get("tls_domain", entry.node["host"]) if proto == "vless" else entry.node["host"]
@@ -339,18 +351,20 @@ def apply(spec, bundle):
                 # Resume plans recorded before local certificate staging.
                 for key, src in (("cert", "cert"), ("key", "keyfile")):
                     tls[key] = entry.run("cat -- " + shlex.quote(entry.node[src]), stdout=subprocess.PIPE).stdout.decode()
-            cfg = job(entry, dest, ident, action="entry", name=f"entry-{i+1}", host=endpoint,
+            pin(p["entry"])
+            cfg = job(entry, dest, ident, action="entry", name=f"entry-{slot}", host=endpoint,
                       protocol=proto, native_port=port,
                       port=port, uplink=uplink, **tls)["config"]
-            path = directory / f"{i+1}-{proto}.{EXT[proto]}"
+            path = directory / f"{slot}-{proto}.{EXT[proto]}"
             atomic_write(path, cfg)
-            catalog.append(dict(id=f"profile-{i+1}", protocol=proto, entry=endpoint,
+            catalog.append(dict(id=f"profile-{slot}", protocol=proto, entry=endpoint,
                                 exit=exit_host.node["host"], port=port, config=cfg))
             print(f"{LABEL[proto]}    {endpoint}:{port} → {exit_host.node['host']}:{port}    {path}", flush=True)
         ui.stage(6, "Панель и клиентские профили")
         controller = hosts[spec["local"]]
+        pin(spec["local"])
         password = job(controller, dest, ident, action="panel", name="panel", host=controller.node["host"],
-                       native_port=44000 if spec["base"] > 44000 or spec["base"] + len(catalog) <= 44000 else 45000,
+                       native_port=spec["panel_native_port"],
                        panel_port=spec["panel"], catalog=catalog)["password_file"]
         spec["password_file"] = password
 
@@ -389,6 +403,79 @@ def open_saved():
     show_access(saved[selected])
 
 
+def edit_plan(spec, pending, failed_node_index=None):
+    return wizard_edit.edit_plan(spec, pending, failed_node_index, ui=ui, ask=ask, number=number)
+
+
+def saved_paths():
+    pending = STATE / "pending.json"
+    paths = sorted([*STATE.glob("*/plan.json"), *STATE.glob("*/unfinished-plan.json")],
+                   key=lambda path: path.stat().st_mtime, reverse=True)
+    return ([pending] if pending.is_file() else []) + paths
+
+
+@contextmanager
+def locked_state():
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if STATE.stat().st_mode & 0o077 or STATE.stat().st_uid != os.getuid():
+        raise ValueError("Каталог мастера должен принадлежать текущему пользователю и иметь права 0700")
+    with (STATE / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
+def edit_saved():
+    with locked_state():
+        paths = saved_paths()
+        candidates = [normalize(json.loads(path.read_text())) for path in paths]
+        titles = {"pending.json": "текущий черновик", "plan.json": "установлен", "unfinished-plan.json": "архив"}
+        choices = [(i + 1, spec["servers"][spec["local"]]["host"],
+                    f"{titles[paths[i].name]} · {spec['installation']}") for i, spec in enumerate(candidates)]
+        choices.append((0, "В главное меню", ""))
+        selected = ui.menu("Какой план редактировать?", choices, 1)
+        if not selected:
+            return
+        pending = STATE / "pending.json"
+        if pending.is_file() and candidates[selected - 1]["installation"] != candidates[0]["installation"]:
+            print("При сохранении выбранный план станет текущим, предыдущий черновик будет доступен в архиве.")
+        if edit_plan(candidates[selected - 1], pending):
+            print("План сохранён. Выберите «Установить» → «Продолжить» для применения.")
+
+
+def confirm_plan(spec):
+    normalize(spec)
+    try:
+        validate(spec, for_apply=True)
+    except ValueError as error:
+        print(error)
+        return False
+    ui.stage(2, "Проверка плана")
+    profiles = active_profiles(spec)
+    enabled = {p["entry"] for p in profiles if p["protocol"] == "vless"}
+    sites = [node for i, node in enumerate(spec["servers"]) if i in enabled and node.get("tls_mode") == "acme"]
+    disabled = [p for p in spec["profiles"] if p not in profiles]
+    if disabled:
+        print("Исключены из этого запуска и списка выдачи панели. Ранее созданные сервисы продолжают работу:")
+        for p in disabled:
+            print("  " + wizard_edit.describe(p, spec))
+    print("Маршруты к установке:")
+    for profile in profiles:
+        entry = spec["servers"][profile["entry"]]
+        exit_node = spec["servers"][profile["exit"]]
+        proto = profile["protocol"]
+        endpoint = entry.get("tls_domain", entry["host"]) if proto == "vless" else entry["host"]
+        transport = "tcp" if proto == "vless" else "udp"
+        port = spec["base"] + profile["slot"] - 1
+        print(f"{LABEL[proto]}  {endpoint}:{port}/{transport} → {exit_node['host']}:{port}/udp")
+    for node in sites:
+        template = {"studio": "Студия", "journal": "Журнал", "github": "GitHub · " + node.get("github", "")}
+        print(f"Сайт https://{node['tls_domain']}/ · nginx на TCP 443 · шаблон {template[node['template']]}.")
+        print(f"Let's Encrypt использует TCP 80 для проверки домена {node['tls_domain']}. Мастер настроит продление.")
+    print(f"Панель на {spec['servers'][spec['local']]['host']}, SSH-туннель к порту {spec['panel']}.")
+    return ui.menu("Применить этот план?", [(1, "Начать установку", "подключиться к VPS и применить указанные изменения"),
+                                       (0, "Выйти", "")], 0 if sites else 1, new_screen=False) == 1
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
@@ -404,6 +491,8 @@ def main():
                (2, "Схема и этапы установки", "что понадобится и как пройдёт настройка")]
     if next(STATE.glob("*/plan.json"), None):
         choices.append((3, "Открыть панель", "команда SSH и путь к паролю"))
+    if saved_paths():
+        choices.append((4, "Редактировать сохранённый план", "исправить доступ или изменить состав VPS"))
     choices.append((0, "Выйти", ""))
     while True:
         choice = ui.menu("Главное меню", choices, 1)
@@ -413,6 +502,9 @@ def main():
             break
         if choice == 3:
             return open_saved()
+        if choice == 4:
+            edit_saved()
+            continue
         ui.guide()
     ui.stage(1, "Поставка и топология")
     default = args.bundle or os.environ.get("ANET_BUNDLE_DIR", "")
@@ -421,56 +513,46 @@ def main():
     bundle = Path(default).expanduser().resolve()
     if not (bundle / "manifest.json").is_file() or not (bundle / "images.tar").is_file():
         raise ValueError("Комплект должен содержать manifest.json и images.tar")
-    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if STATE.stat().st_mode & 0o077 or STATE.stat().st_uid != os.getuid():
-        raise ValueError("Каталог мастера должен принадлежать текущему пользователю и иметь права 0700")
-    with (STATE / ".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with locked_state():
         pending = STATE / "pending.json"
         ui.pending = pending
         if pending.exists():
-            previous = json.loads(pending.read_text())
+            previous = normalize(json.loads(pending.read_text()))
             resume = ui.menu("Найдена незавершённая установка", [
                 (1, "Продолжить", "использовать сохранённые узлы, профили и ключи"),
-                (2, "Создать новый план", "сохранить предыдущий отдельно")
+                (2, "Создать новый план", "сохранить предыдущий отдельно"),
+                (3, "Редактировать", "исправить, пропустить или удалить VPS")
             ], 1)
-            if resume == 1:
+            if resume in (1, 3):
                 spec = previous
+                if resume == 3 and not edit_plan(spec, pending):
+                    return
             else:
                 previous_dir = STATE / previous["installation"]
                 previous_dir.mkdir(mode=0o700, exist_ok=True)
-                pending.rename(previous_dir / "unfinished-plan.json")
+                archived = previous_dir / "unfinished-plan.json"
+                wizard_edit.snapshot(archived, previous_dir)
+                pending.rename(archived)
                 spec = plan()
         else:
             spec = plan()
-        ui.stage(2, "Проверка плана")
-        sites = [node for node in spec["servers"] if node.get("tls_mode") == "acme"]
-        for i, profile in enumerate(spec["profiles"]):
-            entry = spec["servers"][profile["entry"]]
-            exit_node = spec["servers"][profile["exit"]]
-            proto = profile["protocol"]
-            endpoint = entry.get("tls_domain", entry["host"]) if proto == "vless" else entry["host"]
-            transport = "tcp" if proto == "vless" else "udp"
-            port = spec["base"] + i
-            print(f"{LABEL[proto]}  {endpoint}:{port}/{transport} → {exit_node['host']}:{port}/udp")
-        for node in sites:
-            template = {"studio": "Студия", "journal": "Журнал", "github": "GitHub · " + node.get("github", "")}
-            print(f"Сайт https://{node['tls_domain']}/ · nginx на TCP 443 · шаблон {template[node['template']]}.")
-            print(f"Let's Encrypt использует TCP 80 для проверки домена {node['tls_domain']}. Мастер настроит продление.")
-        print(f"Панель на {spec['servers'][spec['local']]['host']}, SSH-туннель к порту {spec['panel']}.")
-        if ui.menu("Применить этот план?", [(1, "Начать установку", "подключиться к VPS и применить указанные изменения"),
-                                           (0, "Выйти", "")], 0 if sites else 1) == 0:
+        if not confirm_plan(spec):
             return
         atomic_write(pending, json.dumps(spec))
-        apply(spec, bundle)
+        ui.resume = resume_commands(spec, bundle)
+        if not recovery_apply(spec, bundle, pending, apply, edit_plan, confirm_plan, ui):
+            return
         atomic_write(pending, json.dumps(spec))
-        pending.rename(STATE / spec["installation"] / "plan.json")
+        installed = STATE / spec["installation"] / "plan.json"
+        wizard_edit.snapshot(installed, installed.parent)
+        pending.rename(installed)
         show_access(spec)
 
 
 if __name__ == "__main__":
     try:
-        main()
+        with credential_session():
+            main()
     except KeyboardInterrupt:
         ui.error("Операция отменена оператором.")
         sys.exit(130)

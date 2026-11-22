@@ -125,6 +125,16 @@ def connect(node, options, target):
             raise NodeConnectionError(node, log.read())
 
 
+def resume_commands(spec, bundle):
+    launcher = Path(bundle) / "install.sh"
+    args = ["bash", str(launcher)] if launcher.is_file() else [
+        "env", "ANET_BUNDLE_DIR=" + str(bundle), "bash", str(Path(__file__).resolve().parents[1] / "install.sh")]
+    remote = shlex.join(args)
+    local = spec["servers"][spec["local"]]
+    login = shlex.join(["ssh", "-tt", "-p", str(local["port"]), local["user"] + "@" + local["address"], remote])
+    return f"На первой VPS:\n  {remote}\nИли с компьютера:\n  {login}"
+
+
 def recovery_apply(spec, bundle, pending, apply, edit_plan, confirm_plan, ui):
     from wizard_edit import active_profiles
     passwords = _credentials.get()
@@ -150,11 +160,8 @@ def recovery_apply(spec, bundle, pending, apply, edit_plan, confirm_plan, ui):
                 check += ["-i", node["key"]]
             print(f"Проверка с первой VPS: {shlex.join(check + [node['user'] + '@' + node['address']])}")
             print("Если SSH зависает до запроса пароля, проверьте адрес, порт, firewall и sshd в консоли провайдера.")
-            print("План сохранён. Для возврата на этой VPS выполните:")
-            launcher = Path(bundle) / "install.sh"
-            if not launcher.is_file():
-                launcher = Path(__file__).resolve().parents[1] / "install.sh"
-            print("  " + shlex.join(["env", "ANET_BUNDLE_DIR=" + str(bundle), "bash", str(launcher)]))
+            print("План сохранён. Чтобы продолжить после выхода:")
+            print(resume_commands(spec, bundle))
             while True:
                 choice = ui.menu("Что сделать сейчас?", [
                     (1, "Повторить подключение", node["address"]),

@@ -137,6 +137,8 @@ class Terminal:
         if self.pending and self.pending.is_file():
             print("План сохранён. Устраните причину, повторите команду установки и выберите «Продолжить».",
                   file=sys.stderr)
+            if getattr(self, "resume", None):
+                print(self.resume, file=sys.stderr)
 
 
 def failure_hint(output, fallback):

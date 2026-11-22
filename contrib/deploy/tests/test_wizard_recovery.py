@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 import shutil
 import socket
@@ -16,7 +15,7 @@ class Recovery(unittest.TestCase):
     def setUp(self):
         self.server = dict(local=False, address="node.example", host="node.example", port=22,
                            user="deploy", password=True, status="active")
-        self.plan = dict(local=0, servers=[dict(local=True, status="active"), self.server],
+        self.plan = dict(local=0, servers=[dict(local=True, status="active", user="root", port=2222, address="first.example"), self.server],
                          profiles=[dict(entry=0, exit=1)])
 
     def test_password_only_in_private_session(self):
