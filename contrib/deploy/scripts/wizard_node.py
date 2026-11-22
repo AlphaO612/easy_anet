@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 from bundle import load_bundle
 from topology import atomic_write
@@ -66,6 +67,41 @@ def publish_catalog(directory, rows):
     return catalog
 
 
+def vless_devices(server_dir):
+    """Pre-authorize distinct device credentials on this route; preserve IDs across retries."""
+    path = server_dir / "server.json"
+    config = json.loads(path.read_text())
+    inbound, = [item for item in config["inbounds"] if item["protocol"] == "vless"]
+    clients = inbound["settings"]["clients"]
+    prefix = "anet-device-"
+    by_email = {item.get("email"): item["id"] for item in clients}
+    devices = []
+    changed = False
+    for slot in range(128):
+        email = f"{prefix}{slot}@anet.invalid"
+        device = by_email.get(email)
+        if device is None:
+            device = str(uuid.uuid4())
+            clients.append({"id": device, "email": email})
+            changed = True
+        devices.append(device)
+    if changed:
+        atomic_write(path, json.dumps(config))
+    return devices
+
+
+def publish_device_catalog(directory, rows, origin):
+    catalog = directory / "vless-catalog"
+    catalog.mkdir(exist_ok=True)
+    catalog.chmod(0o755)
+    routes = {row["id"]: {k: row[k] for k in ("entry", "exit", "port", "devices")}
+              for row in rows if row.get("devices")}
+    path = catalog / "index.json"
+    atomic_write(path, json.dumps({"origin": origin, "routes": routes}))
+    path.chmod(0o444)
+    return catalog
+
+
 def service(root, job):
     action, name = job["action"], job["name"]
     directory = root / name
@@ -82,11 +118,15 @@ def service(root, job):
     project = "anet-" + root.name + "-" + name
     files = [DEPLOY / "compose/compose.yaml"]
     config = state / "client.toml"
+    devices = []
     if panel:
         catalog = publish_catalog(directory, job["catalog"])
+        private_catalog = publish_device_catalog(directory, job["catalog"], job.get("subscription_origin", ""))
         overlay = directory / "webui-mount.json"
         atomic_write(overlay, json.dumps({"services": {"webui": {"volumes": [
             {"type": "bind", "source": str(catalog), "target": "/srv/anet-profiles", "read_only": True}
+        ]}, "vless-profiles": {"volumes": [
+            {"type": "bind", "source": str(private_catalog), "target": "/srv/anet-vless-catalog", "read_only": True}
         ]}}}))
         files.extend([DEPLOY / "compose/webui.yaml", DEPLOY / "compose/probe-management.yaml", overlay])
         env.update(PROBE_VOLUME=project + "-probes", PANEL_PORT=str(job["panel_port"]), PANEL_BIND="127.0.0.1")
@@ -118,6 +158,7 @@ def service(root, job):
                 else:
                     cert, key = job["cert"], job["key"]
                 server_dir = target / "server"
+                devices = vless_devices(server_dir)
                 for filename, contents in (("tls.pem", cert), ("tls.key", key)):
                     current = server_dir / filename
                     if not current.exists() or current.read_text() != contents:
@@ -126,7 +167,8 @@ def service(root, job):
                 # changes the Compose model even after a retry following a crash.
                 overlay = directory / "tls.json"
                 atomic_write(overlay, json.dumps({"services": {"ingress": {"labels": {
-                    "anet.tls.chain": hashlib.sha256(cert.encode()).hexdigest()
+                    "anet.tls.chain": hashlib.sha256(cert.encode()).hexdigest(),
+                    "anet.vless.clients": hashlib.sha256((server_dir / "server.json").read_bytes()).hexdigest()
                 }}}}))
                 files.append(overlay)
             env.update(VPN_BIND="127.0.0.1", VPN_PORT="0", INGRESS_PATH="chain", INGRESS_BIND="0.0.0.0",
@@ -177,7 +219,7 @@ def service(root, job):
         command([*cmd, "up", "--pull", "never", "--no-build", "-d", "--wait", "--wait-timeout", "180"], env=env)
     if panel:
         return {"password_file": str(state / "admin-password")}
-    return {"config": config.read_text()}
+    return {"config": config.read_text(), "devices": devices}
 
 
 if __name__ == "__main__":

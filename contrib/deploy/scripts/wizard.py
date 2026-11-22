@@ -205,7 +205,7 @@ def prepare(host, dest, bundle, source, profile, ident, wireguard):
     job(host, dest, ident, action="images", profile=profile, bundle=location)
 
 
-def setup_vless(host, dest, ident, names):
+def setup_vless(host, dest, ident, names, panel_port=None):
     node = host.node
     mode = node["tls_mode"]
     # Keep the privileged helper in the login user's private installation
@@ -225,6 +225,8 @@ def setup_vless(host, dest, ident, names):
         email_file = remote + "/acme-contact"
         host.run("umask 077; cat > " + shlex.quote(email_file), input=(node["email"] + "\n").encode())
         args += ["--email-file", email_file, "--template", node["template"]]
+        if panel_port is not None:
+            args += ["--subscription-port", str(panel_port)]
         if node["template"] == "github":
             args += ["--github", node["github"]]
         for name in names:
@@ -332,7 +334,7 @@ def apply(spec, bundle):
             if h.node.get("tls_mode") and any(p["entry"] == i and p["protocol"] == "vless" for p in profiles):
                 names = [f"entry-{row['slot']}" for row in profiles
                          if row["entry"] == i and row["protocol"] == "vless"]
-                setup_vless(h, dest, ident, names)
+                setup_vless(h, dest, ident, names, spec["panel"] if i == spec["local"] else None)
         ui.stage(5, "Запуск VPN и проверка маршрутов")
         catalog = []
         for p in profiles:
@@ -352,20 +354,24 @@ def apply(spec, bundle):
                 for key, src in (("cert", "cert"), ("key", "keyfile")):
                     tls[key] = entry.run("cat -- " + shlex.quote(entry.node[src]), stdout=subprocess.PIPE).stdout.decode()
             pin(p["entry"])
-            cfg = job(entry, dest, ident, action="entry", name=f"entry-{slot}", host=endpoint,
+            issued = job(entry, dest, ident, action="entry", name=f"entry-{slot}", host=endpoint,
                       protocol=proto, native_port=port,
-                      port=port, uplink=uplink, **tls)["config"]
+                      port=port, uplink=uplink, **tls)
+            cfg = issued["config"]
             path = directory / f"{slot}-{proto}.{EXT[proto]}"
             atomic_write(path, cfg)
             catalog.append(dict(id=f"profile-{slot}", protocol=proto, entry=endpoint,
-                                exit=exit_host.node["host"], port=port, config=cfg))
+                                exit=exit_host.node["host"], port=port, config=cfg, devices=issued.get("devices", [])))
             print(f"{LABEL[proto]}    {endpoint}:{port} → {exit_host.node['host']}:{port}    {path}", flush=True)
         ui.stage(6, "Панель и клиентские профили")
         controller = hosts[spec["local"]]
         pin(spec["local"])
         password = job(controller, dest, ident, action="panel", name="panel", host=controller.node["host"],
                        native_port=spec["panel_native_port"],
-                       panel_port=spec["panel"], catalog=catalog)["password_file"]
+                       panel_port=spec["panel"], catalog=catalog,
+                       subscription_origin=("https://" + controller.node["tls_domain"]
+                         if controller.node.get("tls_mode") == "acme" and any(
+                             p["entry"] == spec["local"] and p["protocol"] == "vless" for p in profiles) else ""))["password_file"]
         spec["password_file"] = password
 
 
@@ -491,6 +497,8 @@ def main():
                (2, "Схема и этапы установки", "что понадобится и как пройдёт настройка")]
     if next(STATE.glob("*/plan.json"), None):
         choices.append((3, "Открыть панель", "команда SSH и путь к паролю"))
+    if next(STATE.glob("*/plan.json"), None) and not (STATE / "pending.json").exists():
+        choices.append((5, "Обновить установленную сеть", "применить этот выпуск к сохранённой установке"))
     if saved_paths():
         choices.append((4, "Редактировать сохранённый план", "исправить доступ или изменить состав VPS"))
     choices.append((0, "Выйти", ""))
@@ -498,7 +506,7 @@ def main():
         choice = ui.menu("Главное меню", choices, 1)
         if choice == 0:
             return
-        if choice == 1:
+        if choice in (1, 5):
             break
         if choice == 3:
             return open_saved()
@@ -516,7 +524,17 @@ def main():
     with locked_state():
         pending = STATE / "pending.json"
         ui.pending = pending
-        if pending.exists():
+        if choice == 5:
+            if pending.exists():
+                raise WizardError("Появился незавершённый план. Откройте его через «Установить» → «Продолжить».")
+            paths = sorted(STATE.glob("*/plan.json"))
+            saved = [normalize(json.loads(p.read_text())) for p in paths]
+            rows = [(i + 1, item["servers"][item["local"]]["host"], item["installation"]) for i, item in enumerate(saved)]
+            selected = ui.menu("Выберите сеть для обновления", rows + [(0, "Вернуться без обновления", "")], 1)
+            if not selected:
+                return
+            spec = saved[selected - 1]
+        elif pending.exists():
             previous = normalize(json.loads(pending.read_text()))
             resume = ui.menu("Найдена незавершённая установка", [
                 (1, "Продолжить", "использовать сохранённые узлы, профили и ключи"),

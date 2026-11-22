@@ -144,6 +144,19 @@ server {{
 """
     if tls:
         lineage = ACME / "live" / name
+        subscription = ""
+        if port := spec.get("subscription_port"):
+            if type(port) is not int or not 1 <= port <= 65535:
+                raise ValueError("Некорректный порт панели.")
+            subscription = f"""    location ~ "^/api/v1/vless-subscriptions/[A-Za-z0-9_-]{{43}}$" {{
+        access_log off;
+        error_log /dev/null;
+        limit_except GET {{ deny all; }}
+        proxy_pass http://127.0.0.1:{port};
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
+    }}
+"""
         http += f"""server {{
     {listener(443, " ssl")}
     server_name {domain};
@@ -152,7 +165,7 @@ server {{
     ssl_protocols TLSv1.2 TLSv1.3;
     root {docroot};
     index index.html;
-    location / {{ try_files $uri $uri/ =404; }}
+{subscription}    location / {{ try_files $uri $uri/ =404; }}
 }}
 """
     return http.encode()
@@ -279,7 +292,8 @@ def install(spec, email, template, github):
             if any(old[k] != spec[k] for k in ("owner", "domain", "installation")):
                 raise ValueError("У сайта другой владелец или идентификатор установки.")
         old_conf = conf.read_bytes() if conf.exists() else None
-        if conf.is_symlink() or old_conf not in (None, nginx_site(spec, False), nginx_site(spec, True)):
+        if conf.is_symlink() or old_conf not in (None, nginx_site(spec, False), nginx_site(spec, True),
+                nginx_site(old, True) if metadata.exists() else None):
             raise ValueError(f"Конфигурация {conf} изменена вручную. Проверьте её перед повторным запуском.")
         check_names(run("nginx", "-T", capture=True, stderr=subprocess.PIPE).stdout, domain, conf)
         trusted_directory(state, 0o700)
@@ -362,6 +376,7 @@ def main():
     email.add_argument("--email-file", type=Path)
     parser.add_argument("--template", choices=["studio", "journal", "github", "default"], required=True)
     parser.add_argument("--github", "--github-user", default="")
+    parser.add_argument("--subscription-port", type=int)
     parser.add_argument("--entry", action="append", required=True)
     args = parser.parse_args()
     domain = args.domain.lower()
@@ -369,7 +384,8 @@ def main():
     address = args.email if args.email is not None else args.email_file.read_text().strip()
     if len(address) > 254 or not re.fullmatch(r"[a-zA-Z0-9._+%-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,63}", address):
         raise ValueError("Введите контактный email для Let's Encrypt.")
-    install(dict(domain=domain, owner=args.owner, installation=args.installation, entries=sorted(set(args.entry))),
+    install(dict(domain=domain, owner=args.owner, installation=args.installation, entries=sorted(set(args.entry)),
+                 subscription_port=args.subscription_port),
             address, args.template, args.github)
 
 

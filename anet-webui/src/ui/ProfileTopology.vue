@@ -5,6 +5,7 @@ import { advanced } from '@/composables/operatorMode'
 import { GetUsers } from '@/api/users'
 import ProbeRevisionDialog from '@/components/ProbeRevisionDialog.vue'
 import StarterProfiles from '@/components/StarterProfiles.vue'
+import VlessRecipients from '@/components/VlessRecipients.vue'
 import { api } from '@/api/client'
 import type { Server } from '@/models/server'
 import type { ProbeEdge } from '@/api/probes'
@@ -205,6 +206,7 @@ onMounted(() => { load(); loadNodes(); loadReports(); searchUsers() })
 <template>
   <v-container>
     <h1>Профили и маршруты</h1>
+    <VlessRecipients />
     <StarterProfiles />
     <p v-if="saved">Опубликованная ревизия {{ saved.revision }}</p>
     <details :open="!!route.query.entry || !!route.query.exit || !Object.keys(activeProfiles).length">

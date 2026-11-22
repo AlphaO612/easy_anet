@@ -45,6 +45,42 @@ services:
     mem_limit: ${AUTH_MEMORY:-512m}
     cpus: ${AUTH_CPUS:-1}
     pids_limit: ${ANET_PIDS:-256}
+  vless-profiles:
+    image: ${WEBUI_IMAGE:?set WEBUI_IMAGE}
+    entrypoint: ["python3", "-B", "/usr/local/lib/anet/profile-service.py"]
+    command: []
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/http-health", "127.0.0.1:8093", "/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    networks: [control]
+    volumes:
+      - vless-data:/var/lib/anet-vless
+    pids_limit: 64
+    mem_limit: 96m
+  node-install:
+    image: ${WEBUI_IMAGE:?set WEBUI_IMAGE}
+    entrypoint: [python3, -B, /usr/local/lib/anet/node-install.py]
+    command: []
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    networks: [control, auth-egress]
+    mem_limit: 96m
+    pids_limit: 64
+    healthcheck:
+      test: [CMD, /usr/local/bin/http-health, "127.0.0.1:8092", /health]
+      interval: 10s
+      timeout: 3s
+      retries: 5
   webui:
     image: ${WEBUI_IMAGE:?set WEBUI_IMAGE}
     restart: unless-stopped
@@ -64,6 +100,7 @@ secrets:
     file: ${STATE_DIR:?set STATE_DIR}/db-password
 volumes:
   db-data: {}
+  vless-data: {}
 networks:
   database: {internal: true}
   panel: {}
