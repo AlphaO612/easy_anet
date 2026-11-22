@@ -75,7 +75,9 @@ CHECK
             }.items():
                 (root / name).write_text("#!/bin/sh\n" + body)
                 (root / name).chmod(0o700)
-            env = dict(os.environ, PATH=str(root)+":"+os.environ["PATH"], FIXTURE=tmp,
+            # The fixture installer does not parse TOML. Keep the test independent of host packages.
+            (root / "tomli.py").touch()
+            env = dict(os.environ, PYTHONPATH=tmp, PATH=str(root)+":"+os.environ["PATH"], FIXTURE=tmp,
                        XDG_CACHE_HOME=str(root / "cache"), SSL_CERT_FILE=str(root / "tls.pem"))
             payload = dict(host="node.example", port=4530, api=f"https://localhost:{server.server_port}/api/v1",
                            node_id="bf807d7b-4186-4a3d-a2cb-385fdc51d795", token="x"*43)
