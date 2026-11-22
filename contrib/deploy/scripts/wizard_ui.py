@@ -28,7 +28,7 @@ class Terminal:
 
     def screen(self, title, detail=""):
         rich = self.rich(sys.stdout)
-        width = min(66, shutil.get_terminal_size().columns)
+        width = min(66, shutil.get_terminal_size().columns or 80)
         if rich:
             # Clear the visible display only. Earlier stages stay in scrollback.
             print("\033[2J\033[H", end="")
