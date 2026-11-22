@@ -1,6 +1,6 @@
 # Установочный комплект ANet Easy
 
-**[Скачать ANet Easy для двух VPS (ZIP)](https://github.com/AlphaO612/easy_anet/releases/download/anet-easy-2026.11.23/anet-easy-linux-amd64.zip)** · [Контрольная сумма SHA-256](https://github.com/AlphaO612/easy_anet/releases/download/anet-easy-2026.11.23/SHA256SUMS) · [Страница выпуска](https://github.com/AlphaO612/easy_anet/releases/tag/anet-easy-2026.11.23)
+**[Скачать ANet Easy для двух VPS (ZIP)](https://github.com/AlphaO612/easy_anet/releases/latest/download/anet-easy-linux-amd64.zip)** · [Контрольная сумма SHA-256](https://github.com/AlphaO612/easy_anet/releases/latest/download/SHA256SUMS) · [Страница выпуска](https://github.com/AlphaO612/easy_anet/releases/latest)
 
 1. Скачайте ZIP **на компьютер** и распакуйте. Для серверов нужна Debian или Ubuntu на **amd64**.
 2. Откройте терминал в распакованной папке `anet-easy`.
@@ -20,3 +20,15 @@
 Скачайте `SHA256SUMS` рядом с ZIP. В Linux выполните `sha256sum -c SHA256SUMS`, в macOS — `shasum -a 256 -c SHA256SUMS`. В PowerShell выполните `Get-FileHash .\anet-easy-linux-amd64.zip -Algorithm SHA256` и сравните значение со строкой в `SHA256SUMS`.
 
 [Пошаговая инструкция с настройкой VPN и подключением к панели](../contrib/deploy/distribution/START-HERE.md)
+
+### Если комплект уже на VPS
+
+Откройте SSH-сеанс на первой VPS и перейдите в каталог со старым `images.tar` и `manifest.json`. Эта команда обновит только мастер и откроет сохранённый план:
+
+```sh
+curl --proto '=https' --proto-redir '=https' -fsSL https://github.com/AlphaO612/easy_anet/releases/latest/download/anet-easy-update.sh | bash
+```
+
+[Как исправить SSH-параметры или пропустить недоступную VPS](../contrib/deploy/distribution/START-HERE.md#ssh-остановился-на-этапе-36)
+
+Если требуется настроить только ключ root с компьютера, скачайте [помощник для Bash](https://github.com/AlphaO612/easy_anet/releases/latest/download/send-to-vps.sh) или [помощник для PowerShell](https://github.com/AlphaO612/easy_anet/releases/latest/download/send-to-vps.ps1) и запустите с `--key-only` или `-KeyOnly` соответственно.
