@@ -26,24 +26,31 @@ class Terminal:
     def accent(self, text):
         return f"\033[1;36m{text}\033[0m" if self.rich(sys.stdout) else text
 
-    def title(self):
-        title = "ANet  /  Установка VPN"
-        description = "Входы, выходы и панель на ваших VPS."
+    def screen(self, title, detail=""):
+        rich = self.rich(sys.stdout)
         width = min(66, shutil.get_terminal_size().columns)
-        if self.rich(sys.stdout) and width >= 16:
-            print(self.accent("╭" + "─" * (width - 2) + "╮"))
-            for content, highlight in ((title, True), (description, False)):
+        if rich:
+            # Clear the visible display only. Earlier stages stay in scrollback.
+            print("\033[2J\033[H", end="")
+        if rich and width >= 16:
+            border = "─" * (width - 2)
+            print(self.accent("╭" + border + "╮"))
+            for content in (title, detail):
                 for line in textwrap.wrap(content, width=width - 6):
                     inside = line.ljust(width - 6)
-                    print(self.accent("│") + "  " + (self.accent(inside) if highlight else inside) + "  " + self.accent("│"))
-            print(self.accent("╰" + "─" * (width - 2) + "╯"))
+                    print(self.accent("│") + "  " + inside + "  " + self.accent("│"))
+            print(self.accent("╰" + border + "╯"), flush=True)
         else:
-            print(title)
-            print(description)
+            print(title, flush=True)
+            if detail:
+                print(detail, flush=True)
+
+    def title(self):
+        self.screen("ANet  /  Установка VPN", "Входы, выходы и панель на ваших VPS.")
         print()
 
     def guide(self):
-        print("\n" + self.accent("Схема и этапы установки"))
+        self.screen("Схема и этапы установки")
         print("Клиент → входной VPS → по ANet на выходной VPS → интернет.")
         print("Клиент подключается по WireGuard, VLESS или ANet. Панель будет на текущем VPS.")
         print("\nЧто подготовить")
@@ -60,10 +67,13 @@ class Terminal:
 
     def stage(self, number, name):
         self.step = f"Этап {number}/6 · {name}"
-        print("\n" + self.accent(self.step), flush=True)
+        self.screen(self.step)
 
-    def menu(self, title, options, default):
-        print(title)
+    def menu(self, title, options, default, *, new_screen=True):
+        if new_screen and self.rich(sys.stdout):
+            self.screen(title, self.step or "ANet  /  Установка VPN")
+        else:
+            print(title)
         for value, label, detail in options:
             selected = value == default and self.rich(sys.stdout)
             heading = f"› {value}   {label}" if selected else f"  {value}   {label}"
