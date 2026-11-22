@@ -6,6 +6,12 @@ fail() { printf '%s\n' "$*" >&2; exit 1; }
 case "${1:-}" in ''|--stdin) ;; *) fail 'Использование: bash join-node.sh [--stdin]' ;; esac
 [[ $(uname -sm) = 'Linux x86_64' && -c /dev/net/tun ]] || fail 'Нужна Linux VPS на amd64 с /dev/net/tun.'
 for cmd in python3 curl flock; do command -v "$cmd" >/dev/null || fail "Установите $cmd и повторите запуск."; done
+# Keep the same rootless daemon and node identity when switching between SSH accounts or UI modes.
+if [[ $(id -u) != 0 ]]; then
+    if [[ ${1:-} = --stdin ]]; then exec sudo -n -H bash "$0" "$@"; fi
+    echo 'Введите пароль sudo для подготовки VPS. Сервер будет работать от пользователя anet-vpn.'
+    exec sudo -H bash "$0" "$@"
+fi
 stage=$(mktemp -d /tmp/anet-join.XXXXXXXX)
 trap 'rm -rf -- "$stage"' EXIT
 if [[ ${1:-} = --stdin ]]; then
@@ -43,19 +49,12 @@ tar -xzf "$stage/source.tar.gz" -C "$stage"
 deploy="$stage/contrib/deploy"
 echo '[2/4] Подготовка rootless Docker'
 if ! python3 -c 'import tomllib' 2>/dev/null && ! python3 -c 'import tomli' 2>/dev/null; then
-    privileged=()
-    if [[ $(id -u) != 0 ]]; then privileged=(sudo); fi
-    "${privileged[@]}" apt-get update
-    "${privileged[@]}" apt-get install -y python3-tomli
+    apt-get update
+    apt-get install -y python3-tomli
 fi
-run=()
-if [[ $(id -u) = 0 ]]; then
-    sh "$deploy/scripts/rootless-docker.sh" --wizard-user
-    uid=$(id -u anet-vpn)
-    run=(runuser -u anet-vpn -- env "HOME=$(getent passwd anet-vpn | cut -d: -f6)" "XDG_RUNTIME_DIR=/run/user/$uid" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus")
-else
-    sh "$deploy/scripts/rootless-docker.sh"
-fi
+sh "$deploy/scripts/rootless-docker.sh" --wizard-user
+uid=$(id -u anet-vpn)
+run=(runuser -u anet-vpn -- env "HOME=$(getent passwd anet-vpn | cut -d: -f6)" "XDG_RUNTIME_DIR=/run/user/$uid" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus")
 echo '[3/4] Подключение к панели'
 if [[ ${1:-} != --stdin ]]; then
     IFS= read -rs -p 'Вставьте код приглашения из панели и нажмите Enter: ' invitation </dev/tty
@@ -113,7 +112,7 @@ unset invitation
 node=$(cat "$stage/node")
 host=$(cat "$stage/host")
 port=$(cat "$stage/port")
-if [[ $(id -u) = 0 ]]; then chown -R anet-vpn: "$stage"; fi
+chown -R anet-vpn: "$stage"
 echo '[4/4] Обмен приглашения и запуск сервера'
 "${run[@]}" env VPN_PORT="$port" COMPOSE_PROJECT_NAME="anet-node-$node" bash -c '
     exec sh "$1/contrib/deploy/install.sh" --profile standalone --bundle "$1" --host "$2" \

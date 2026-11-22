@@ -71,7 +71,10 @@ CHECK
             (root / "SHA256SUMS").write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n")
             for name, body in {
                     "curl": 'until [ "$1" = -o ]; do shift; done\ncp "$FIXTURE/${4##*/}" "$2"',
-                    "id": 'echo 1000',
+                    "id": 'if [ "$#" = 1 ]; then echo 0; else echo 1000; fi',
+                    "getent": 'printf "anet-vpn:x:1000:1000::%s:/bin/bash\\n" "$FIXTURE"',
+                    "chown": 'exit 0',
+                    "runuser": 'test "$1 $2 $3" = "-u anet-vpn --" || exit 1; shift 3; exec "$@"',
             }.items():
                 (root / name).write_text("#!/bin/sh\n" + body)
                 (root / name).chmod(0o700)
