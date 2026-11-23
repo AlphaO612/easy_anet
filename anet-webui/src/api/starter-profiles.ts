@@ -5,6 +5,7 @@ export interface StarterProfile {
   id: string
   entry: string
   exit: string
+  exit_public_key?: string
   protocol: 'wireguard' | 'anet' | 'vless'
   port: number
 }

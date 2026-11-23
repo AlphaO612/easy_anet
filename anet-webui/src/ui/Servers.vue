@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { advanced } from '@/composables/operatorMode'
+import { getStarterProfiles, type StarterProfile } from '@/api/starter-profiles'
 import { GetServers } from '@/api/servers'
 import type { Server } from '@/models/server'
 import ServerModal from '@/components/ServerModal.vue'
@@ -23,6 +24,21 @@ const probeNode = ref<Server | null>(null)
 const data = ref<Server[]>([])
 const loading = ref(false)
 const searchQuery = ref('')
+const starter = ref<StarterProfile[]>([])
+const loadError = ref('')
+const inventoryError = ref('')
+
+function matchesExit(server: Server, profile: StarterProfile) {
+  return profile.exit_public_key ? server.public_key === profile.exit_public_key
+    : server.address.toLowerCase() === profile.exit.toLowerCase() && server.quic_port === profile.port
+}
+const exitIds = computed(() => new Set(data.value.filter(server =>
+  starter.value.some(profile => matchesExit(server, profile))).map(server => server.id)))
+const plannedExits = computed(() => starter.value.filter(profile =>
+  !data.value.some(server => matchesExit(server, profile))))
+function endpoint(host: string, port: number) {
+  return (host.includes(':') ? `[${host}]` : host) + ':' + port
+}
 
 // Управление модалками
 const showCreateModal = ref(false)
@@ -54,7 +70,11 @@ const formatUptime = (seconds?: number) => {
 const loadServers = async () => {
   loading.value = true
   try {
-    data.value = await GetServers()
+    const [servers, profiles] = await Promise.allSettled([GetServers(), getStarterProfiles()])
+    if (servers.status === 'fulfilled') data.value = servers.value
+    loadError.value = servers.status === 'rejected' ? 'Не удалось обновить список серверов.' : ''
+    if (profiles.status === 'fulfilled') starter.value = profiles.value
+    inventoryError.value = profiles.status === 'rejected' ? 'Не удалось прочитать список выходов из плана установки.' : ''
   } finally {
     loading.value = false
   }
@@ -114,6 +134,7 @@ onBeforeUnmount(() => {
       </v-btn>
     </div>
 
+    <v-alert v-if="loadError || inventoryError" type="warning" class="mb-3">{{ loadError || inventoryError }}</v-alert>
     <v-alert v-if="exportError" type="error">{{ exportError }}</v-alert>
     <v-data-table
       :headers="advanced ? headers : headers.filter(h => ['name', 'address', 'runtime.status', 'actions'].includes(h.key))"
@@ -132,10 +153,12 @@ onBeforeUnmount(() => {
     >
       <template #item.name="{ item }">
         <span class="font-weight-bold">{{ item.name }}</span>
+        <div v-if="exitIds.has(item.id)" class="text-caption">Выход по плану установки</div>
       </template>
 
       <template #item.address="{ item }">
-        <code class="font-weight-medium text-primary">{{ item.address }}</code>
+        <code class="font-weight-medium text-primary">{{ item.quic_port ? endpoint(item.address, item.quic_port) : item.address }}</code>
+        <div v-if="item.quic_port" class="text-caption">ANet · UDP</div>
       </template>
 
       <template #item.is_active="{ item }">
@@ -147,7 +170,7 @@ onBeforeUnmount(() => {
       <template #item.runtime.status="{ item }">
         <div class="d-flex flex-column align-center ga-1">
           <v-chip :color="!item.runtime ? 'default' : item.runtime.status === 'online' ? 'success' : 'error'" size="small">
-            {{ !item.runtime ? 'Нет отчёта' : item.runtime.status === 'online' ? 'На связи' : 'Связь потеряна' }}
+            {{ !item.runtime ? 'Нет телеметрии' : item.runtime.status === 'online' ? 'На связи' : 'Связь потеряна' }}
           </v-chip>
           <div v-if="item.runtime" class="text-caption text-medium-emphasis">v{{ item.runtime.version }}</div>
         </div>
@@ -161,7 +184,7 @@ onBeforeUnmount(() => {
 
       <template #item.runtime.active_connections="{ item }">
         <v-chip size="small" variant="tonal" color="success" prepend-icon="mdi-account-multiple">
-          {{ item.runtime?.active_connections ?? 0 }}
+          {{ item.runtime?.active_connections ?? '—' }}
         </v-chip>
       </template>
 
@@ -191,6 +214,17 @@ onBeforeUnmount(() => {
         </div>
       </template>
     </v-data-table>
+    <v-card v-if="plannedExits.length && !loadError" title="Выходы из сохранённого плана" variant="outlined" class="mt-4">
+      <v-card-text>
+        <p class="mb-2">Эти маршруты записаны мастером. Повторно примените сохранённый план в обновлённом мастере, чтобы добавить выходы в список серверов по их публичным ключам.</p>
+        <v-table density="compact">
+          <thead><tr><th>Вход</th><th>Выход · UDP</th><th>Профиль</th></tr></thead>
+          <tbody><tr v-for="profile in plannedExits" :key="profile.id">
+            <td>{{ profile.entry }}</td><td>{{ endpoint(profile.exit, profile.port) }}</td><td>{{ profile.id }} · {{ profile.protocol }}</td>
+          </tr></tbody>
+        </v-table>
+      </v-card-text>
+    </v-card>
 
     <ProbeRevisionDialog v-if="probeNode" :key="probeNode.id" :server="probeNode" :servers="data" @close="probeNode = null" />
     <CreateServerModal

@@ -130,7 +130,7 @@ class PlanEditor(unittest.TestCase):
             def run(self, cmd, **opts):
                 if "input" in opts:
                     jobs.append(json.loads(opts["input"]))
-                    output = b'{"config":"fixture","password_file":"/test/password"}'
+                    output = b'{"config":"fixture","public_key":"public-fixture","password_file":"/test/password"}'
                 else:
                     output = self.node["host"].encode()
                 return subprocess.CompletedProcess([], 0, output)
@@ -148,6 +148,9 @@ class PlanEditor(unittest.TestCase):
         self.assertEqual([j["name"] for j in jobs], ["exit-2", "entry-2", "panel"])
         self.assertEqual([j["native_port"] for j in jobs], [44000, 44000, 45000])
         self.assertEqual(jobs[-1]["catalog"][0]["id"], "profile-2")
+        self.assertEqual(jobs[-1]["catalog"][0]["exit_public_key"], "public-fixture")
+        self.assertEqual(jobs[-1]["exits"], [dict(address="east.test", quic_port=44000, ssh_port=22,
+                                                  ssh_user="deploy", public_key="public-fixture")])
 
 
 if __name__ == "__main__":

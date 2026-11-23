@@ -151,7 +151,7 @@ class Host:
 def sources(out):
     # Only runtime code distributed by this release may cross to another VPS.
     names = ["deploy/scripts/" + x for x in (
-        "wizard_node.py", "wizard_tls.py", "bundle.py", "release.py", "topology.py", "init-state.py",
+        "wizard_node.py", "wizard_inventory.py", "wizard_tls.py", "bundle.py", "release.py", "topology.py", "init-state.py",
         "register-local-node.py", "init-probe-signing.py")]
     names += ["deploy/compose/" + x for x in ("compose.yaml", "chain.yaml", "webui.yaml", "probe-management.yaml")]
     names += ["chain/issue-ingress.py", "chain/ingress.yaml"]
@@ -337,14 +337,18 @@ def apply(spec, bundle):
                 setup_vless(h, dest, ident, names, spec["panel"] if i == spec["local"] else None)
         ui.stage(5, "Запуск VPN и проверка маршрутов")
         catalog = []
+        exits = []
         for p in profiles:
             slot = p["slot"]
             entry, exit_host = hosts[p["entry"]], hosts[p["exit"]]
             port = spec["base"] + slot - 1
             proto = p["protocol"]
             pin(p["exit"])
-            uplink = job(exit_host, dest, ident, action="exit", name=f"exit-{slot}",
-                         native_port=port, host=exit_host.node["host"])["config"]
+            exit_result = job(exit_host, dest, ident, action="exit", name=f"exit-{slot}",
+                         native_port=port, host=exit_host.node["host"])
+            uplink = exit_result["config"]
+            exits.append(dict(address=exit_host.node["host"], quic_port=port, public_key=exit_result["public_key"],
+                              ssh_port=exit_host.node["port"], ssh_user=exit_host.node["user"]))
             tls = {}
             endpoint = entry.node.get("tls_domain", entry.node["host"]) if proto == "vless" else entry.node["host"]
             if proto == "vless" and entry.node.get("tls_mode"):
@@ -361,14 +365,14 @@ def apply(spec, bundle):
             path = directory / f"{slot}-{proto}.{EXT[proto]}"
             atomic_write(path, cfg)
             catalog.append(dict(id=f"profile-{slot}", protocol=proto, entry=endpoint,
-                                exit=exit_host.node["host"], port=port, config=cfg, devices=issued.get("devices", [])))
+                                exit=exit_host.node["host"], exit_public_key=exit_result["public_key"], port=port, config=cfg, devices=issued.get("devices", [])))
             print(f"{LABEL[proto]}    {endpoint}:{port} → {exit_host.node['host']}:{port}    {path}", flush=True)
         ui.stage(6, "Панель и клиентские профили")
         controller = hosts[spec["local"]]
         pin(spec["local"])
         password = job(controller, dest, ident, action="panel", name="panel", host=controller.node["host"],
                        native_port=spec["panel_native_port"],
-                       panel_port=spec["panel"], catalog=catalog,
+                       panel_port=spec["panel"], catalog=catalog, exits=exits,
                        subscription_origin=("https://" + controller.node["tls_domain"]
                          if controller.node.get("tls_mode") == "acme" and any(
                              p["entry"] == spec["local"] and p["protocol"] == "vless" for p in profiles) else ""))["password_file"]

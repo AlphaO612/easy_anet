@@ -146,6 +146,7 @@ def failure_hint(output, fallback):
     # profile contents. Display only recognized causes and a fixed next action.
     data = output.lower()
     causes = [
+        (b"conflicting exit identity", "В панели уже есть другая запись для этого выхода. Сверьте адрес, UDP-порт и публичный ключ в разделе «Серверы», затем повторите применение плана."),
         (b"vless tls handshake failed", "Проверьте домен VLESS, срок действия, цепочку и сертификат на VPN-порту."),
         (b"no space left", "Освободите место для архива и образов Docker."),
         (b"permission denied", "Проверьте права пользователя SSH на каталог установки и доступ к Docker."),

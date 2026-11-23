@@ -14,6 +14,7 @@ import uuid
 
 from bundle import load_bundle
 from topology import atomic_write
+from wizard_inventory import sync_exits
 from wizard_tls import verify_listener
 
 HERE = Path(__file__).resolve().parent
@@ -61,7 +62,10 @@ def publish_catalog(directory, rows):
         path = files / (row["id"] + "." + ext)
         atomic_write(path, row["config"])
         path.chmod(0o444)
-        index.append({key: row[key] for key in ("id", "protocol", "entry", "exit", "port")})
+        item = {key: row[key] for key in ("id", "protocol", "entry", "exit", "port")}
+        if row.get("exit_public_key"):
+            item["exit_public_key"] = row["exit_public_key"]
+        index.append(item)
     atomic_write(catalog / "index.json", json.dumps(index))
     (catalog / "index.json").chmod(0o444)
     return catalog
@@ -217,7 +221,10 @@ def service(root, job):
             raise ValueError("Вход запущен, но связь или входной протокол не готовы. Проверьте UDP-порт выхода и журналы Compose.")
     else:
         command([*cmd, "up", "--pull", "never", "--no-build", "-d", "--wait", "--wait-timeout", "180"], env=env)
+    if action == "exit":
+        return {"config": config.read_text(), "public_key": (state / "server-public-key").read_text().strip()}
     if panel:
+        sync_exits(cmd, env, job.get("exits", []))
         return {"password_file": str(state / "admin-password")}
     return {"config": config.read_text(), "devices": devices}
 
