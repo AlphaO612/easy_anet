@@ -12,6 +12,9 @@ import tempfile
 import time
 import uuid
 
+import vless_meter
+from urllib.parse import urlsplit
+
 from bundle import load_bundle
 from topology import atomic_write
 from wizard_inventory import sync_exits
@@ -80,16 +83,16 @@ def vless_devices(server_dir):
     prefix = "anet-device-"
     by_email = {item.get("email"): item["id"] for item in clients}
     devices = []
-    changed = False
+    before = json.dumps(config)
+    vless_meter.configure(config, clients)
     for slot in range(128):
         email = f"{prefix}{slot}@anet.invalid"
         device = by_email.get(email)
         if device is None:
             device = str(uuid.uuid4())
             clients.append({"id": device, "email": email})
-            changed = True
         devices.append(device)
-    if changed:
+    if json.dumps(config) != before:
         atomic_write(path, json.dumps(config))
     return devices
 
@@ -98,7 +101,7 @@ def publish_device_catalog(directory, rows, origin):
     catalog = directory / "vless-catalog"
     catalog.mkdir(exist_ok=True)
     catalog.chmod(0o755)
-    routes = {row["id"]: {k: row[k] for k in ("entry", "exit", "port", "devices")}
+    routes = {row["id"]: {k: row[k] for k in ("entry", "exit", "port", "devices", "usage") if k in row}
               for row in rows if row.get("devices")}
     path = catalog / "index.json"
     atomic_write(path, json.dumps({"origin": origin, "routes": routes}))
@@ -173,7 +176,7 @@ def service(root, job):
                 atomic_write(overlay, json.dumps({"services": {"ingress": {"labels": {
                     "anet.tls.chain": hashlib.sha256(cert.encode()).hexdigest(),
                     "anet.vless.clients": hashlib.sha256((server_dir / "server.json").read_bytes()).hexdigest()
-                }}}}))
+                }, "tmpfs": ["/anet-usage:size=64k,uid=17777,gid=17777,mode=0700,noexec,nosuid,nodev"]}}}))
                 files.append(overlay)
             env.update(VPN_BIND="127.0.0.1", VPN_PORT="0", INGRESS_PATH="chain", INGRESS_BIND="0.0.0.0",
                        INGRESS_PORT=str(job["port"]), INGRESS_PROTOCOL=protocol,
@@ -226,7 +229,11 @@ def service(root, job):
     if panel:
         sync_exits(cmd, env, job.get("exits", []))
         return {"password_file": str(state / "admin-password")}
-    return {"config": config.read_text(), "devices": devices}
+    result = {"config": config.read_text(), "devices": devices}
+    if devices:
+        starter = urlsplit(result["config"].strip()).username
+        result["usage"] = vless_meter.install(directory, project, job.get("usage_endpoint", ""), starter, devices)
+    return result
 
 
 if __name__ == "__main__":
