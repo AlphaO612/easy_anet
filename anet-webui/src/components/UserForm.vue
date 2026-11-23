@@ -22,6 +22,7 @@ const props = defineProps<{
   creating?: boolean
 }>()
 
+const emit = defineEmits<{ (event: 'submit'): void }>()
 const availableServers = ref<Server[]>([])
 const availablePools = ref<NodePool[]>([])
 const availableRouteMaps = ref<RouteMap[]>([])
@@ -75,10 +76,12 @@ onMounted(async () => {
 </script>
 
 <template>
-  <v-form v-model="valid" @submit.prevent>
+  <v-form v-model="valid" @submit.prevent="emit('submit')">
     <!-- UID (editable) -->
-    <v-text-field v-model="user.uid" label="UID" :rules="uidRules" counter="64" class="mb-3" />
+    <v-text-field v-model="user.uid" label="Имя пользователя" maxlength="64" :rules="uidRules" counter="64" class="mb-3" />
 
+    <details :open="!props.creating">
+      <summary v-if="props.creating" class="mb-3">Группа и маршруты ANet (необязательно)</summary>
     <!-- Выбор группы (Тарифа) -->
     <v-select
         v-model="user.group_id"
@@ -126,6 +129,7 @@ onMounted(async () => {
         placeholder="Выберите сервера для этого пользователя"
     />
 
+    </details>
     <template v-if="!props.creating">
       <v-divider class="my-4" />
 

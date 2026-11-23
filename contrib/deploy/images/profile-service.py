@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import time
 from urllib.parse import quote, urlsplit
 import uuid
 
@@ -30,9 +31,17 @@ def digest(value):
 
 def read_catalog():
     try:
-        return json.loads(CATALOG.read_text())
+        catalog = json.loads(CATALOG.read_text())
     except FileNotFoundError:
-        return {"origin": "", "routes": {}}
+        catalog = {"origin": "", "routes": {}}
+    try:
+        # A separately exposed subscription host also works when the panel is on an exit VPS.
+        explicit = CATALOG.with_name("subscription-origin").read_text().strip()
+        if explicit:
+            catalog["origin"] = explicit
+    except FileNotFoundError:
+        pass
+    return catalog
 
 
 def connect():
@@ -48,11 +57,57 @@ def init():
             CREATE TABLE IF NOT EXISTS recipients (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, token_hash TEXT UNIQUE
             );
+            CREATE TABLE IF NOT EXISTS account_links (
+                user_id TEXT PRIMARY KEY, recipient TEXT NOT NULL UNIQUE REFERENCES recipients(id)
+            );
+            CREATE TABLE IF NOT EXISTS traffic (
+                credential TEXT NOT NULL, source TEXT NOT NULL, upload INTEGER NOT NULL, download INTEGER NOT NULL,
+                PRIMARY KEY(credential,source)
+            );
+            CREATE TABLE IF NOT EXISTS traffic_reports (catalog TEXT PRIMARY KEY, received INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS devices (
                 credential_hash TEXT PRIMARY KEY, recipient TEXT NOT NULL, route TEXT NOT NULL, name TEXT NOT NULL,
                 UNIQUE(recipient, route, name)
             );
         """)
+
+
+def report_route(route_id, token):
+    route = read_catalog()["routes"].get(route_id)
+    meter = route.get("usage", {}) if route else {}
+    if not TOKEN.fullmatch(token) or not secrets.compare_digest(meter.get("token_hash", ""), digest(token)):
+        raise Problem(403, "Ключ сбора трафика не принят.")
+    return route
+
+
+def record_usage(db, route, report):
+    meter = route["usage"]
+    if report.get("catalog") != meter["catalog"]:
+        raise Problem(409, "Каталог входа изменился. Примените план в мастере.")
+    source, totals = report.get("source"), report.get("totals")
+    if not isinstance(source, str) or not re.fullmatch(r"[a-f0-9]{32}", source) or not isinstance(totals, dict) or len(totals) > 129:
+        raise Problem(400, "Некорректный отчёт Xray.")
+    keys = {str(slot): digest(key) for slot, key in enumerate(route["devices"])}
+    keys["starter"] = meter["starter_hash"]
+    records = []
+    for slot, pair in totals.items():
+        if slot not in keys or not isinstance(pair, list) or len(pair) != 2 or any(type(n) != int or not 0 <= n < 2**60 for n in pair):
+            raise Problem(400, "Некорректный счётчик Xray.")
+        records.append((keys[slot], source, *pair))
+    db.executemany("""INSERT INTO traffic VALUES(?,?,?,?)
+        ON CONFLICT(credential,source) DO UPDATE SET
+        upload=max(upload,excluded.upload), download=max(download,excluded.download)""", records)
+    db.execute("INSERT OR REPLACE INTO traffic_reports(catalog,received) VALUES(?,?)", (meter["catalog"], int(time.time())))
+    return {}
+
+
+def traffic_for(db, route, credential):
+    meter = (route or {}).get("usage", {})
+    seen = db.execute("SELECT received FROM traffic_reports WHERE catalog=?", (meter.get("catalog"),)).fetchone()
+    if not seen:
+        return None
+    amounts = db.execute("SELECT upload, download FROM traffic WHERE credential=?", (credential,)).fetchall()
+    return {"upload": sum(r[0] for r in amounts), "download": sum(r[1] for r in amounts), "updated": seen[0]}
 
 
 def text_field(body, field):
@@ -74,8 +129,54 @@ def device_rows(db, group, catalog):
         if route and key:
             host, port = route["entry"], route["port"]
             uri = f"vless://{key}@{host}:{port}?encryption=none&security=tls&type=tcp&sni={host}#{quote(row['name'], safe='')}"
-        result.append({"name": row["name"], "route": row["route"], "uri": uri})
+        result.append({"name": row["name"], "route": row["route"], "uri": uri,
+                       "traffic": traffic_for(db, route, row["credential_hash"])})
     return result
+
+
+def account_exists(user_id):
+    # The existing auth service checks is_active before returning its QR landing page.
+    # Only the HTTP status is needed. No admin credential is stored for subscription reads.
+    connection = http.client.HTTPConnection("auth", 3000, timeout=5)
+    try:
+        connection.request("GET", "/api/v1/config/qr/" + user_id)
+        status = connection.getresponse().status
+    finally:
+        connection.close()
+    if status not in (200, 404):
+        raise Problem(503, "Не удалось проверить состояние пользователя.")
+    return status == 200
+
+
+def connect_account(db, body):
+    value = body.get("user_id")
+    try:
+        user_id = str(uuid.UUID(value)) if isinstance(value, str) else None
+    except ValueError:
+        user_id = None
+    if not user_id or not account_exists(user_id):
+        raise Problem(400, "Выберите действующего пользователя из панели.")
+    legacy = body.get("recipient")
+    if legacy is not None and (not isinstance(legacy, str) or not re.fullmatch(r"[a-f0-9]{32}", legacy)):
+        raise Problem(400, "Выберите прежнего получателя.")
+    db.execute("BEGIN IMMEDIATE")
+    linked = db.execute("SELECT recipient FROM account_links WHERE user_id=?", (user_id,)).fetchone()
+    if linked:
+        if legacy and legacy != linked[0]:
+            raise Problem(409, "У пользователя уже есть отдельный набор профилей.")
+        return {"id": linked[0]}
+    if legacy:
+        if not db.execute("SELECT id FROM recipients WHERE id=?", (legacy,)).fetchone():
+            raise Problem(404, "Прежний получатель не найден.")
+        if db.execute("SELECT user_id FROM account_links WHERE recipient=?", (legacy,)).fetchone():
+            raise Problem(409, "Этот набор уже привязан к пользователю.")
+        group = legacy
+    else:
+        group = uuid.uuid4().hex
+        # Older releases have a UNIQUE name column. Keep the internal key independent of the display name.
+        db.execute("INSERT INTO recipients(id,name) VALUES(?,?)", (group, "\x01" + group))
+    db.execute("INSERT INTO account_links(user_id, recipient) VALUES(?,?)", (user_id, group))
+    return {"id": group}
 
 
 def dispatch(db, method, path, body):
@@ -84,8 +185,9 @@ def dispatch(db, method, path, body):
         token = path[len(PUBLIC):]
         if method != "GET" or not TOKEN.fullmatch(token):
             raise Problem(404, "Ссылка недействительна.")
-        group = db.execute("SELECT id FROM recipients WHERE token_hash=?", (digest(token),)).fetchone()
-        if not group:
+        group = db.execute("""SELECT id, user_id FROM recipients LEFT JOIN account_links
+            ON recipient=id WHERE token_hash=?""", (digest(token),)).fetchone()
+        if not group or (group["user_id"] and not account_exists(group["user_id"])):
             raise Problem(404, "Ссылка недействительна.")
         configs = [d["uri"] for d in device_rows(db, group["id"], catalog) if d["uri"]]
         if not configs:
@@ -93,27 +195,28 @@ def dispatch(db, method, path, body):
         return base64.b64encode(("\n".join(configs) + "\n").encode())
     if path == ADMIN:
         if method == "GET":
-            routes = [{"id": k, "entry": r["entry"], "exit": r["exit"], "port": r["port"]}
+            routes = [{"id": k, "entry": r["entry"], "exit": r["exit"], "port": r["port"],
+                       "starter_traffic": traffic_for(db, r, r.get("usage", {}).get("starter_hash"))}
                       for k, r in catalog["routes"].items()]
             groups = [dict(row) for row in db.execute(
-                "SELECT id, name, token_hash IS NOT NULL AS subscribed FROM recipients ORDER BY name")]
+                """SELECT id, CASE WHEN user_id IS NULL THEN name ELSE '' END AS name, user_id,
+                   token_hash IS NOT NULL AS subscribed FROM recipients LEFT JOIN account_links
+                   ON recipient=id ORDER BY name""")]
             return {"groups": groups, "routes": routes, "origin": catalog.get("origin", "")}
         if method == "POST":
-            name = text_field(body, "name")
-            group = uuid.uuid4().hex
-            try:
-                db.execute("INSERT INTO recipients(id,name) VALUES(?,?)", (group, name))
-            except sqlite3.IntegrityError:
-                raise Problem(409, "Получатель с таким именем уже существует.") from None
-            return {"id": group}
+            return connect_account(db, body)
     match = re.fullmatch(re.escape(ADMIN) + r"/([a-f0-9]{32})/(profiles|token)", path)
     if not match:
         raise Problem(404, "Адрес не найден.")
     group, action = match.groups()
+    record = db.execute("""SELECT id, user_id FROM recipients LEFT JOIN account_links
+        ON recipient=id WHERE id=?""", (group,)).fetchone()
+    if not record:
+        raise Problem(404, "Получатель не найден.")
+    if method == "POST" and (not record["user_id"] or not account_exists(record["user_id"])):
+        raise Problem(409, "Сначала привяжите набор к действующему пользователю.")
     if method != "GET":
         db.execute("BEGIN IMMEDIATE")
-    if not db.execute("SELECT id FROM recipients WHERE id=?", (group,)).fetchone():
-        raise Problem(404, "Получатель не найден.")
     if action == "profiles":
         if method == "GET":
             return device_rows(db, group, catalog)
@@ -174,12 +277,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            if not path.startswith(PUBLIC):
+            report = re.fullmatch(r"/api/v1/vless-usage/(profile-[1-9][0-9]*)", path)
+            if report:
+                if self.command != "POST":
+                    raise Problem(405, "Нужен POST.")
+                route = report_route(report[1], self.headers.get("X-Usage-Token", ""))
+            elif not path.startswith(PUBLIC):
                 authenticate(self.headers.get("Authorization", ""))
             body = {}
             if self.command == "POST":
                 length = int(self.headers.get("Content-Length", "0"))
-                if not 0 <= length <= 2048:
+                if not 0 <= length <= (12288 if report else 2048):
                     raise Problem(413, "Слишком большой запрос.")
                 raw = self.rfile.read(length)
                 body = json.loads(raw) if raw else {}
@@ -188,7 +296,7 @@ class Handler(BaseHTTPRequestHandler):
             db = connect()
             try:
                 with db:
-                    result = dispatch(db, self.command, path, body)
+                    result = record_usage(db, route, body) if report else dispatch(db, self.command, path, body)
             finally:
                 db.close()
             status = 200

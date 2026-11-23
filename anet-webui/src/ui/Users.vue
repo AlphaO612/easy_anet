@@ -10,6 +10,8 @@ import CreateUserModal from '@/components/CreateUserModal.vue'
 
 const data = ref<UsersResponse | null>(null)
 const loading = ref(false)
+const error = ref('')
+let request = 0
 const searchQuery = ref('')
 const selectedGroupIds = ref<string[]>([])
 const groups = ref<UserGroup[]>([])
@@ -43,15 +45,20 @@ const loadUsers = async (
     groupIds = selectedGroupIds.value,
     sortBy = options.value.sortBy
 ) => {
+  const current = ++request
   loading.value = true
+  error.value = ''
   try {
     const offset = (page - 1) * itemsPerPage
     const sortField = sortBy[0]?.key // Извлекаем поле сортировки
     const isDesc = sortBy[0]?.order === 'desc' // Извлекаем направление
 
-    data.value = await GetUsers(offset, itemsPerPage, search, groupIds, sortField, isDesc)
+    const response = await GetUsers(offset, itemsPerPage, search, groupIds, sortField, isDesc)
+    if (current === request) data.value = response
+  } catch {
+    if (current === request) error.value = 'Не удалось загрузить пользователей.'
   } finally {
-    loading.value = false
+    if (current === request) loading.value = false
   }
 }
 
@@ -96,6 +103,12 @@ const closeModal = () => {
   selectedUserId.value = ''
 }
 
+async function createdUser(user: Pick<User, 'id' | 'uid'>) {
+  searchQuery.value = user.uid
+  selectedGroupIds.value = []
+  options.value.page = 1
+  await loadUsers()
+}
 onMounted(() => {
   loadGroupDictionary()
   loadUsers()
@@ -151,6 +164,7 @@ onMounted(() => {
       </v-btn>
     </div>
 
+    <v-alert v-if="error" type="error" variant="tonal">{{ error }} <v-btn variant="text" @click="loadUsers()">Повторить</v-btn></v-alert>
     <v-data-table-server
       v-model:items-per-page="options.itemsPerPage"
       v-model:page="options.page"
@@ -196,6 +210,7 @@ onMounted(() => {
 
       <template #item.actions="{ item }">
         <div class="d-flex ga-1 justify-center flex-nowrap" @click.stop>
+          <v-btn :to="{ path: '/profile-topology', query: { user: item.id } }" variant="tonal" size="small">VLESS</v-btn>
           <v-btn
             icon="mdi-pencil"
             size="small"
@@ -214,7 +229,7 @@ onMounted(() => {
       @close="closeModal"
     />
 
-    <CreateUserModal v-model="showCreate" @created="loadUsers" />
+    <CreateUserModal v-model="showCreate" @created="createdUser" />
   </v-container>
 </template>
 

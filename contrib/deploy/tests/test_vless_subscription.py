@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -42,7 +43,8 @@ class Devices(unittest.TestCase):
         with mock.patch.object(service, "os") as os_mock:
             with mock.patch.object(service, "DB", root / "state.sqlite"):
                 service.init()
-        self.patches = [mock.patch.object(service, "DB", root / "state.sqlite"),
+        self.user_ids = {str(uuid.uuid4()) for _ in range(2)}
+        self.patches = [mock.patch.object(service, "account_exists", side_effect=lambda user_id: user_id in self.user_ids),mock.patch.object(service, "DB", root / "state.sqlite"),
                         mock.patch.object(service, "CATALOG", catalog / "index.json"),
                         mock.patch.object(service, "authenticate", side_effect=self.auth)]
         for patch in self.patches:
@@ -72,7 +74,8 @@ class Devices(unittest.TestCase):
     def test_groups_devices_scope_and_rotation(self):
         a = service.ADMIN
         self.assertFalse(any(k in json.dumps(self.request(a)) for k in self.ids))
-        users = [self.request(a, "POST", {"name": n})["id"] for n in ("Алиса", "Борис")]
+        ids = sorted(self.user_ids)
+        users = [self.request(a, "POST", {"user_id": user})["id"] for user in ids]
         def issue(user):
             return self.request(a + "/" + user + "/profiles", "POST", {"name": "Телефон", "route": "profile-1"})[0]["uri"]
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -82,6 +85,11 @@ class Devices(unittest.TestCase):
         token_endpoint = a + "/" + users[0] + "/token"
         path = self.request(token_endpoint, "POST")["path"]
         self.assertEqual(self.request(path, admin=False).strip(), first)
+        self.user_ids.remove(ids[0])
+        with self.assertRaises(HTTPError) as disabled:
+            self.request(path, admin=False)
+        self.assertEqual(disabled.exception.code, 404)
+        self.user_ids.add(ids[0])
         self.request(a + "/" + users[0] + "/profiles", "POST", {"name": "Ноутбук", "route": "profile-1"})
         active = self.request(path, admin=False)
         self.assertIn(first, active)
@@ -101,6 +109,34 @@ class Devices(unittest.TestCase):
         on_disk = service.DB.read_bytes()
         self.assertNotIn(path.split("/")[-1].encode(), on_disk)
         self.assertFalse(any(k.encode() in on_disk for k in self.ids))
+
+    def test_explicit_legacy_binding_and_separate_origin(self):
+        destination = "a" * 32
+        previous_token = "a" * 43
+        user = next(iter(self.user_ids))
+        with service.connect() as db:
+            db.execute("INSERT INTO recipients VALUES(?,?,?)", (destination, "Анна", service.digest(previous_token)))
+            db.execute("INSERT INTO devices VALUES(?,?,?,?)", (service.digest(self.ids[0]), destination, "profile-1", "Телефон"))
+        service.CATALOG.with_name("subscription-origin").write_text("https://subscriptions.example.test\n")
+        inventory = self.request(service.ADMIN)
+        self.assertEqual(inventory["origin"], "https://subscriptions.example.test")
+        self.assertIsNone(inventory["groups"][0]["user_id"])
+        with self.assertRaises(HTTPError) as missing:
+            self.request(service.ADMIN, "POST", {"user_id": str(uuid.uuid4())})
+        self.assertEqual(missing.exception.code, 400)
+        assigned = self.request(service.ADMIN, "POST", {"user_id": user, "recipient": destination})["id"]
+        self.assertEqual(assigned, destination)
+        self.assertEqual(self.request(service.ADMIN, "POST", {"user_id": user})["id"], destination)
+        self.assertEqual(self.request(service.ADMIN)["groups"][0]["user_id"], user)
+        self.assertIn(self.ids[0], self.request(service.PUBLIC + previous_token, admin=False))
+        other = next(i for i in self.user_ids if i != user)
+        with self.assertRaises(HTTPError) as taken:
+            self.request(service.ADMIN, "POST", {"user_id": other, "recipient": destination})
+        self.assertEqual(taken.exception.code, 409)
+        self.user_ids.remove(user)
+        with self.assertRaises(HTTPError) as disabled:
+            self.request(service.PUBLIC + previous_token, admin=False)
+        self.assertEqual(disabled.exception.code, 404)
 
     def test_public_nginx_limits_subscription_to_single_path(self):
         spec = dict(domain="vpn.example.test", installation="0123456789", entries=["entry-1"], owner="anet")

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { CreateUser } from '@/api/users'
 import type { CreateUserRequest, User } from '@/models/user'
 import { useAppMessage } from '@/composables/useAppMessage'
@@ -9,13 +9,13 @@ import UserForm from '@/components/UserForm.vue'
 const show = defineModel<boolean>()
 
 const emit = defineEmits<{
-  (e: 'created'): void
+  (e: 'created', user: Pick<User, 'id' | 'uid'>): void
 }>()
 
 const message = useAppMessage()
 
 const loading = ref(false)
-const formValid = ref(false)
+const error = ref('')
 
 // Черновик User: общие поля редактирует UserForm, справочники грузит он же
 const defaultDraft = (): User => ({
@@ -33,8 +33,13 @@ const defaultDraft = (): User => ({
 })
 const draft = ref<User>(defaultDraft())
 
+const formValid = computed(() => {
+  const length = Array.from(draft.value.uid.trim()).length
+  return length >= 2 && length <= 64
+})
 const create = async () => {
-  if (!formValid.value) return
+  if (loading.value || !formValid.value) return
+  error.value = ''
   loading.value = true
   try {
     const payload: CreateUserRequest = {
@@ -45,9 +50,9 @@ const create = async () => {
       group_id: draft.value.group_id, // Группа передается напрямую
     }
 
-    await CreateUser(payload)
+    const created = await CreateUser(payload)
     message.success(`Пользователь «${payload.uid}» создан`)
-    emit('created')
+    emit('created', { id: created.id, uid: created.uid })
     show.value = false
 
     draft.value = defaultDraft()
@@ -56,7 +61,7 @@ const create = async () => {
     const detail = typeof err.response?.data === 'string'
         ? err.response.data
         : err instanceof Error ? err.message : 'Не удалось создать пользователя'
-    message.error(detail)
+    error.value = detail
   } finally {
     loading.value = false
   }
@@ -64,24 +69,25 @@ const create = async () => {
 </script>
 
 <template>
-  <v-dialog v-model="show" width="600">
+  <v-dialog v-model="show" :persistent="loading" width="600">
     <v-card>
       <v-card-title class="text-h6 pb-4">Создать пользователя</v-card-title>
 
       <v-card-text>
-        <UserForm v-model="draft" v-model:valid="formValid" creating />
+        <UserForm v-model="draft" creating @submit="create" />
+        <v-alert v-if="error" type="error" variant="tonal">{{ error }}</v-alert>
       </v-card-text>
 
       <v-card-actions class="px-6 pb-4">
         <v-spacer />
-        <v-btn variant="text" @click="show = false">Cancel</v-btn>
+        <v-btn variant="text" :disabled="loading" @click="show = false">Отмена</v-btn>
         <v-btn
             color="primary"
             :loading="loading"
             :disabled="!formValid"
             @click="create"
         >
-          Create
+          Создать пользователя
         </v-btn>
       </v-card-actions>
     </v-card>

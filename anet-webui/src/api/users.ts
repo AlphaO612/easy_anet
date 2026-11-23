@@ -52,8 +52,8 @@ export async function Regenerate(id: string): Promise<RegenerateUserRequest> {
   })
 }
 
-export async function CreateUser(data: CreateUserRequest): Promise<User> {
-  return api<User>(`/add`, {
+export async function CreateUser(data: CreateUserRequest): Promise<Pick<User, 'id' | 'uid'>> {
+  return api<Pick<User, 'id' | 'uid'>>(`/add`, {
     method: 'POST',
     data,
   })
