@@ -11,7 +11,7 @@ SERVICES = {
 }
 SERVICES["anet-easy"] = SERVICES["webui"] + ("CLIENT_IMAGE", "INGRESS_IMAGE", "PROMETHEUS_IMAGE", "BLACKBOX_IMAGE", "GRAFANA_IMAGE")
 SERVICES["panel-update"] = ("WEBUI_IMAGE",)
-OPTIONAL_SERVICES = {"anet-easy": ("DNS_IMAGE",)}
+OPTIONAL_SERVICES = {"anet-easy": ("DNS_IMAGE",), "panel-update": ("AUTH_IMAGE",)}
 IMAGE = re.compile(r"[a-z0-9][a-z0-9./:_-]*@sha256:[0-9a-f]{64}")
 
 

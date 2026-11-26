@@ -1,12 +1,26 @@
 use std::collections::HashMap;
-use crate::api::api::{generate_node_token, hash_node_token, node_token_is_valid, validate_admin_session};
-use crate::api::dto::{AdminToken, CreateAdmissionCommandRequest, CreateNodeCommandResponse, CreateServerRequest, GetNodeCommandStatusResponse, GetNodeCommandsResponse, GetServersResponse, NodeCommandResultResponse, NodeCommandResultRequest, NodeCommandStatusDto, NodeCredentialDto, RotateNodeCredentialResponse, ServerDto, NodeRuntimeDto, NodeCommand, NodeHeartbeatResponse};
-use crate::entities::{node_commands, node_runtime_states, servers};
+use crate::api::api::{
+    generate_node_token, hash_node_token, node_token_is_valid, remove_live_node_sessions,
+    validate_admin_session,
+};
+use crate::api::dto::{
+    AdminToken, CreateAdmissionCommandRequest, CreateNodeCommandResponse, CreateServerRequest,
+    DeleteServerApiResult, DeleteServerDto, GetNodeCommandStatusResponse, GetNodeCommandsResponse,
+    GetServersResponse, NodeCommand, NodeCommandResultRequest, NodeCommandResultResponse,
+    NodeCommandStatusDto, NodeCredentialDto, NodeHeartbeatResponse, NodeRuntimeDto,
+    ResetServerStateApiResult, ResetServerStateDto, RotateNodeCredentialResponse, ServerDto,
+};
+use crate::entities::{
+    flow_history, flow_reports, ingress_routes, node_commands, node_pool_members,
+    node_runtime_states, probe_publications, profile_credentials, servers, traffic_hourly,
+    traffic_totals, uplink_keys, user_servers,
+};
 use chrono::{NaiveDateTime, Utc};
 use log::info;
 use poem_openapi::{param::Query, payload::Json, OpenApi};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, Set, QueryFilter, QueryOrder
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
+    QueryOrder, Set, TransactionTrait,
 };
 use uuid::Uuid;
 use anet_common::dto::NodeHeartbeatRequest;
@@ -329,6 +343,178 @@ impl ServersApi {
             }
             Err(e) => GetServersResponse::Error(Json(e.to_string())),
         }
+    }
+
+    /// Удалить сервер и каскадно очистить все связанные таблицы.
+    #[oai(path = "/servers/:id", method = "delete")]
+    async fn delete_server(
+        &self,
+        auth: AdminToken,
+        id: poem_openapi::param::Path<Uuid>,
+    ) -> DeleteServerApiResult {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return DeleteServerApiResult::Unauthorized(Json(err));
+        }
+
+        match servers::Entity::find_by_id(id.0).one(&self.db).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return DeleteServerApiResult::NotFound(Json("Сервер не найден".to_string())),
+            Err(e) => return DeleteServerApiResult::Error(Json(e.to_string())),
+        }
+
+        let txn = match self.db.begin().await {
+            Ok(t) => t,
+            Err(e) => return DeleteServerApiResult::Error(Json(e.to_string())),
+        };
+
+        let cleanup_result: Result<(), sea_orm::DbErr> = async {
+            node_runtime_states::Entity::delete_many()
+                .filter(node_runtime_states::Column::ServerId.eq(id.0))
+                .exec(&txn)
+                .await?;
+            node_commands::Entity::delete_many()
+                .filter(node_commands::Column::ServerId.eq(id.0))
+                .exec(&txn)
+                .await?;
+            user_servers::Entity::delete_many()
+                .filter(user_servers::Column::ServerId.eq(id.0))
+                .exec(&txn)
+                .await?;
+            node_pool_members::Entity::delete_many()
+                .filter(node_pool_members::Column::ServerId.eq(id.0))
+                .exec(&txn)
+                .await?;
+            probe_publications::Entity::delete_many()
+                .filter(probe_publications::Column::NodeId.eq(id.0))
+                .exec(&txn)
+                .await?;
+            flow_reports::Entity::delete_many()
+                .filter(flow_reports::Column::NodeId.eq(id.0))
+                .exec(&txn)
+                .await?;
+            flow_history::Entity::delete_many()
+                .filter(flow_history::Column::NodeId.eq(id.0))
+                .exec(&txn)
+                .await?;
+            uplink_keys::Entity::delete_many()
+                .filter(
+                    sea_orm::Condition::any()
+                        .add(uplink_keys::Column::NodeId.eq(id.0))
+                        .add(uplink_keys::Column::ExitId.eq(id.0)),
+                )
+                .exec(&txn)
+                .await?;
+            profile_credentials::Entity::delete_many()
+                .filter(profile_credentials::Column::NodeId.eq(id.0))
+                .exec(&txn)
+                .await?;
+            traffic_totals::Entity::delete_many()
+                .filter(traffic_totals::Column::ServerId.eq(id.0))
+                .exec(&txn)
+                .await?;
+            traffic_hourly::Entity::delete_many()
+                .filter(traffic_hourly::Column::ServerId.eq(id.0))
+                .exec(&txn)
+                .await?;
+            ingress_routes::Entity::update_many()
+                .col_expr(
+                    ingress_routes::Column::EntryServerId,
+                    sea_orm::sea_query::Expr::value(Option::<Uuid>::None),
+                )
+                .filter(ingress_routes::Column::EntryServerId.eq(id.0))
+                .exec(&txn)
+                .await?;
+            ingress_routes::Entity::update_many()
+                .col_expr(
+                    ingress_routes::Column::ExitServerId,
+                    sea_orm::sea_query::Expr::value(Option::<Uuid>::None),
+                )
+                .filter(ingress_routes::Column::ExitServerId.eq(id.0))
+                .exec(&txn)
+                .await?;
+            servers::Entity::delete_by_id(id.0).exec(&txn).await?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = cleanup_result {
+            return DeleteServerApiResult::Error(Json(e.to_string()));
+        }
+
+        if let Err(e) = txn.commit().await {
+            return DeleteServerApiResult::Error(Json(e.to_string()));
+        }
+
+        remove_live_node_sessions(id.0);
+        DeleteServerApiResult::Ok(Json(DeleteServerDto {
+            deleted: true,
+            id: id.0,
+        }))
+    }
+
+    /// Сбросить runtime-состояние сервера, очистить зависшие команды и сбросить ошибку проб.
+    #[oai(path = "/servers/:id/reset-state", method = "post")]
+    async fn reset_server_state(
+        &self,
+        auth: AdminToken,
+        id: poem_openapi::param::Path<Uuid>,
+    ) -> ResetServerStateApiResult {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return ResetServerStateApiResult::Unauthorized(Json(err));
+        }
+
+        match servers::Entity::find_by_id(id.0).one(&self.db).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return ResetServerStateApiResult::NotFound(Json("Сервер не найден".to_string()));
+            }
+            Err(e) => return ResetServerStateApiResult::Error(Json(e.to_string())),
+        }
+
+        let txn = match self.db.begin().await {
+            Ok(t) => t,
+            Err(e) => return ResetServerStateApiResult::Error(Json(e.to_string())),
+        };
+
+        let reset_result: Result<(), sea_orm::DbErr> = async {
+            node_runtime_states::Entity::delete_many()
+                .filter(node_runtime_states::Column::ServerId.eq(id.0))
+                .exec(&txn)
+                .await?;
+            node_commands::Entity::delete_many()
+                .filter(node_commands::Column::ServerId.eq(id.0))
+                .filter(node_commands::Column::Status.is_in(["pending", "running"]))
+                .exec(&txn)
+                .await?;
+            servers::Entity::update_many()
+                .col_expr(
+                    servers::Column::ProbeError,
+                    sea_orm::sea_query::Expr::value(Option::<String>::None),
+                )
+                .col_expr(
+                    servers::Column::UpdatedAt,
+                    sea_orm::sea_query::Expr::value(Utc::now().naive_utc()),
+                )
+                .filter(servers::Column::Id.eq(id.0))
+                .exec(&txn)
+                .await?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = reset_result {
+            return ResetServerStateApiResult::Error(Json(e.to_string()));
+        }
+
+        if let Err(e) = txn.commit().await {
+            return ResetServerStateApiResult::Error(Json(e.to_string()));
+        }
+
+        remove_live_node_sessions(id.0);
+        ResetServerStateApiResult::Ok(Json(ResetServerStateDto {
+            reset: true,
+            id: id.0,
+        }))
     }
 
     /// Поставить в очередь команду включения или выключения новых подключений.

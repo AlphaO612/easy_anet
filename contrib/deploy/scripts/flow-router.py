@@ -10,7 +10,9 @@ import sys
 import time
 
 from flow_node import NodeAPI
-from topology import api_read, decide, observed_metrics, read, validate
+from topology import api_read, decide, observed_metrics, probe_local_paths, read, validate
+
+MULTI_EXIT_STRATEGIES = {"weighted", "balanced", "least-load"}
 
 
 def context(topology, binding):
@@ -68,11 +70,21 @@ def render(topology, binding, metrics, now, previous):
 
     unique = {ip: next(iter(names.items())) for ip, names in domains.items() if len(names) == 1}
     lines = ["set live { type mark; flags timeout;"]
+    fail_mode = profile.get("fail_mode", "fail-closed")
     leases = {name: math.floor(min(45, metrics[name]["expires"] - now)) for name in paths
               if metrics.get(name, {}).get("up") and metrics[name]["expires"] >= now + 1
               and (profile["strategy"] != "strict-ip" or topology["paths"][name]["external_ip"] == profile["external_ip"])}
+    degraded_fallback = []
+    if (not leases and not profile_revoked(profile, binding)
+            and fail_mode in {"fail-open", "degrade"} and profile["strategy"] != "strict-ip"):
+        any_fresh = any(name in metrics and metrics[name].get("expires", 0) >= now + 1 for name in paths)
+        if not any_fresh:
+            for name in paths:
+                if metrics.get(name, {}).get("up") is not False:
+                    leases[name] = 15
+                    degraded_fallback.append(name)
     # A new flow may only select a mark the kernel can lease for a whole second.
-    metrics = {name: metrics[name] for name in leases}
+    metrics = {name: metrics[name] for name in leases if name in metrics}
     if leases:
         lines.append("elements = { " + ", ".join(f'{paths[name]["table"]} timeout {ttl}s'
                                                  for name, ttl in leases.items()) + " }")
@@ -92,13 +104,28 @@ def render(topology, binding, metrics, now, previous):
         sub = dict(profile, paths=allowed, rules=[], require_domain=False)
         session = dict(profile=binding["profile"], user=binding["user"], groups=binding.get("groups", []),
                        metrics=metrics, destination="0.0.0.0")
+        if degraded_fallback:
+            session["fallback_paths"] = degraded_fallback
         last = previous.get(rule, {})
         session.update(previous=last.get("selected"), selected_at=last.get("since", now))
         decision = decide(dict(paths=topology["paths"], profiles={binding["profile"]: sub}), session, now)
         chosen = decision["selected"]
+        dist = [(p, w) for p, w in decision.get("distribution", []) if p in leases and w > 0]
         events[rule] = {"selected": chosen, "since": last["since"] if last.get("selected") == chosen and "since" in last else now,
-                        "strategy": profile["strategy"], "eligible": decision["eligible"]}
-        action = f'ct mark set {paths[chosen]["table"]} meta mark set ct mark return' if chosen else "drop"
+                        "strategy": profile["strategy"], "eligible": decision["eligible"],
+                        "weights": decision.get("weights", {})}
+        if profile["strategy"] in MULTI_EXIT_STRATEGIES and len(dist) > 1:
+            total = sum(weight for _, weight in dist)
+            buckets = []
+            cursor = 0
+            for path_name, weight in dist:
+                lo, hi = cursor, cursor + weight - 1
+                mark = paths[path_name]["table"]
+                buckets.append(f"{lo} : {mark}" if lo == hi else f"{lo}-{hi} : {mark}")
+                cursor += weight
+            action = f"ct mark set numgen random mod {total} map {{ {', '.join(buckets)} }} meta mark set ct mark return"
+        else:
+            action = f'ct mark set {paths[chosen]["table"]} meta mark set ct mark return' if chosen else "drop"
         lines.append((selector + " " + action).strip())
 
     if profile.get("require_domain"):
@@ -202,6 +229,41 @@ ln "$temp" binding 2>/dev/null || cmp -s "$temp" binding
         raise ValueError("drain namespace before changing profile or path identity")
 
 
+def probe_namespace_paths(execute, topology, binding, timeout=2.0):
+    """Probe bound egress paths from inside the entry namespace without external Prometheus."""
+    targets = {}
+    for name, bound in binding["paths"].items():
+        merged = dict(topology["paths"].get(name, {}))
+        merged["interface"] = bound["interface"]
+        if "gateway" in bound:
+            merged["gateway"] = bound["gateway"]
+        targets[name] = merged
+
+    def ns_tcp_probe(host, port, interface, probe_timeout):
+        start = time.monotonic()
+        wait = max(1, int(math.ceil(probe_timeout)))
+        py_cmd = (
+            "import socket,sys;"
+            "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);"
+            f"s.settimeout({float(probe_timeout)});"
+            + (f"s.setsockopt(socket.SOL_SOCKET,25,{interface!r}.encode()+b'\\0');" if interface else "")
+            + f"s.connect(({host!r},{int(port)}));s.close()"
+        )
+        res = execute("python3", "-c", py_cmd, check=False)
+        if res.returncode == 0:
+            return (time.monotonic() - start) * 1000.0
+        # Fallback to ping if python3 is unavailable in the holder container
+        if interface:
+            ping_start = time.monotonic()
+            ping = execute("ping", "-I", interface, "-c", "1", "-W", str(wait), str(host), check=False)
+            if ping.returncode == 0:
+                match = re.search(r"time=([0-9.]+)\s*ms", ping.stdout or "")
+                return float(match.group(1)) if match else (time.monotonic() - ping_start) * 1000.0
+        return None
+
+    return probe_local_paths(targets, timeout=timeout, tcp_probe=ns_tcp_probe)
+
+
 def run(args):
     def execute(*cmd, stdin=None, check=True):
         return subprocess.run(["docker", "exec", "-i", "--user", "0", args.container, *cmd],
@@ -248,8 +310,15 @@ table ip anet_flow {
             metrics = {}
             snapshot = {"links": []}
             if not profile_revoked(profile, binding):
-                snapshot = fetch("/probe-links")
-                metrics = observed_metrics(topology, snapshot, time.time())
+                try:
+                    snapshot = fetch("/probe-links")
+                    metrics = observed_metrics(topology, snapshot, time.time())
+                except (OSError, KeyError, TypeError, ValueError) as probe_exc:
+                    if not profile.get("local_probe", False) and profile.get("fail_mode", "fail-closed") == "fail-closed":
+                        raise
+                    print(f"probe-links unavailable ({probe_exc}); falling back to local policy", file=sys.stderr, flush=True)
+                if not metrics and profile.get("local_probe", False):
+                    metrics = probe_namespace_paths(execute, topology, binding)
             for name, p in paths.items():
                 table, dev = str(p["table"]), p["interface"]
                 execute("ip", "-4", "route", "replace", "unreachable", "default", "metric", "32767", "table", table)
@@ -257,7 +326,7 @@ table ip anet_flow {
                              *(["via", p["gateway"]] if "gateway" in p else []),
                              "dev", dev, "metric", "10", "table", table, check=False)
                 if ok.returncode:
-                    metrics.pop(name, None)
+                    metrics[name] = dict(up=False, expires=0)
                 pref = str(11000 + p["table"])
                 rules = execute("ip", "-4", "rule", "show", "pref", pref).stdout
                 if not rules.strip():

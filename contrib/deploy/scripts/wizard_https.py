@@ -1,7 +1,10 @@
 """Provision a dedicated nginx site and renew its VLESS certificates on the entry VPS."""
 import argparse
 import contextlib
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import fnmatch
 import hashlib
 import http.client
@@ -9,7 +12,10 @@ import ipaddress
 import json
 import os
 from pathlib import Path
-import pwd
+try:
+    import pwd
+except ImportError:
+    pwd = None
 import re
 import secrets
 import shutil
@@ -38,10 +44,19 @@ def atomic(path, data, mode=0o600):
         try:
             temp.write(data)
             temp.flush()
-            os.fchmod(temp.fileno(), mode)
+            if hasattr(os, "fchmod"):
+                os.fchmod(temp.fileno(), mode)
+            temp.close()
+            if not hasattr(os, "fchmod"):
+                os.chmod(name, mode)
             name.replace(path)
         finally:
             name.unlink(missing_ok=True)
+
+
+def _flock(lock):
+    if fcntl is not None:
+        fcntl.flock(lock, fcntl.LOCK_EX)
 
 
 def trusted_directory(path, mode=0o755):
@@ -153,6 +168,38 @@ server {{
         error_log /dev/null;
         limit_except GET {{ deny all; }}
         proxy_pass http://127.0.0.1:{port};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
+    }}
+    location ~ "^/api/v1/subscriptions/[A-Za-z0-9_-]{{32,128}}$" {{
+        access_log off;
+        error_log /dev/null;
+        limit_except GET {{ deny all; }}
+        proxy_pass http://127.0.0.1:{port};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
+    }}
+    location ~ "^/api/v1/vless-usage/profile-[1-9][0-9]*$" {{
+        access_log off;
+        limit_except POST {{ deny all; }}
+        client_max_body_size 32k;
+        proxy_pass http://127.0.0.1:{port};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
+    }}
+    location ~ "^/api/v1/ingress-sync/[A-Za-z0-9_-]+$" {{
+        access_log off;
+        limit_except POST {{ deny all; }}
+        client_max_body_size 64k;
+        proxy_pass http://127.0.0.1:{port};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header Authorization "";
         proxy_set_header Cookie "";
     }}
@@ -176,7 +223,7 @@ def checked_reload():
     run("systemctl", "reload-or-restart", "nginx.service")
 
 
-def request(address, domain, path, tls, certificate=None):
+def request(address, domain, path, tls, certificate=None, *, redirect=False):
     with socket.create_connection((address, 443 if tls else 80), timeout=7) as raw:
         with contextlib.ExitStack() as stack:
             sock = raw
@@ -187,6 +234,8 @@ def request(address, domain, path, tls, certificate=None):
             sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n".encode())
             with http.client.HTTPResponse(sock) as response:
                 response.begin()
+                if redirect:
+                    return response.status, response.getheader("Location")
                 return response.status, response.read(2 * 1024 * 1024)
 
 
@@ -206,12 +255,19 @@ def verify_site(ips, domain, path, expected, certificate=None):
                 time.sleep(1)
 
 
+def verify_redirect(ips, domain):
+    for address in ips:
+        status, location = request(address, domain, "/", False, redirect=True)
+        if status not in (301, 308) or location != f"https://{domain}/":
+            raise ValueError(f"На {address}:80 ожидался редирект на https://{domain}/, получен HTTP {status}.")
+
+
 def write_owner_copies(state, spec, cert, key):
     dest = state / "tls" / spec["domain"]
     dest.mkdir(mode=0o700, exist_ok=True, parents=True)
     # Provisioning and renewal must agree on the pair a new ingress reads.
     with (state / ".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock)
         atomic(dest / "fullchain.pem", cert)
         atomic(dest / "privkey.pem", key)
         for entry in spec["entries"]:
@@ -266,7 +322,7 @@ def install(spec, email, template, github):
     os.umask(0o022)
     trusted_directory(STATE, 0o700)
     with (STATE / "install.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock)
         if not shutil.which("ip") or not shutil.which("ss"):
             run("apt-get", "update")
             run("apt-get", "install", "-y", "iproute2")
@@ -327,6 +383,7 @@ def install(spec, email, template, github):
             checked_reload()
             der = ssl.PEM_cert_to_DER_cert((lineage / "cert.pem").read_text())
             verify_site(ips, domain, "/", html, der)
+            verify_redirect(ips, domain)
             atomic(state / "renew.py", Path(__file__).read_bytes())
             trusted_directory(hook.parent)
             # The timer executes only the root-owned copy, in isolated Python mode.
@@ -334,7 +391,6 @@ def install(spec, email, template, github):
                           f'exec /usr/bin/python3 -I "{state}/renew.py" --renew\n').encode(), 0o755)
             run("systemctl", "enable", "--now", "certbot.timer")
             run("systemctl", "enable", "nginx.service")
-            apply_cert(spec)
             atomic(metadata, json.dumps(spec).encode())
         except BaseException:
             if old_conf is None:
@@ -352,6 +408,10 @@ def install(spec, email, template, github):
             raise
         finally:
             token.unlink(missing_ok=True)
+        try:
+            apply_cert(spec)
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            raise ValueError(f"Сайт https://{domain}/ работает. Синхронизация сертификата с VPN не завершена: {error}") from error
 
 
 def main():

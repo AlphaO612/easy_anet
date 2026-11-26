@@ -1,5 +1,8 @@
 """Apply one wizard assignment on its VPS. Credentials enter and leave on pipes."""
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import hashlib
 import json
 import os
@@ -13,6 +16,7 @@ import time
 import uuid
 
 import vless_meter
+import wg_sync
 from urllib.parse import urlsplit
 
 from bundle import load_bundle
@@ -36,7 +40,8 @@ def provision(job):
     if root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o077:
         raise ValueError("Каталог установки должен быть приватным")
     with (root / ".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
         if job["action"] == "images":
             if not Path("/dev/net/tun").is_char_device():
                 raise ValueError("Требуется /dev/net/tun")
@@ -68,6 +73,8 @@ def publish_catalog(directory, rows):
         item = {key: row[key] for key in ("id", "protocol", "entry", "exit", "port")}
         if row.get("exit_public_key"):
             item["exit_public_key"] = row["exit_public_key"]
+        if row.get("wg_server_public_key"):
+            item["wg_server_public_key"] = row["wg_server_public_key"]
         index.append(item)
     atomic_write(catalog / "index.json", json.dumps(index))
     (catalog / "index.json").chmod(0o444)
@@ -103,8 +110,15 @@ def publish_device_catalog(directory, rows, origin):
     catalog.chmod(0o755)
     routes = {row["id"]: {k: row[k] for k in ("entry", "exit", "port", "devices", "usage") if k in row}
               for row in rows if row.get("devices")}
+    wireguard_routes = {
+        row["id"]: {k: row[k] for k in ("entry", "exit", "port", "wg_server_public_key", "usage") if k in row}
+        for row in rows if row.get("protocol") == "wireguard" and (row.get("wg_server_public_key") or row.get("usage"))
+    }
+    payload = {"origin": origin, "routes": routes}
+    if wireguard_routes:
+        payload["wireguard_routes"] = wireguard_routes
     path = catalog / "index.json"
-    atomic_write(path, json.dumps({"origin": origin, "routes": routes}))
+    atomic_write(path, json.dumps(payload))
     path.chmod(0o444)
     return catalog
 
@@ -130,11 +144,18 @@ def service(root, job):
         catalog = publish_catalog(directory, job["catalog"])
         private_catalog = publish_device_catalog(directory, job["catalog"], job.get("subscription_origin", ""))
         overlay = directory / "webui-mount.json"
-        atomic_write(overlay, json.dumps({"services": {"webui": {"volumes": [
-            {"type": "bind", "source": str(catalog), "target": "/srv/anet-profiles", "read_only": True}
-        ]}, "vless-profiles": {"volumes": [
-            {"type": "bind", "source": str(private_catalog), "target": "/srv/anet-vless-catalog", "read_only": True}
-        ]}}}))
+        atomic_write(overlay, json.dumps({"services": {
+            "webui": {"volumes": [
+                {"type": "bind", "source": str(catalog), "target": "/srv/anet-profiles", "read_only": True}
+            ]},
+            "vless-profiles": {"volumes": [
+                {"type": "bind", "source": str(private_catalog), "target": "/srv/anet-vless-catalog", "read_only": True}
+            ]},
+            "auth": {"volumes": [
+                {"type": "bind", "source": str(catalog), "target": "/srv/anet-profiles", "read_only": True},
+                {"type": "bind", "source": str(private_catalog), "target": "/srv/anet-vless-catalog", "read_only": True}
+            ]}
+        }}))
         files.extend([DEPLOY / "compose/webui.yaml", DEPLOY / "compose/probe-management.yaml", overlay])
         env.update(PROBE_VOLUME=project + "-probes", PANEL_PORT=str(job["panel_port"]), PANEL_BIND="127.0.0.1")
         runpy.run_path(str(HERE / "init-probe-signing.py"))["initialize"](state)
@@ -232,7 +253,23 @@ def service(root, job):
     result = {"config": config.read_text(), "devices": devices}
     if devices:
         starter = urlsplit(result["config"].strip()).username
-        result["usage"] = vless_meter.install(directory, project, job.get("usage_endpoint", ""), starter, devices)
+        result["usage"] = vless_meter.install(
+            directory, project, job.get("usage_endpoint", ""), starter, devices,
+            sync_endpoint=job.get("sync_endpoint", ""),
+            server_json=str(directory / "adapter/server/server.json"),
+        )
+    elif action == "entry" and job.get("protocol") == "wireguard":
+        wg_conf = directory / "adapter/server/wg.conf"
+        client_conf = directory / "adapter/client.conf"
+        wg_server_pub = wg_sync.extract_server_public_key(wg_conf, client_conf)
+        if wg_server_pub:
+            result["wg_server_public_key"] = wg_server_pub
+        if job.get("sync_endpoint"):
+            starter_pub = wg_sync.extract_starter_client_public_key(wg_conf)
+            result["usage"] = wg_sync.install(
+                directory, project, job["sync_endpoint"], wg_server_pub,
+                starter_public_key=starter_pub, wg_conf=wg_conf,
+            )
     return result
 
 

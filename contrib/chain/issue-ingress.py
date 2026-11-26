@@ -55,7 +55,7 @@ def vless(host, port, dns):
     config = {
         "log": {"loglevel": "warning", "access": "none"},
         "dns": {"servers": [str(dns)], "queryStrategy": "UseIPv4"},
-        "inbounds": [{"listen": "0.0.0.0", "port": 8443, "protocol": "vless",
+        "inbounds": [{"tag": "vless-in", "listen": "0.0.0.0", "port": 8443, "protocol": "vless",
                       "settings": {"clients": [{"id": credential}], "decryption": "none"},
                       "streamSettings": stream}],
         "outbounds": [{"protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}}],

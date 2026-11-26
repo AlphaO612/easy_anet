@@ -22,7 +22,8 @@ export type User = {
 export type UpdateUserRequest = {
   uid: string
   is_active: boolean
-  static_ip: string | null
+  static_ip?: string | null
+  clear_static_ip?: boolean
   server_ids: string[]
   pool_ids: string[]
   route_map_id?: string

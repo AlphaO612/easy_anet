@@ -20,6 +20,7 @@ sea-orm-migration = "2.0.2"
 uuid = { version = "1.10", features = ["serde", "v4"] }
 clap = { workspace = true, features = ["derive"] }
 ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }

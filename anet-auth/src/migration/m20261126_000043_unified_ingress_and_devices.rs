@@ -1,0 +1,275 @@
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(IngressRoutes::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(IngressRoutes::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(IngressRoutes::Protocol).string().not_null())
+                    .col(ColumnDef::new(IngressRoutes::Name).string().not_null())
+                    .col(ColumnDef::new(IngressRoutes::EntryHost).string().not_null())
+                    .col(ColumnDef::new(IngressRoutes::EntryPort).integer().not_null())
+                    .col(ColumnDef::new(IngressRoutes::ExitHost).string().not_null())
+                    .col(ColumnDef::new(IngressRoutes::EntryServerId).uuid().null())
+                    .col(ColumnDef::new(IngressRoutes::ExitServerId).uuid().null())
+                    .col(ColumnDef::new(IngressRoutes::WgServerPublicKey).string().null())
+                    .col(ColumnDef::new(IngressRoutes::WgSubnet).string().null())
+                    .col(ColumnDef::new(IngressRoutes::Sni).string().null())
+                    .col(ColumnDef::new(IngressRoutes::SyncTokenHash).string().null())
+                    .col(
+                        ColumnDef::new(IngressRoutes::SyncMode)
+                            .string()
+                            .not_null()
+                            .default("live"),
+                    )
+                    .col(ColumnDef::new(IngressRoutes::LastSyncAt).timestamp().null())
+                    .col(ColumnDef::new(IngressRoutes::CreatedAt).timestamp().not_null())
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(UserDevices::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(UserDevices::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(UserDevices::UserId).uuid().not_null())
+                    .col(ColumnDef::new(UserDevices::Protocol).string().not_null())
+                    .col(ColumnDef::new(UserDevices::Name).string().not_null())
+                    .col(ColumnDef::new(UserDevices::RouteId).string().null())
+                    .col(ColumnDef::new(UserDevices::CredentialId).string().not_null())
+                    .col(ColumnDef::new(UserDevices::AssignedIp).string().null())
+                    .col(ColumnDef::new(UserDevices::EncryptedSecret).text().null())
+                    .col(
+                        ColumnDef::new(UserDevices::Status)
+                            .string()
+                            .not_null()
+                            .default("active"),
+                    )
+                    .col(
+                        ColumnDef::new(UserDevices::UploadBytes)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(UserDevices::DownloadBytes)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(ColumnDef::new(UserDevices::LastTrafficAt).timestamp().null())
+                    .col(ColumnDef::new(UserDevices::SyncedAt).timestamp().null())
+                    .col(ColumnDef::new(UserDevices::CreatedAt).timestamp().not_null())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk-user-devices-user")
+                            .from(UserDevices::Table, UserDevices::UserId)
+                            .to(Users::Table, Users::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(UserDeviceTrafficSources::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(UserDeviceTrafficSources::DeviceId)
+                            .uuid()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(UserDeviceTrafficSources::Source)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(UserDeviceTrafficSources::UploadBytes)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(UserDeviceTrafficSources::DownloadBytes)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .primary_key(
+                        Index::create()
+                            .col(UserDeviceTrafficSources::DeviceId)
+                            .col(UserDeviceTrafficSources::Source),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk-device-traffic-sources-device")
+                            .from(
+                                UserDeviceTrafficSources::Table,
+                                UserDeviceTrafficSources::DeviceId,
+                            )
+                            .to(UserDevices::Table, UserDevices::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(UserSubscriptions::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(UserSubscriptions::UserId)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(UserSubscriptions::TokenHash)
+                            .string()
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(
+                        ColumnDef::new(UserSubscriptions::CreatedAt)
+                            .timestamp()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(UserSubscriptions::UpdatedAt)
+                            .timestamp()
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk-user-subscriptions-user")
+                            .from(UserSubscriptions::Table, UserSubscriptions::UserId)
+                            .to(Users::Table, Users::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(UserSubscriptions::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(UserDeviceTrafficSources::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(UserDevices::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(IngressRoutes::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+#[derive(Iden)]
+enum IngressRoutes {
+    Table,
+    Id,
+    Protocol,
+    Name,
+    EntryHost,
+    EntryPort,
+    ExitHost,
+    EntryServerId,
+    ExitServerId,
+    WgServerPublicKey,
+    WgSubnet,
+    Sni,
+    SyncTokenHash,
+    SyncMode,
+    LastSyncAt,
+    CreatedAt,
+}
+
+#[derive(Iden)]
+enum UserDevices {
+    Table,
+    Id,
+    UserId,
+    Protocol,
+    Name,
+    RouteId,
+    CredentialId,
+    AssignedIp,
+    EncryptedSecret,
+    Status,
+    UploadBytes,
+    DownloadBytes,
+    LastTrafficAt,
+    SyncedAt,
+    CreatedAt,
+}
+
+#[derive(Iden)]
+enum UserDeviceTrafficSources {
+    Table,
+    DeviceId,
+    Source,
+    UploadBytes,
+    DownloadBytes,
+}
+
+#[derive(Iden)]
+enum UserSubscriptions {
+    Table,
+    UserId,
+    TokenHash,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum Users {
+    Table,
+    Id,
+}

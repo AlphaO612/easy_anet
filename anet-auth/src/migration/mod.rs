@@ -41,6 +41,7 @@ mod m20261122_000040_uplink_keys;
 mod m20261122_000041_profile_credentials;
 mod m20261122_000042_flow_history;
 mod m20261122_000038_operator_incidents;
+pub mod m20261126_000043_unified_ingress_and_devices;
 
 use sea_orm_migration::prelude::*;
 
@@ -92,6 +93,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261122_000040_uplink_keys::Migration),
             Box::new(m20261122_000041_profile_credentials::Migration),
             Box::new(m20261122_000042_flow_history::Migration),
+            Box::new(m20261126_000043_unified_ingress_and_devices::Migration),
         ]
     }
 }

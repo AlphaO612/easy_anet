@@ -1,9 +1,16 @@
 """Interactive multi-VPS installation from a verified, locally delivered Linux bundle."""
 import argparse
 from contextlib import ExitStack, contextmanager
-import fcntl
+from urllib.parse import urlsplit
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import hashlib
-import pwd
+try:
+    import pwd
+except ImportError:
+    pwd = None
 import json
 import os
 from pathlib import Path
@@ -64,7 +71,8 @@ def plan():
         s = {"host": host, "local": i == local}
         s["address"] = ask("Адрес SSH", host, hostname) if expert else host
         s["port"] = number("Порт SSH", 22, 1, 65535)
-        s["user"] = pwd.getpwuid(os.getuid()).pw_name if s["local"] else ask("Пользователь SSH", "root", lambda v: re.fullmatch(r"[a-z_][a-z0-9_-]*", v))
+        local_user = pwd.getpwuid(os.getuid()).pw_name if pwd is not None else os.environ.get("USERNAME", "user")
+        s["user"] = local_user if s["local"] else ask("Пользователь SSH", "root", lambda v: re.fullmatch(r"[a-z_][a-z0-9_-]*", v))
         if not s["local"]:
             mode = number("Авторизация SSH: 1 — ключ/ssh-agent, 2 — пароль", 1, 1, 2)
             s["password"] = mode == 2
@@ -151,8 +159,10 @@ class Host:
 def sources(out):
     # Only runtime code distributed by this release may cross to another VPS.
     names = ["deploy/scripts/" + x for x in (
-        "wizard_node.py", "wizard_inventory.py", "wizard_tls.py", "bundle.py", "release.py", "topology.py", "init-state.py",
-        "register-local-node.py", "init-probe-signing.py")]
+        "wizard_node.py", "vless_meter.py", "wg_sync.py", "wizard_inventory.py", "wizard_tls.py",
+        "bundle.py", "release.py", "topology.py", "init-state.py",
+        "register-local-node.py", "init-probe-signing.py",
+        "flow-router.py", "flow-agent.py", "flow-compose.py", "flow_adapter.py", "flow_node.py", "managed-flow.py")]
     names += ["deploy/compose/" + x for x in ("compose.yaml", "chain.yaml", "webui.yaml", "probe-management.yaml")]
     names += ["chain/issue-ingress.py", "chain/ingress.yaml"]
     with tarfile.open(out, "w:gz") as tar:
@@ -335,6 +345,23 @@ def apply(spec, bundle):
                 names = [f"entry-{row['slot']}" for row in profiles
                          if row["entry"] == i and row["protocol"] == "vless"]
                 setup_vless(h, dest, ident, names, spec["panel"] if i == spec["local"] else None)
+        controller = hosts[spec["local"]]
+        remote_vless = any(p["protocol"] == "vless" and p["entry"] != spec["local"] for p in profiles)
+        origin = spec.get("usage_origin", "")
+        origin_file = Path("/etc/anet-wizard/public-api") / (str(spec["panel"]) + ".origin")
+        if origin_file.is_file():
+            origin = origin_file.read_text().strip()
+        elif controller.node.get("tls_mode") == "acme":
+            origin = "https://" + controller.node["tls_domain"]
+        if remote_vless and not origin and sys.stdin.isatty():
+            def valid_origin(value):
+                parsed = urlsplit(value)
+                return not value or (parsed.scheme == "https" and parsed.hostname and
+                    not parsed.username and not parsed.password and parsed.path in ("","/") and
+                    not parsed.query and not parsed.fragment)
+            origin = ask("HTTPS-адрес панели для счётчиков удалённых VLESS-входов (Enter — пока считать на VPS)",
+                         check=valid_origin).rstrip("/")
+            spec["usage_origin"] = origin
         ui.stage(5, "Запуск VPN и проверка маршрутов")
         catalog = []
         exits = []
@@ -357,6 +384,12 @@ def apply(spec, bundle):
                 # Resume plans recorded before local certificate staging.
                 for key, src in (("cert", "cert"), ("key", "keyfile")):
                     tls[key] = entry.run("cat -- " + shlex.quote(entry.node[src]), stdout=subprocess.PIPE).stdout.decode()
+            base_url = f"http://127.0.0.1:{spec['panel']}" if p["entry"] == spec["local"] else origin
+            if proto == "vless":
+                tls["usage_endpoint"] = f"{base_url}/api/v1/vless-usage/profile-{slot}" if base_url else ""
+                tls["sync_endpoint"] = f"{base_url}/api/v1/ingress-sync/profile-{slot}" if base_url else ""
+            elif proto == "wireguard" and base_url:
+                tls["sync_endpoint"] = f"{base_url}/api/v1/ingress-sync/profile-{slot}"
             pin(p["entry"])
             issued = job(entry, dest, ident, action="entry", name=f"entry-{slot}", host=endpoint,
                       protocol=proto, native_port=port,
@@ -364,8 +397,12 @@ def apply(spec, bundle):
             cfg = issued["config"]
             path = directory / f"{slot}-{proto}.{EXT[proto]}"
             atomic_write(path, cfg)
-            catalog.append(dict(id=f"profile-{slot}", protocol=proto, entry=endpoint,
-                                exit=exit_host.node["host"], exit_public_key=exit_result["public_key"], port=port, config=cfg, devices=issued.get("devices", [])))
+            entry_item = dict(id=f"profile-{slot}", protocol=proto, entry=endpoint,
+                              exit=exit_host.node["host"], exit_public_key=exit_result["public_key"], port=port, config=cfg,
+                              devices=issued.get("devices", []), usage=issued.get("usage", {}))
+            if issued.get("wg_server_public_key"):
+                entry_item["wg_server_public_key"] = issued["wg_server_public_key"]
+            catalog.append(entry_item)
             print(f"{LABEL[proto]}    {endpoint}:{port} → {exit_host.node['host']}:{port}    {path}", flush=True)
         ui.stage(6, "Панель и клиентские профили")
         controller = hosts[spec["local"]]
@@ -398,6 +435,54 @@ def show_access(spec):
     print("4. В панели откройте «Профили и маршруты» → «Скачать профиль».")
     print("Чтобы снова показать эти инструкции, выполните на этом VPS:")
     print("   " + shlex.join([str(HERE.parent / "install.sh"), "--access"]))
+
+
+def repair_site():
+    with locked_state():
+        sites = {}
+        for path in saved_paths():
+            spec = normalize(json.loads(path.read_text()))
+            for i, node in enumerate(spec["servers"]):
+                entries = [f"entry-{p['slot']}" for p in active_profiles(spec)
+                           if p["entry"] == i and p["protocol"] == "vless"]
+                if entries and node.get("tls_mode") == "acme":
+                    sites.setdefault((spec["installation"], node["tls_domain"]), (spec, i, entries))
+        if not sites:
+            raise WizardError("В сохранённых планах нет активного сайта VLESS с Let's Encrypt.")
+        items = list(sites.values())
+        options = [(n, "https://" + s["servers"][i]["tls_domain"], s["servers"][i]["host"] + " · " + s["installation"])
+                   for n, (s, i, _) in enumerate(items, 1)]
+        choice = ui.menu("Проверить сайт входной VPS", options + [(0, "Выйти", "")], 1)
+        if not choice:
+            return
+        spec, index, entries = items[choice - 1]
+        node = spec["servers"][index]
+        ident = spec["installation"]
+        domain = node["tls_domain"]
+        prompt_for_new_node(node)
+        with tempfile.TemporaryDirectory() as tmp, Host(node, Path(tmp) / "ssh") as host:
+            pins = STATE / ident / "runtime-owners.json"
+            expected = json.loads(pins.read_text()).get(str(index)) if pins.exists() else None
+            if expected:
+                machine = host.run("cat /etc/machine-id", capture_output=True).stdout.strip()
+                owner = "anet-vpn" if node["user"] == "root" else node["user"]
+                if expected != {"machine": hashlib.sha256(machine).hexdigest(), "owner": owner}:
+                    raise WizardError("SSH ведёт на другой VPS или к другому владельцу установки.")
+            print(f"DNS и проверка сайта {domain} с входной VPS:", flush=True)
+            host.run(shlex.join(["sh", "-c", """
+getent ahosts "$1" | awk '{print $1}' | sort -u
+systemctl is-active nginx || :
+ss -Hltn '( sport = :80 or sport = :443 )'
+for scheme in http https; do
+    curl --noproxy '*' --max-time 8 -sS -o /dev/null -w '%{url_effective} → HTTP %{http_code}, адрес %{remote_ip}\\n' "$scheme://$1/" || :
+done
+""", "check-site", domain]))
+            if ui.menu("Восстановить сайт по сохранённому плану?", [
+                (1, "Восстановить сайт", "настроить nginx, проверить сертификат и HTTPS"),
+                (0, "Завершить проверку", "")], 0, new_screen=False) == 1:
+                setup_vless(host, ".local/share/anet-wizard/" + ident, ident, entries,
+                            spec["panel"] if node["local"] else None)
+                print(f"Проверка с входной VPS пройдена. Откройте https://{domain}/ в браузере.")
 
 
 def open_saved():
@@ -505,6 +590,7 @@ def main():
         choices.append((5, "Обновить установленную сеть", "применить этот выпуск к сохранённой установке"))
     if saved_paths():
         choices.append((4, "Редактировать сохранённый план", "исправить доступ или изменить состав VPS"))
+        choices.append((6, "Проверить и восстановить HTTPS-сайт", "DNS, порты 80/443, nginx и сертификат"))
     choices.append((0, "Выйти", ""))
     while True:
         choice = ui.menu("Главное меню", choices, 1)
@@ -514,6 +600,8 @@ def main():
             break
         if choice == 3:
             return open_saved()
+        if choice == 6:
+            return repair_site()
         if choice == 4:
             edit_saved()
             continue

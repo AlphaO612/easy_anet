@@ -40,6 +40,9 @@ services:
       BIND_TO: 0.0.0.0:3000
       ANET_PUBLIC_URL: ${ANET_PUBLIC_URL:-}
       PROVIDER_CACHE_DIR: /tmp/providers
+      ANET_VLESS_CATALOG_PATH: /srv/anet-vless-catalog/index.json
+      ANET_SUBSCRIPTION_ORIGIN_PATH: /srv/anet-vless-catalog/subscription-origin
+      ANET_STARTER_PROFILES_PATH: /srv/anet-profiles/index.json
     tmpfs: [/tmp]
     networks: [control, database, auth-egress]
     mem_limit: ${AUTH_MEMORY:-512m}

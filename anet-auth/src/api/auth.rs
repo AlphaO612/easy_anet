@@ -1,6 +1,6 @@
 use crate::api::dto::{
-    AuthTokens, CheckAccessRequest, CheckAccessResponse, Claims, LoginRequest,
-    LoginResponse,
+    AdminToken, AuthTokens, CheckAccessRequest, CheckAccessResponse, Claims, LoginRequest,
+    LoginResponse, LogoutResponse, LogoutResultDto,
 };
 use crate::entities::{admins, sessions, users};
 use anet_common::dto::BillingType;
@@ -85,6 +85,36 @@ impl AuthApi {
         LoginResponse::Ok(Json(AuthTokens {
             access_token: token,
         }))
+    }
+
+    /// Выход из панели Администратора (отзыв текущей сессии по jti)
+    #[oai(path = "/logout", method = "post")]
+    async fn admin_logout(&self, auth: AdminToken) -> LogoutResponse {
+        let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "secret_na_chushpana".into());
+        let token_data = match jsonwebtoken::decode::<Claims>(
+            &auth.0.token,
+            &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+            &jsonwebtoken::Validation::default(),
+        ) {
+            Ok(data) => data,
+            Err(_) => {
+                return LogoutResponse::Unauthorized(Json(
+                    "Сломанный или протухший JWT".to_string(),
+                ));
+            }
+        };
+
+        let jti = match Uuid::parse_str(&token_data.claims.jti) {
+            Ok(id) => id,
+            Err(_) => {
+                return LogoutResponse::Unauthorized(Json("Invalid JTI Format".to_string()));
+            }
+        };
+
+        match sessions::Entity::delete_by_id(jti).exec(&self.db).await {
+            Ok(_) => LogoutResponse::Ok(Json(LogoutResultDto { ok: true })),
+            Err(e) => LogoutResponse::Error(Json(e.to_string())),
+        }
     }
 
     /// Проверка VPN Сервера при Handshake

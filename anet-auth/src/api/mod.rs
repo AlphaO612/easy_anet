@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod compiled_rules;
 pub mod custom_overrides;
+pub mod devices;
 pub mod dto;
 pub mod groups;
 pub mod pools;
@@ -27,11 +28,19 @@ pub fn get_api(
         auth::AuthApi { db: db.clone() },
         users::UsersApi {
             db: db.clone(),
-            client_template_path,
+            client_template_path: client_template_path.clone(),
         },
         servers::ServersApi { db: db.clone() },
         pools::PoolsApi { db: db.clone() },
-        (probes::ProbesApi { db: db.clone() }, topology::TopologyApi { db: db.clone() }, incidents::IncidentsApi { db: db.clone() }),
+        (
+            probes::ProbesApi { db: db.clone() },
+            topology::TopologyApi { db: db.clone() },
+            incidents::IncidentsApi { db: db.clone() },
+            devices::DevicesApi {
+                db: db.clone(),
+                client_template_path,
+            },
+        ),
         route_maps::RouteMapsApi { db: db.clone() },
         groups::GroupsApi { db: db.clone() },
         statistics::StatisticsApi { db: db.clone() },

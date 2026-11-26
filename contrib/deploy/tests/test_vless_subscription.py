@@ -1,6 +1,7 @@
 """Verify on-disk Xray provisioning and subscription isolation end to end through HTTP."""
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import hashlib
 import importlib.util
 import json
@@ -114,7 +115,7 @@ class Devices(unittest.TestCase):
         destination = "a" * 32
         previous_token = "a" * 43
         user = next(iter(self.user_ids))
-        with service.connect() as db:
+        with closing(service.connect()) as db, db:
             db.execute("INSERT INTO recipients VALUES(?,?,?)", (destination, "Анна", service.digest(previous_token)))
             db.execute("INSERT INTO devices VALUES(?,?,?,?)", (service.digest(self.ids[0]), destination, "profile-1", "Телефон"))
         service.CATALOG.with_name("subscription-origin").write_text("https://subscriptions.example.test\n")

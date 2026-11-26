@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Publish the node API and subscription endpoint on a dedicated HTTPS hostname."""
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import fnmatch
 import os
 from pathlib import Path
@@ -14,6 +17,7 @@ from urllib.request import urlopen
 
 NGINX = Path("/etc/nginx/conf.d")
 ACME = Path("/etc/letsencrypt")
+PUBLIC_API_DIR = Path("/etc/anet-wizard/public-api")
 
 
 def write(path, data, mode=0o644):
@@ -21,6 +25,34 @@ def write(path, data, mode=0o644):
         tmp.write(data)
     os.chmod(tmp.name, mode)
     os.replace(tmp.name, path)
+
+
+def persist_origin(domain, port, *, public_api_dir=None, catalog_dirs=None):
+    origin = f"https://{domain}\n"
+    api_dir = Path(public_api_dir) if public_api_dir is not None else PUBLIC_API_DIR
+    api_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(api_dir, 0o755)
+    origin_file = api_dir / f"{port}.origin"
+    write(origin_file, origin, 0o644)
+    if catalog_dirs is None:
+        discovered = []
+        for base in (Path("/root"), *Path("/home").glob("*")):
+            try:
+                discovered.extend(base.glob(".local/state/anet-wizard/*/panel/vless-catalog"))
+            except OSError:
+                continue
+        catalog_dirs = discovered
+    written = [origin_file]
+    for catalog_dir in catalog_dirs:
+        catalog_dir = Path(catalog_dir)
+        try:
+            if (catalog_dir / "index.json").is_file():
+                target = catalog_dir / "subscription-origin"
+                write(target, origin, 0o444)
+                written.append(target)
+        except OSError:
+            continue
+    return written
 
 
 def config(domain, port, https):
@@ -47,7 +79,8 @@ server {{
     access_log off;
     error_log /dev/null;
     location = /api/v1/node-healthz {{ default_type text/plain; return 200 "ANet node API"; }}
-    location ~ ^/api/v1/(?:control/nodes/|check_access$|vless-subscriptions/[A-Za-z0-9_-]+$) {{
+    location ~ ^/api/v1/(?:control/nodes/|check_access$|vless-subscriptions/[A-Za-z0-9_-]+$|subscriptions/[A-Za-z0-9_-]+$|vless-usage/profile-[1-9][0-9]*$|ingress-sync/[A-Za-z0-9_-]+$) {{
+        client_max_body_size 64k;
         proxy_pass http://127.0.0.1:{port};
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto https;
@@ -120,6 +153,7 @@ def main():
         with urlopen(f"https://{domain}/api/v1/node-healthz", timeout=12) as r:
             if r.read(80) != b"ANet node API":
                 raise ValueError("Проверка публичного HTTPS-адреса не прошла.")
+        persist_origin(domain, port)
         hooks = ACME / "renewal-hooks/deploy"
         hooks.mkdir(parents=True, exist_ok=True)
         hook = hooks / f"anet-node-{domain}"

@@ -1,9 +1,15 @@
 use super::{api::validate_admin_session, dto::AdminToken};
 use crate::entities::operator_incidents as reports;
 use poem::{Error, Result, error::InternalServerError, http::StatusCode};
-use poem_openapi::{Object, OpenApi, payload::Json};
+use poem_openapi::{Object, OpenApi, param::Path, payload::Json};
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, QueryOrder, QuerySelect, Set};
 use uuid::Uuid;
+
+#[derive(Object)]
+struct DeleteIncidentResult {
+    deleted: bool,
+    id: Uuid,
+}
 
 pub struct IncidentsApi {
     pub db: DatabaseConnection,
@@ -99,6 +105,28 @@ impl IncidentsApi {
         .await
         .map_err(InternalServerError)?;
         Ok(Json(row.into()))
+    }
+
+    #[oai(path = "/operator-incidents/:id", method = "delete")]
+    async fn delete_report(
+        &self,
+        auth: AdminToken,
+        id: Path<Uuid>,
+    ) -> Result<Json<DeleteIncidentResult>> {
+        validate_admin_session(&self.db, &auth.0.token)
+            .await
+            .map_err(|e| Error::from_string(e, StatusCode::UNAUTHORIZED))?;
+        let deleted = reports::Entity::delete_by_id(id.0)
+            .exec(&self.db)
+            .await
+            .map_err(InternalServerError)?;
+        if deleted.rows_affected == 0 {
+            return Err(Error::from_status(StatusCode::NOT_FOUND));
+        }
+        Ok(Json(DeleteIncidentResult {
+            deleted: true,
+            id: id.0,
+        }))
     }
 }
 

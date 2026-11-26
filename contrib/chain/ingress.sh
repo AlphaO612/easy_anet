@@ -27,12 +27,12 @@ case "${1:-}" in
         # The guard is in force before activation, even if table 177 disappears.
         rule iptables filter INPUT -i wg-profile -j DROP
         rule iptables filter FORWARD -i wg-profile ! -o "$output" -j DROP
-        rule iptables filter FORWARD -i wg-profile -s 10.79.0.2/32 -o "$output" -j ACCEPT
+        rule iptables filter FORWARD -i wg-profile -s 10.79.0.0/24 -o "$output" -j ACCEPT
         rule iptables filter FORWARD -o wg-profile -j DROP
         rule iptables filter FORWARD -i "$output" -o wg-profile -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
         rule ip6tables filter INPUT -i wg-profile -j DROP
         rule ip6tables filter FORWARD -i wg-profile -j DROP
-        rule iptables nat POSTROUTING -s 10.79.0.2/32 -o "$output" -j MASQUERADE
+        rule iptables nat POSTROUTING -s 10.79.0.0/24 -o "$output" -j MASQUERADE
         if ip link show dev wg-profile >/dev/null 2>&1; then ip link del dev wg-profile; fi
         ip link add dev wg-profile type wireguard
         trap 'ip link del dev wg-profile' EXIT
@@ -43,7 +43,7 @@ case "${1:-}" in
             fi
         fi
         wg setconf wg-profile /input/wg.conf
-        ip addr add 10.79.0.1/30 dev wg-profile
+        ip addr add 10.79.0.1/24 dev wg-profile
         ip link set dev wg-profile mtu 1280 up
         while :; do sleep 3600 & wait $!; done
         ;;
@@ -66,7 +66,8 @@ case "${1:-}" in
             rule iptables nat POSTROUTING -m mark --mark 177 -o "$output" -j MASQUERADE
         fi
         for file in server.json tls.pem tls.key; do cp "/input/$file" "/run/$file"; done
-        chmod 0400 /run/server.json /run/tls.pem /run/tls.key
+        chmod 0600 /run/server.json
+        chmod 0400 /run/tls.pem /run/tls.key
         chown 17777:17777 /run/server.json /run/tls.pem /run/tls.key
         exec setpriv --bounding-set=-all --reuid=17777 --regid=17777 --clear-groups --no-new-privs xray run -config /run/server.json
         ;;

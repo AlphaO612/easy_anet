@@ -9,133 +9,237 @@ import { GetRouteMaps } from '@/api/route-maps'
 import type { RouteMap } from '@/models/route-map'
 import { GetGroups } from '@/api/groups'
 import type { UserGroup } from '@/models/group'
+import { extractApiError, formatDateTime } from '@/utils/format'
 
 const user = defineModel<User>('modelValue', {
   required: true,
 })
 
-// Валидность формы наружу (кнопка Create/Save в родительской модалке)
 const valid = defineModel<boolean>('valid', { default: false })
 
-// Режим создания: показываем только поля, входящие в CreateUserRequest
 const props = defineProps<{
   creating?: boolean
+  hideStatus?: boolean
+  hideReadonly?: boolean
 }>()
 
 const emit = defineEmits<{ (event: 'submit'): void }>()
+
 const availableServers = ref<Server[]>([])
 const availablePools = ref<NodePool[]>([])
 const availableRouteMaps = ref<RouteMap[]>([])
 const availableGroups = ref<UserGroup[]>([])
+const dictLoading = ref(false)
+const dictError = ref('')
 
-// Опции v-select в стандартном формате { title, value }
-const serverOptions = computed(() => availableServers.value.map(s => ({
-  title: `${s.name} (${s.address})`,
-  value: s.id,
-})))
-const poolOptions = computed(() => availablePools.value.map(pool => ({
-  title: `${pool.name} · ${pool.strategy}`,
-  value: pool.id,
-})))
-const routeMapOptions = computed(() => availableRouteMaps.value.map(map => ({
-  title: `${map.name} · rev ${map.revision}`,
-  value: map.id,
-})))
-const groupOptions = computed(() => availableGroups.value.map(group => ({
-  title: `${group.name} (+${group.duration_days} дн.)`,
-  value: group.id,
-})))
+const serverOptions = computed(() =>
+  availableServers.value.map((s) => ({
+    title: `${s.name} (${s.address})`,
+    value: s.id,
+  })),
+)
+
+const poolOptions = computed(() =>
+  availablePools.value.map((pool) => ({
+    title: `${pool.name} · ${pool.strategy}`,
+    value: pool.id,
+  })),
+)
+
+const routeMapOptions = computed(() =>
+  availableRouteMaps.value.map((map) => ({
+    title: `${map.name} · rev ${map.revision}`,
+    value: map.id,
+  })),
+)
+
+const groupOptions = computed(() =>
+  availableGroups.value.map((group) => ({
+    title: `${group.name} (+${group.duration_days} дн.)`,
+    value: group.id,
+  })),
+)
 
 const uidRules = [
   (v: string) => !!v?.trim() || 'UID обязателен',
-  (v: string) => (v && v.trim().length >= 2 && v.trim().length <= 64) || 'Длина имени должна быть от 2 до 64 символов',
+  (v: string) => {
+    const len = Array.from((v ?? '').trim()).length
+    return (len >= 2 && len <= 64) || 'Длина имени должна быть от 2 до 64 символов'
+  },
 ]
 
-onMounted(async () => {
+const loadDictionaries = async () => {
+  dictLoading.value = true
+  dictError.value = ''
   try {
-    // Загружаем справочники, включая новые Группы Пользователей
     ;[
       availableServers.value,
       availablePools.value,
       availableRouteMaps.value,
-      availableGroups.value
+      availableGroups.value,
     ] = await Promise.all([
       GetServers(),
       GetPools(),
       GetRouteMaps(),
       GetGroups(),
     ])
-
-    // Защита: гарантируем, что массивы инициализированы
-    if (!user.value.server_ids) user.value.server_ids = []
-    if (!user.value.pool_ids) user.value.pool_ids = []
-  } catch (e) {
-    console.error('Failed to fetch dictionaries inside form:', e)
+  } catch (e: unknown) {
+    dictError.value = extractApiError(e, 'Не удалось загрузить справочники серверов и групп')
+  } finally {
+    dictLoading.value = false
   }
+}
+
+onMounted(() => {
+  if (!user.value.server_ids) user.value.server_ids = []
+  if (!user.value.pool_ids) user.value.pool_ids = []
+  void loadDictionaries()
 })
 </script>
 
 <template>
   <v-form v-model="valid" @submit.prevent="emit('submit')">
-    <!-- UID (editable) -->
-    <v-text-field v-model="user.uid" label="Имя пользователя" maxlength="64" :rules="uidRules" counter="64" class="mb-3" />
+    <v-alert
+      v-if="dictError"
+      type="warning"
+      variant="tonal"
+      density="compact"
+      class="mb-3"
+    >
+      {{ dictError }}
+    </v-alert>
 
-    <details :open="!props.creating">
-      <summary v-if="props.creating" class="mb-3">Группа и маршруты ANet (необязательно)</summary>
-    <!-- Выбор группы (Тарифа) -->
-    <v-select
+    <v-text-field
+      v-model="user.uid"
+      label="Имя пользователя (UID)"
+      placeholder="например, ivan-petrov"
+      maxlength="64"
+      :rules="uidRules"
+      counter="64"
+      variant="outlined"
+      density="comfortable"
+      class="mb-3"
+      autofocus
+    />
+
+    <details :open="!props.creating" class="optional-section">
+      <summary v-if="props.creating" class="text-body-2 font-weight-medium text-medium-emphasis mb-3 cursor-pointer">
+        Группа и маршруты ANet (необязательно)
+      </summary>
+
+      <v-select
         v-model="user.group_id"
         clearable
+        :loading="dictLoading"
         :items="groupOptions"
+        item-title="title"
+        item-value="value"
         label="Группа пользователей"
-        placeholder="Выберите группу пользователей"
+        placeholder="Без группы"
+        variant="outlined"
+        density="comfortable"
         class="mb-3"
-    />
+      />
 
-    <!-- Балансируемые pools -->
-    <v-select
+      <v-select
         v-model="user.pool_ids"
         multiple
+        chips
+        closable-chips
+        :loading="dictLoading"
         :items="poolOptions"
-        label="Балансируемые pools"
-        placeholder="Выберите pools для этого пользователя"
+        item-title="title"
+        item-value="value"
+        label="Балансируемые пулы (ANet)"
+        placeholder="Выберите пулы для пользователя"
+        variant="outlined"
+        density="comfortable"
         class="mb-3"
-    />
+      />
 
-    <!-- Route map -->
-    <v-select
+      <v-select
         v-model="user.route_map_id"
         clearable
+        :loading="dictLoading"
         :items="routeMapOptions"
-        label="Route map"
-        placeholder="Политика маршрутизации"
+        item-title="title"
+        item-value="value"
+        label="Карта маршрутизации (Route map)"
+        placeholder="Политика маршрутизации по умолчанию"
+        variant="outlined"
+        density="comfortable"
         class="mb-3"
-    />
+      />
 
-    <template v-if="!props.creating">
-      <!-- Active (editable) -->
-      <v-switch v-model="user.is_active" label="Active" color="success" class="mb-2" />
+      <template v-if="!props.creating">
+        <v-switch
+          v-if="!props.hideStatus"
+          v-model="user.is_active"
+          :label="user.is_active ? 'Статус: Активен' : 'Статус: Забанен'"
+          color="success"
+          inset
+          density="comfortable"
+          class="mb-2"
+        />
 
-      <!-- Static IP (editable) -->
-      <v-text-field v-model="user.static_ip" label="Static IP" placeholder="e.g. 10.0.0.10" class="mb-3" />
-    </template>
+        <v-text-field
+          v-model="user.static_ip"
+          clearable
+          label="Статический IP (ANet)"
+          placeholder="например, 10.0.0.10"
+          hint="Оставьте пустым для автоматического выделения IP"
+          persistent-hint
+          variant="outlined"
+          density="comfortable"
+          class="mb-3"
+        />
+      </template>
 
-    <!-- ВЫБОР СЕРВЕРОВ (Many-to-Many) -->
-    <v-select
+      <v-select
         v-model="user.server_ids"
         multiple
+        chips
+        closable-chips
+        :loading="dictLoading"
         :items="serverOptions"
-        label="Привязанные сервера (Локации)"
-        placeholder="Выберите сервера для этого пользователя"
-    />
-
+        item-title="title"
+        item-value="value"
+        label="Привязанные серверы (Локации ANet)"
+        placeholder="Выберите серверы для пользователя"
+        variant="outlined"
+        density="comfortable"
+      />
     </details>
-    <template v-if="!props.creating">
+
+    <template v-if="!props.creating && !props.hideReadonly">
       <v-divider class="my-4" />
 
-      <!-- Readonly fields -->
-      <v-text-field :model-value="user.fingerprint" label="Fingerprint" disabled class="mb-3" />
-      <v-text-field :model-value="user.created_at" label="Created At" disabled />
+      <v-text-field
+        :model-value="user.fingerprint"
+        label="Fingerprint ключа ANet"
+        variant="outlined"
+        density="comfortable"
+        readonly
+        class="mb-3 mono-field"
+      />
+      <v-text-field
+        :model-value="formatDateTime(user.created_at)"
+        label="Дата создания"
+        variant="outlined"
+        density="comfortable"
+        readonly
+      />
     </template>
   </v-form>
 </template>
+
+<style scoped>
+.cursor-pointer {
+  cursor: pointer;
+}
+
+.mono-field :deep(input) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+}
+</style>

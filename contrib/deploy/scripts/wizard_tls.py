@@ -1,10 +1,16 @@
 """Import an operator-provided pair on its VPS and verify a published TLS listener."""
 import argparse
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import ipaddress
 import os
 from pathlib import Path
-import pwd
+try:
+    import pwd
+except ImportError:
+    pwd = None
 import re
 import socket
 import ssl

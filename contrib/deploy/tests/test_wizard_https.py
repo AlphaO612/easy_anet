@@ -79,12 +79,14 @@ class WizardHTTPS(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, "")
             mocks.enter_context(patch.object(https, "run", side_effect=run))
             probe = mocks.enter_context(patch.object(https, "verify_site"))
+            redirect = mocks.enter_context(patch.object(https, "verify_redirect"))
             copies = mocks.enter_context(patch.object(https, "sync_copies"))
             https.install(self.spec, "admin@example.test", "studio", "")
             self.assertEqual(probe.call_count, 2)
             self.assertEqual(probe.call_args_list[1].args[-1], b"abc")
             copies.assert_called_once_with(self.spec, b"chain", b"private")
             self.assertIn(("systemctl", "enable", "--now", "certbot.timer"), commands)
+            redirect.assert_called_once_with(["192.0.2.1"], self.spec["domain"])
             hook = (https.ACME / "renewal-hooks/deploy" / name).read_text()
             self.assertIn(str(lineage), hook)
             self.assertIn("/usr/bin/python3 -I", hook)
@@ -97,6 +99,18 @@ class WizardHTTPS(unittest.TestCase):
                 https.install(self.spec, "admin@example.test", "journal", "")
             self.assertEqual(previous, (conf.read_bytes(), html.read_bytes()))
             self.assertEqual(json.loads((https.STATE / name / "site.json").read_text()), self.spec)
+
+            probe.side_effect = None
+            copies.side_effect = ValueError("Docker unavailable")
+            with self.assertRaisesRegex(ValueError, "Сайт .* работает"):
+                https.install(self.spec, "admin@example.test", "journal", "")
+            self.assertTrue(conf.is_file())
+            self.assertNotEqual(html.read_bytes(), previous[1])
+
+    def test_redirect_points_to_the_selected_domain(self):
+        with patch.object(https, "request", return_value=(301, "https://elsewhere.test/")):
+            with self.assertRaisesRegex(ValueError, "редирект"):
+                https.verify_redirect(["127.0.0.1"], "vpn.example.test")
 
     def test_renew_for_other_lineage_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:

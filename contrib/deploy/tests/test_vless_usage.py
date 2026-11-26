@@ -1,4 +1,5 @@
 """Check per-device accounting across samples, report retries and Xray restarts."""
+from contextlib import closing
 import importlib.util
 import json
 from pathlib import Path
@@ -33,7 +34,7 @@ class Usage(unittest.TestCase):
                     service.report_route("profile-2", token)
                 verified = service.report_route("profile-1", token)
                 state = {"catalog": meter["catalog"], "source": "1" * 32}
-                with service.connect() as db:
+                with closing(service.connect()) as db, db:
                     self.assertIsNone(service.traffic_for(db, route, service.digest("phone")))
                     for generation, counters in [("pid-1", {"0": [10, 20], "starter": [3, 7]}),
                                                   ("pid-1", {"0": [20, 30]}), ("pid-1", {"0": [20, 30]}),
@@ -58,7 +59,8 @@ class Usage(unittest.TestCase):
         first = json.dumps(config)
         vless_meter.configure(config, clients)
         self.assertEqual(json.dumps(config), first)
-        self.assertEqual(config["api"]["services"], ["StatsService"])
+        self.assertEqual(config["api"]["services"], ["StatsService", "HandlerService"])
+        self.assertEqual(config["inbounds"][0]["tag"], "vless-in")
         self.assertEqual(config["inbounds"][1]["listen"], "/anet-usage/stats.sock")
         self.assertNotIn("port", config["inbounds"][1])
         self.assertEqual(clients[0]["email"], vless_meter.STARTER)

@@ -1,19 +1,108 @@
 use crate::api::dto::{Claims, NodePoolDto, NodePoolMemberDto, RouteMapDto, RouteRuleDto};
 use crate::entities::{
-    node_pool_members, node_pools, node_runtime_states, route_maps, route_rules, servers,
-    sessions, user_node_pools, users,
+    node_commands, node_pool_members, node_pools, node_runtime_states, route_maps, route_rules,
+    servers, sessions, user_node_pools, users, ProtocolType,
 };
 use crate::route_compiler::{CompiledRouteConfig, RouteRuleSpec, compile_route_map};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::{RngCore, rngs::OsRng};
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use uuid::Uuid;
 
+pub fn url_encode(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(encoded, "%{:02X}", byte);
+            }
+        }
+    }
+    encoded
+}
+
+/// Ставит в очередь команду `disconnect_user` для указанного `fingerprint` на всех активных серверах.
+pub async fn enqueue_disconnect_on_active_servers(db: &DatabaseConnection, fingerprint: &str) {
+    if fingerprint.trim().is_empty() {
+        return;
+    }
+    let active_servers = match servers::Entity::find()
+        .filter(servers::Column::IsActive.eq(true))
+        .all(db)
+        .await
+    {
+        Ok(list) => list,
+        Err(e) => {
+            log::warn!(
+                "[ControlPlane] Failed to load active servers for disconnect_user: {}",
+                e
+            );
+            return;
+        }
+    };
+    let now = chrono::Utc::now().naive_utc();
+    for srv in active_servers {
+        let cmd = node_commands::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            server_id: Set(srv.id),
+            command_type: Set("disconnect_user".to_string()),
+            accepting_connections: Set(None),
+            target_fingerprint: Set(Some(fingerprint.to_string())),
+            status: Set("pending".to_string()),
+            created_at: Set(now),
+            started_at: Set(None),
+            completed_at: Set(None),
+            error: Set(None),
+        };
+        if let Err(e) = cmd.insert(db).await {
+            log::warn!(
+                "[ControlPlane] Failed to enqueue disconnect_user on server {}: {}",
+                srv.id,
+                e
+            );
+        }
+    }
+}
+
 pub fn hash_node_token(token: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
+}
+
+pub fn sha256_hex(input: &str) -> String {
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{:02x}", byte);
+    }
+    out
+}
+
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Проверяет соответствие токена сохранённому SHA-256 хешу (поддерживает и hex, и urlsafe_no_pad).
+pub fn matches_token_hash(expected_hash: &str, raw_token: &str) -> bool {
+    let hex_hash = sha256_hex(raw_token);
+    let b64_hash = hash_node_token(raw_token);
+    constant_time_eq(expected_hash, &hex_hash) || constant_time_eq(expected_hash, &b64_hash)
 }
 
 pub fn generate_node_token() -> String {
@@ -170,6 +259,12 @@ pub fn set_live_node_session_for_fingerprint(node_id: Uuid, fingerprint: &str, c
         snap.counts
             .insert(fingerprint.to_string(), (count, existing_oldest));
     }
+}
+
+/// Удаляет конкретную ноду из in-memory реестра `LIVE_NODE_SESSIONS` (при удалении или сбросе состояния).
+pub fn remove_live_node_sessions(node_id: Uuid) {
+    let mut guard = live_sessions_map().lock().unwrap();
+    guard.remove(&node_id);
 }
 
 /// Очищает протухшие снимки нод (> 45с) и возвращает агрегированную карту живых сессий,
@@ -346,19 +441,35 @@ pub async fn load_route_map_dto(
     })
 }
 
-pub async fn resolve_client_servers(
+#[derive(Debug, Clone)]
+pub struct ResolvedServerEntry {
+    pub server: servers::Model,
+    pub pool_name: Option<String>,
+    pub pool_id: Option<Uuid>,
+    pub protocol: Option<ProtocolType>,
+    pub port_or_url: Option<String>,
+    pub wrtc_mode: Option<String>,
+    pub weight: i32,
+}
+
+/// Возвращает сбалансированный список entry-записей (сервер + метаданные протокола/порта/веса из пула)
+/// для пользователя. Устаревшие/отсутствующие heartbeat не приводят к HTTP 500: такие ноды
+/// понижаются по `health_tier` балансировщиком, а здоровые узлы всегда идут первыми.
+pub async fn resolve_client_server_entries(
     db: &DatabaseConnection,
     user_id: Uuid,
     direct_servers: Vec<servers::Model>,
-) -> std::result::Result<Vec<servers::Model>, sea_orm::DbErr> {
+) -> std::result::Result<Vec<ResolvedServerEntry>, sea_orm::DbErr> {
     let links = user_node_pools::Entity::find()
         .filter(user_node_pools::Column::UserId.eq(user_id))
         .order_by_asc(user_node_pools::Column::PoolId)
         .all(db)
         .await?;
     let mut resolved = Vec::new();
-    let mut included = HashSet::new();
+    let mut included_server_proto: HashSet<(Uuid, Option<ProtocolType>)> = HashSet::new();
+    let mut included_servers: HashSet<Uuid> = HashSet::new();
     let now = chrono::Utc::now().naive_utc();
+    let (probe_metrics, _) = crate::api::probes::collect_probe_metrics(db).await;
 
     for link in links {
         let Some(pool) = node_pools::Entity::find_by_id(link.pool_id).one(db).await? else {
@@ -371,66 +482,140 @@ pub async fn resolve_client_servers(
             .filter(node_pool_members::Column::PoolId.eq(pool.id))
             .all(db)
             .await?;
-        let member_ids: Vec<_> = members.iter().map(|member| member.server_id).collect();
+        let member_ids: Vec<Uuid> = members
+            .iter()
+            .map(|member| member.server_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         if member_ids.is_empty() {
             continue;
         }
         let pool_servers = servers::Entity::find()
             .filter(servers::Column::Id.is_in(member_ids.clone()))
+            .filter(servers::Column::IsActive.eq(true))
             .all(db)
             .await?;
-        let runtime_by_id: HashMap<_, _> = node_runtime_states::Entity::find()
-            .filter(node_runtime_states::Column::ServerId.is_in(member_ids))
-            .all(db)
-            .await?
+        if pool_servers.is_empty() {
+            continue;
+        }
+        let runtime_by_id: HashMap<Uuid, node_runtime_states::Model> =
+            node_runtime_states::Entity::find()
+                .filter(node_runtime_states::Column::ServerId.is_in(member_ids))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|runtime| (runtime.server_id, runtime))
+                .collect();
+
+        let server_by_id: HashMap<Uuid, servers::Model> = pool_servers
             .into_iter()
-            .map(|runtime| (runtime.server_id, runtime))
-            .collect();
-        let weight_by_id: HashMap<_, _> = members
-            .into_iter()
-            .map(|member| (member.server_id, member.weight.max(1) as i32))
-            .collect();
-        let mut server_by_id: HashMap<_, _> = pool_servers
-            .into_iter()
-            .filter(|server| server.is_active)
-            .filter(|server| {
-                runtime_by_id.get(&server.id).is_some_and(|runtime| {
-                    runtime.accepting_connections
-                        && now
-                        .signed_duration_since(runtime.last_seen_at)
-                        .num_seconds()
-                        <= 45
-                })
-            })
             .map(|server| (server.id, server))
             .collect();
-        let mut candidates: Vec<_> = server_by_id
-            .keys()
-            .map(|server_id| crate::balancer::BalanceCandidate {
-                server_id: *server_id,
-                weight: weight_by_id.get(server_id).copied().unwrap_or(1).max(1) as u32,
-                active_connections: runtime_by_id
-                    .get(server_id)
-                    .map(|runtime| runtime.active_connections.max(0) as u64)
-                    .unwrap_or_default(),
+
+        let mut members_by_server: HashMap<Uuid, Vec<node_pool_members::Model>> = HashMap::new();
+        for member in members {
+            if server_by_id.contains_key(&member.server_id) {
+                members_by_server
+                    .entry(member.server_id)
+                    .or_default()
+                    .push(member);
+            }
+        }
+
+        let mut candidates: Vec<crate::balancer::BalanceCandidate> = members_by_server
+            .iter()
+            .map(|(&server_id, srv_members)| {
+                let weight = srv_members
+                    .iter()
+                    .map(|m| m.weight.max(1) as u32)
+                    .max()
+                    .unwrap_or(1);
+                let runtime = runtime_by_id.get(&server_id);
+                let has_runtime = runtime.is_some();
+                let is_online = runtime.is_some_and(|rt| {
+                    now.signed_duration_since(rt.last_seen_at).num_seconds() <= 45
+                });
+                let accepting_connections = runtime.map_or(true, |rt| rt.accepting_connections);
+                let active_connections = runtime
+                    .map(|rt| rt.active_connections.max(0) as u64)
+                    .unwrap_or(0);
+                let metrics = probe_metrics.get(&server_id);
+                crate::balancer::BalanceCandidate {
+                    server_id,
+                    weight,
+                    active_connections,
+                    has_runtime,
+                    is_online,
+                    accepting_connections,
+                    latency_ms: metrics.and_then(|m| m.latency_ms),
+                    loss_pct: metrics.and_then(|m| m.loss_pct),
+                    throughput_mbps: metrics.and_then(|m| m.throughput_mbps),
+                }
             })
             .collect();
+
         crate::balancer::order_candidates(&pool.strategy, user_id, pool.id, &mut candidates);
+
         for candidate in candidates {
-            if included.insert(candidate.server_id) {
-                if let Some(server) = server_by_id.remove(&candidate.server_id) {
-                    resolved.push(server);
+            let Some(server) = server_by_id.get(&candidate.server_id) else {
+                continue;
+            };
+            if let Some(mut srv_members) = members_by_server.remove(&candidate.server_id) {
+                srv_members.sort_by(|a, b| {
+                    b.weight
+                        .cmp(&a.weight)
+                        .then_with(|| a.protocol.as_str().cmp(b.protocol.as_str()))
+                });
+                for member in srv_members {
+                    if included_server_proto.insert((server.id, Some(member.protocol))) {
+                        included_servers.insert(server.id);
+                        resolved.push(ResolvedServerEntry {
+                            server: server.clone(),
+                            pool_name: Some(pool.name.clone()),
+                            pool_id: Some(pool.id),
+                            protocol: Some(member.protocol),
+                            port_or_url: member.port_or_url,
+                            wrtc_mode: member.wrtc_mode,
+                            weight: member.weight.max(1),
+                        });
+                    }
                 }
             }
         }
     }
 
     for server in direct_servers {
-        if server.is_active && included.insert(server.id) {
-            resolved.push(server);
+        if server.is_active && !included_servers.contains(&server.id) {
+            included_servers.insert(server.id);
+            resolved.push(ResolvedServerEntry {
+                server,
+                pool_name: None,
+                pool_id: None,
+                protocol: None,
+                port_or_url: None,
+                wrtc_mode: None,
+                weight: 1,
+            });
         }
     }
     Ok(resolved)
+}
+
+pub async fn resolve_client_servers(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    direct_servers: Vec<servers::Model>,
+) -> std::result::Result<Vec<servers::Model>, sea_orm::DbErr> {
+    let entries = resolve_client_server_entries(db, user_id, direct_servers).await?;
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for entry in entries {
+        if seen.insert(entry.server.id) {
+            result.push(entry.server);
+        }
+    }
+    Ok(result)
 }
 
 pub async fn compiled_routes_for_user(
@@ -475,6 +660,16 @@ pub async fn compiled_routes_for_user(
 }
 
 pub fn get_qr_html_page(config_url: &str, user_name: &str) -> String {
+    let escaped_url = config_url
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let escaped_name = user_name
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     format!(
         r#"<!DOCTYPE html>
 <html lang="ru">
@@ -501,13 +696,13 @@ pub fn get_qr_html_page(config_url: &str, user_name: &str) -> String {
             border-radius: 12px;
             padding: 32px;
             text-align: center;
-            max-width: 420px;
+            max-width: 440px;
             width: 100%;
             box-shadow: 0 8px 32px rgba(0,0,0,0.5);
         }}
         h1 {{
             color: #18a058;
-            font-size: 24px;
+            font-size: 22px;
             margin-top: 0;
             margin-bottom: 8px;
             font-family: monospace;
@@ -517,20 +712,7 @@ pub fn get_qr_html_page(config_url: &str, user_name: &str) -> String {
             color: #94a3b8;
             font-size: 14px;
             line-height: 1.5;
-            margin-bottom: 24px;
-        }}
-        .qr-container {{
-            background: white;
-            padding: 16px;
-            border-radius: 8px;
-            display: inline-block;
-            margin-bottom: 24px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-        }}
-        .qr-container img {{
-            display: block;
-            width: 200px;
-            height: 200px;
+            margin-bottom: 20px;
         }}
         .btn {{
             display: block;
@@ -541,16 +723,13 @@ pub fn get_qr_html_page(config_url: &str, user_name: &str) -> String {
             border-radius: 6px;
             font-weight: 600;
             font-size: 15px;
-            transition: background-color 0.15s ease-in-out;
             margin-bottom: 16px;
             border: none;
             cursor: pointer;
             width: 100%;
             box-sizing: border-box;
         }}
-        .btn:hover {{
-            background-color: #148043;
-        }}
+        .btn:hover {{ background-color: #148043; }}
         .input-group {{
             display: flex;
             background: #121214;
@@ -578,25 +757,15 @@ pub fn get_qr_html_page(config_url: &str, user_name: &str) -> String {
             border-radius: 4px;
             cursor: pointer;
             font-size: 12px;
-            transition: all 0.1s;
         }}
-        .btn-copy:hover {{
-            background: #333;
-            color: white;
-        }}
+        .btn-copy:hover {{ background: #333; color: white; }}
     </style>
 </head>
 <body>
     <div class="card">
-        <h1>ANet VPN for {user_name}</h1>
-        <p>Отсканируй QR-код приложением ANet, или скачай файл конфигурации прямо на свой компьютер.</p>
-
-        <div class="qr-container">
-            <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={config_url}" alt="Config QR" />
-        </div>
-
+        <h1>ANet VPN — {user_name}</h1>
+        <p>Скачайте файл конфигурации или скопируйте защищённую ссылку ниже. Никакие сторонние QR-сервисы не используются.</p>
         <a href="{config_url}" class="btn">Download client.toml</a>
-
         <div class="input-group">
             <input type="text" readonly id="link-input" value="{config_url}" />
             <button class="btn-copy" onclick="copyLink()">Copy</button>
@@ -608,16 +777,14 @@ pub fn get_qr_html_page(config_url: &str, user_name: &str) -> String {
             copyText.select();
             copyText.setSelectionRange(0, 99999);
             navigator.clipboard.writeText(copyText.value);
-
             var btn = document.querySelector(".btn-copy");
             btn.textContent = "Copied!";
-            setTimeout(function() {{
-                btn.textContent = "Copy";
-            }}, 2000);
+            setTimeout(function() {{ btn.textContent = "Copy"; }}, 2000);
         }}
     </script>
 </body>
 </html>"#,
-        config_url = config_url
+        user_name = escaped_name,
+        config_url = escaped_url
     )
 }

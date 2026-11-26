@@ -1,5 +1,6 @@
 """Issue pre-authorized Xray devices and serve a scoped subscription per recipient."""
 import base64
+from contextlib import closing
 import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,8 +10,9 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import sys
 import time
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 import uuid
 
 DB = Path("/var/lib/anet-vless/profiles.sqlite")
@@ -27,6 +29,12 @@ class Problem(Exception):
 
 def digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def sanitize_path(path):
+    if path.startswith(PUBLIC):
+        return PUBLIC + "<redacted>"
+    return path
 
 
 def read_catalog():
@@ -47,18 +55,20 @@ def read_catalog():
 def connect():
     db = sqlite3.connect(DB, timeout=10)
     db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA foreign_keys=ON")
     return db
 
 
 def init():
     os.umask(0o077)
-    with connect() as db:
+    with closing(connect()) as db, db:
         db.executescript("""
             CREATE TABLE IF NOT EXISTS recipients (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, token_hash TEXT UNIQUE
             );
             CREATE TABLE IF NOT EXISTS account_links (
-                user_id TEXT PRIMARY KEY, recipient TEXT NOT NULL UNIQUE REFERENCES recipients(id)
+                user_id TEXT PRIMARY KEY, recipient TEXT NOT NULL UNIQUE REFERENCES recipients(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS traffic (
                 credential TEXT NOT NULL, source TEXT NOT NULL, upload INTEGER NOT NULL, download INTEGER NOT NULL,
@@ -66,7 +76,7 @@ def init():
             );
             CREATE TABLE IF NOT EXISTS traffic_reports (catalog TEXT PRIMARY KEY, received INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS devices (
-                credential_hash TEXT PRIMARY KEY, recipient TEXT NOT NULL, route TEXT NOT NULL, name TEXT NOT NULL,
+                credential_hash TEXT PRIMARY KEY, recipient TEXT NOT NULL REFERENCES recipients(id) ON DELETE CASCADE, route TEXT NOT NULL, name TEXT NOT NULL,
                 UNIQUE(recipient, route, name)
             );
         """)
@@ -120,7 +130,7 @@ def text_field(body, field):
 def device_rows(db, group, catalog):
     routes = catalog["routes"]
     # Match using a one-way identifier so taking a database backup does not disclose VPN credentials.
-    current = {route: {digest(key): key for key in data["devices"]} for route, data in routes.items()}
+    current = {route: {digest(key): key for key in data.get("devices", [])} for route, data in routes.items()}
     result = []
     for row in db.execute("SELECT name, route, credential_hash FROM devices WHERE recipient=? ORDER BY name, route", (group,)):
         route = routes.get(row["route"])
@@ -135,17 +145,35 @@ def device_rows(db, group, catalog):
 
 
 def account_exists(user_id):
-    # The existing auth service checks is_active before returning its QR landing page.
-    # Only the HTTP status is needed. No admin credential is stored for subscription reads.
+    # Prefer dedicated internal status endpoint; fall back to legacy QR check for older auth builds.
+    headers = {"X-Internal-Service": "vless-profiles"}
     connection = http.client.HTTPConnection("auth", 3000, timeout=5)
     try:
-        connection.request("GET", "/api/v1/config/qr/" + user_id)
-        status = connection.getresponse().status
+        connection.request("GET", "/api/v1/internal/users/" + user_id + "/status", headers=headers)
+        response = connection.getresponse()
+        status = response.status
+        payload = response.read(4096)
     finally:
         connection.close()
-    if status not in (200, 404):
-        raise Problem(503, "Не удалось проверить состояние пользователя.")
-    return status == 200
+    if status == 200:
+        try:
+            data = json.loads(payload)
+            if isinstance(data, dict) and "active" in data:
+                return bool(data["active"])
+        except (ValueError, UnicodeError):
+            pass
+        return True
+    if status in (404, 405, 501):
+        connection = http.client.HTTPConnection("auth", 3000, timeout=5)
+        try:
+            connection.request("GET", "/api/v1/config/qr/" + user_id, headers=headers)
+            status = connection.getresponse().status
+        finally:
+            connection.close()
+        if status not in (200, 404):
+            raise Problem(503, "Не удалось проверить состояние пользователя.")
+        return status == 200
+    raise Problem(503, "Не удалось проверить состояние пользователя.")
 
 
 def connect_account(db, body):
@@ -179,8 +207,9 @@ def connect_account(db, body):
     return {"id": group}
 
 
-def dispatch(db, method, path, body):
+def dispatch(db, method, path, body, query=None):
     catalog = read_catalog()
+    params = parse_qs(query or "")
     if path.startswith(PUBLIC):
         token = path[len(PUBLIC):]
         if method != "GET" or not TOKEN.fullmatch(token):
@@ -205,6 +234,39 @@ def dispatch(db, method, path, body):
             return {"groups": groups, "routes": routes, "origin": catalog.get("origin", "")}
         if method == "POST":
             return connect_account(db, body)
+    group_only = re.fullmatch(re.escape(ADMIN) + r"/([a-f0-9]{32})", path)
+    if group_only:
+        group = group_only.group(1)
+        if method == "DELETE":
+            db.execute("BEGIN IMMEDIATE")
+            exists = db.execute("SELECT 1 FROM recipients WHERE id=?", (group,)).fetchone()
+            if not exists:
+                raise Problem(404, "Получатель не найден.")
+            db.execute("DELETE FROM devices WHERE recipient=?", (group,))
+            db.execute("DELETE FROM account_links WHERE recipient=?", (group,))
+            db.execute("DELETE FROM recipients WHERE id=?", (group,))
+            return {"deleted": group}
+        raise Problem(405, "Действие не поддерживается.")
+    device_delete = re.fullmatch(re.escape(ADMIN) + r"/([a-f0-9]{32})/profiles/(.+)", path)
+    if device_delete:
+        group, raw_name = device_delete.groups()
+        if method != "DELETE":
+            raise Problem(405, "Действие не поддерживается.")
+        record = db.execute("SELECT id FROM recipients WHERE id=?", (group,)).fetchone()
+        if not record:
+            raise Problem(404, "Получатель не найден.")
+        name = text_field({"name": unquote(raw_name)}, "name")
+        route = body.get("route") if isinstance(body, dict) and "route" in body else (params.get("route", [None])[0])
+        if route is not None and (not isinstance(route, str) or not route):
+            raise Problem(400, "Неверный маршрут.")
+        db.execute("BEGIN IMMEDIATE")
+        if route:
+            cur = db.execute("DELETE FROM devices WHERE recipient=? AND route=? AND name=?", (group, route, name))
+        else:
+            cur = db.execute("DELETE FROM devices WHERE recipient=? AND name=?", (group, name))
+        if cur.rowcount == 0:
+            raise Problem(404, "Профиль не найден.")
+        return device_rows(db, group, catalog)
     match = re.fullmatch(re.escape(ADMIN) + r"/([a-f0-9]{32})/(profiles|token)", path)
     if not match:
         raise Problem(404, "Адрес не найден.")
@@ -232,6 +294,19 @@ def dispatch(db, method, path, body):
                 if key is None:
                     raise Problem(409, "На маршруте уже выданы все 128 профилей. Выберите другой вход.")
                 db.execute("INSERT INTO devices VALUES(?,?,?,?)", (key, group, route, name))
+            return device_rows(db, group, catalog)
+        if method == "DELETE":
+            raw_name = body.get("name") if isinstance(body, dict) and "name" in body else params.get("name", [None])[0]
+            name = text_field({"name": raw_name}, "name")
+            route = body.get("route") if isinstance(body, dict) and "route" in body else params.get("route", [None])[0]
+            if route is not None and (not isinstance(route, str) or not route):
+                raise Problem(400, "Неверный маршрут.")
+            if route:
+                cur = db.execute("DELETE FROM devices WHERE recipient=? AND route=? AND name=?", (group, route, name))
+            else:
+                cur = db.execute("DELETE FROM devices WHERE recipient=? AND name=?", (group, name))
+            if cur.rowcount == 0:
+                raise Problem(404, "Профиль не найден.")
             return device_rows(db, group, catalog)
     if action == "token":
         if method == "POST":
@@ -265,8 +340,9 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def handle_request(self):
+        parsed = urlsplit(self.path)
+        path = parsed.path
         try:
-            path = urlsplit(self.path).path
             if path == "/ready" and self.command == "GET" and self.client_address[0] == "127.0.0.1":
                 db = connect()
                 try:
@@ -285,27 +361,34 @@ class Handler(BaseHTTPRequestHandler):
             elif not path.startswith(PUBLIC):
                 authenticate(self.headers.get("Authorization", ""))
             body = {}
-            if self.command == "POST":
+            if self.command in ("POST", "DELETE"):
                 length = int(self.headers.get("Content-Length", "0"))
-                if not 0 <= length <= (12288 if report else 2048):
+                if not 0 <= length <= (32768 if report else 2048):
                     raise Problem(413, "Слишком большой запрос.")
-                raw = self.rfile.read(length)
+                raw = self.rfile.read(length) if length else b""
                 body = json.loads(raw) if raw else {}
                 if not isinstance(body, dict):
                     raise ValueError()
             db = connect()
             try:
                 with db:
-                    result = record_usage(db, route, body) if report else dispatch(db, self.command, path, body)
+                    result = record_usage(db, route, body) if report else dispatch(db, self.command, path, body, parsed.query)
             finally:
                 db.close()
             status = 200
         except Problem as error:
             status, result = error.status, {"error": error.message}
-        except (ValueError, UnicodeError):
+            if status >= 500:
+                print(f"[profile-service] {self.command} {sanitize_path(path)} -> {status} ({type(error).__name__})",
+                      file=sys.stderr, flush=True)
+        except (ValueError, UnicodeError) as error:
             status, result = 400, {"error": "Неверный формат запроса."}
-        except (OSError, sqlite3.Error, http.client.HTTPException):
+            print(f"[profile-service] {self.command} {sanitize_path(path)} -> {status} ({type(error).__name__})",
+                  file=sys.stderr, flush=True)
+        except (OSError, sqlite3.Error, http.client.HTTPException) as error:
             status, result = 503, {"error": "Хранилище профилей или сервис авторизации недоступен."}
+            print(f"[profile-service] {self.command} {sanitize_path(path)} -> {status} ({type(error).__name__})",
+                  file=sys.stderr, flush=True)
         binary = isinstance(result, bytes)
         data = result if binary else json.dumps(result, ensure_ascii=False).encode()
         self.send_response(status)

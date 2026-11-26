@@ -3,6 +3,8 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useDisplay } from 'vuetify'
 import Navigation from '@/components/Navigation.vue'
+import ConfirmDialog from '@/components/ConfirmDialog.vue'
+import { logout as apiLogout } from '@/api/auth'
 
 const route = useRoute()
 const router = useRouter()
@@ -26,9 +28,15 @@ const onMessage = (event: Event) => {
 onMounted(() => window.addEventListener('anet:message', onMessage))
 onBeforeUnmount(() => window.removeEventListener('anet:message', onMessage))
 
-const logout = () => {
-  localStorage.removeItem('token')
-  router.push('/')
+const handleLogout = async () => {
+  try {
+    await apiLogout()
+  } catch {
+    // Даже если сессия на сервере уже истекла, локальный токен всё равно очищаем.
+  } finally {
+    localStorage.removeItem('token')
+    router.push('/')
+  }
 }
 </script>
 
@@ -37,13 +45,12 @@ const logout = () => {
     <router-view v-if="route.meta.isAuth" />
 
     <template v-else>
-      <Navigation v-model="drawer" @logout="logout" />
+      <Navigation v-model="drawer" @logout="handleLogout" />
 
       <v-app-bar flat border>
         <v-app-bar-nav-icon @click="drawer = !drawer" />
         <v-toolbar-title>{{ pageTitle }}</v-toolbar-title>
         <v-spacer />
-
       </v-app-bar>
 
       <v-main>
@@ -52,6 +59,8 @@ const logout = () => {
         </v-container>
       </v-main>
     </template>
+
+    <ConfirmDialog />
 
     <v-snackbar v-model="snackbar.open" :color="snackbar.color" :timeout="4000">
       {{ snackbar.message }}

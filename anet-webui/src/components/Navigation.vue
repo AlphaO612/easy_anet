@@ -1,6 +1,4 @@
 <script setup lang="ts">
-import { advanced } from '@/composables/operatorMode'
-import { computed } from 'vue'
 import { useRouter } from 'vue-router'
 
 defineProps<{ modelValue: boolean }>()
@@ -11,21 +9,27 @@ const emit = defineEmits<{
 
 const router = useRouter()
 
-const navigation = [
-  { label: 'Обзор', path: '/overview', icon: 'mdi-view-dashboard-outline', group: 'Обзор' },
-  { label: 'Пользователи', path: '/users', icon: 'mdi-account-multiple-outline', group: 'Управление' },
+interface NavItem {
+  label: string
+  path: string
+  icon: string
+  group: string
+}
+
+const navigation: NavItem[] = [
+  { label: 'Топология и обзор', path: '/overview', icon: 'mdi-hub-outline', group: 'Обзор' },
+  { label: 'Пользователи и конфиги', path: '/users', icon: 'mdi-account-multiple-outline', group: 'Управление' },
   { label: 'Серверы', path: '/servers', icon: 'mdi-server', group: 'Управление' },
-  { label: 'Балансировка', path: '/pools', icon: 'mdi-lan', group: 'Управление' },
-  { label: 'IMAP Mailboxes', path: '/mailboxes', icon: 'mdi-email-outline', group: 'Управление' },
-  { label: 'Incident Reports', path: '/operator-incidents', icon: 'mdi-alert-outline', group: 'Управление' },
-  { label: 'Профили и маршруты', path: '/profile-topology', icon: 'mdi-routes', group: 'Управление' },
-  { label: 'Route Maps', path: '/route-maps', icon: 'mdi-map-marker-path', group: 'Управление' },
-  { label: 'User Groups', path: '/groups', icon: 'mdi-wallet-membership', group: 'Управление' },
-  { label: 'Трафик', path: '/statistics', icon: 'mdi-chart-line', group: 'Наблюдение' },
+  { label: 'Балансировщик и пулы', path: '/pools', icon: 'mdi-scale-balance', group: 'Управление' },
+  { label: 'Группы', path: '/groups', icon: 'mdi-account-group-outline', group: 'Управление' },
+  { label: 'Маршруты и правила', path: '/route-maps', icon: 'mdi-map-marker-path', group: 'Управление' },
+  { label: 'Топология потоков', path: '/profile-topology', icon: 'mdi-routes', group: 'Управление' },
+  { label: 'Почтовые ящики', path: '/mailboxes', icon: 'mdi-email-outline', group: 'Управление' },
+  { label: 'Статистика', path: '/statistics', icon: 'mdi-chart-line', group: 'Наблюдение' },
+  { label: 'Инциденты', path: '/operator-incidents', icon: 'mdi-alert-outline', group: 'Наблюдение' },
 ]
-const simplePaths = ['/overview', '/servers', '/profile-topology', '/users', '/pools']
-const visible = computed(() => navigation.filter(item => advanced.value || simplePaths.includes(item.path)))
-const groups = computed(() => [...new Set(visible.value.map(item => item.group))])
+
+const groups = ['Обзор', 'Управление', 'Наблюдение']
 </script>
 
 <template>
@@ -42,11 +46,11 @@ const groups = computed(() => [...new Set(visible.value.map(item => item.group))
       <template v-for="group in groups" :key="group">
         <v-list-subheader>{{ group }}</v-list-subheader>
         <v-list-item
-            v-for="item in visible.filter(entry => entry.group === group)"
-            :key="item.path"
-            :to="item.path"
-            :prepend-icon="item.icon"
-            :title="item.label"
+          v-for="item in navigation.filter(entry => entry.group === group)"
+          :key="item.path"
+          :to="item.path"
+          :prepend-icon="item.icon"
+          :title="item.label"
         />
       </template>
     </v-list>
@@ -54,7 +58,6 @@ const groups = computed(() => [...new Set(visible.value.map(item => item.group))
     <template #append>
       <v-divider />
       <div class="pa-3">
-        <v-switch v-model="advanced" label="Расширенный режим" density="compact" color="primary" hide-details />
         <v-btn block variant="tonal" color="error" prepend-icon="mdi-logout" @click="emit('logout')">
           Выйти
         </v-btn>

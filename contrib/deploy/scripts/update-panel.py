@@ -53,8 +53,15 @@ def upgrade(directory, project, cid):
     catalog.chmod(0o755)
     overlay_path = directory / "webui-mount.json"
     overlay = json.loads(overlay_path.read_text())
+    profiles_dir = directory / "profiles"
+    profiles_dir.mkdir(exist_ok=True)
+    profiles_dir.chmod(0o755)
     overlay["services"]["vless-profiles"] = {"volumes": [{
         "type": "bind", "source": str(catalog), "target": "/srv/anet-vless-catalog", "read_only": True}]}
+    overlay["services"]["auth"] = {"volumes": [
+        {"type": "bind", "source": str(profiles_dir), "target": "/srv/anet-profiles", "read_only": True},
+        {"type": "bind", "source": str(catalog), "target": "/srv/anet-vless-catalog", "read_only": True},
+    ]}
     print("Проверяю и загружаю образ панели.")
     new_refs = load_bundle(Path("bundle"), "panel-update")
     env = dict(os.environ, **{**refs, **new_refs}, STATE_DIR=str(directory / "node"),
@@ -71,8 +78,8 @@ def upgrade(directory, project, cid):
     atomic_write(candidate, json.dumps(overlay))
     cmd += ["-f", str(candidate)]
     subprocess.run([*cmd, "config", "--quiet"], env=env, check=True)
-    print("Перезапускаю интерфейс и службы регистрации VPS и выдачи профилей.", flush=True)
-    services = ("node-install", "vless-profiles", "webui")
+    print("Перезапускаю интерфейс и службы панели.", flush=True)
+    services = ("auth", "node-install", "vless-profiles", "webui") if "AUTH_IMAGE" in new_refs else ("node-install", "vless-profiles", "webui")
     up = [*cmd, "up", "-d", "--no-build", "--pull", "never", "--no-deps", "--wait", "--wait-timeout", "120"]
     previous = [name for name in services if docker("ps", "-q", "--filter", "label=com.docker.compose.project="+project,
                                                     "--filter", "label=com.docker.compose.service="+name)]

@@ -290,6 +290,21 @@ pub enum LoginResponse {
     Error,
 }
 
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct LogoutResultDto {
+    pub ok: bool,
+}
+
+#[derive(ApiResponse)]
+pub enum LogoutResponse {
+    #[oai(status = 200)]
+    Ok(Json<LogoutResultDto>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     pub jti: String,
@@ -381,8 +396,12 @@ pub struct AddUserResponse {
 pub enum AddUserApiResult {
     #[oai(status = 200)]
     Ok(Json<AddUserResponse>),
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
     #[oai(status = 401)]
     Unauthorized(Json<String>),
+    #[oai(status = 409)]
+    Conflict(Json<String>),
     #[oai(status = 500)]
     Error(Json<String>),
 }
@@ -392,12 +411,157 @@ pub struct UpdateUserRequest {
     pub uid: Option<String>,
     pub is_active: Option<bool>,
     pub static_ip: Option<String>,
+    pub clear_static_ip: Option<bool>,
     pub server_ids: Option<Vec<uuid::Uuid>>,
     pub pool_ids: Option<Vec<uuid::Uuid>>,
     pub route_map_id: Option<uuid::Uuid>,
     pub clear_route_map: Option<bool>,
     pub group_id: Option<uuid::Uuid>,
     pub clear_group: Option<bool>,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteUserDto {
+    pub deleted: bool,
+    pub id: uuid::Uuid,
+}
+
+#[derive(ApiResponse)]
+pub enum DeleteUserApiResult {
+    #[oai(status = 200)]
+    Ok(Json<DeleteUserDto>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct ResetTrafficDto {
+    pub reset: bool,
+}
+
+#[derive(ApiResponse)]
+pub enum ResetTrafficApiResult {
+    #[oai(status = 200)]
+    Ok(Json<ResetTrafficDto>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum DeleteRateApiResult {
+    #[oai(status = 204)]
+    Deleted,
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct InternalUserStatusDto {
+    pub active: bool,
+    pub id: uuid::Uuid,
+    pub uid: Option<String>,
+    pub is_active: bool,
+    pub expired: bool,
+    pub expires_at: Option<String>,
+}
+
+#[derive(ApiResponse)]
+pub enum InternalUserStatusResponse {
+    #[oai(status = 200)]
+    Ok(Json<InternalUserStatusDto>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteServerDto {
+    pub deleted: bool,
+    pub id: uuid::Uuid,
+}
+
+#[derive(ApiResponse)]
+pub enum DeleteServerApiResult {
+    #[oai(status = 200)]
+    Ok(Json<DeleteServerDto>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct ResetServerStateDto {
+    pub reset: bool,
+    pub id: uuid::Uuid,
+}
+
+#[derive(ApiResponse)]
+pub enum ResetServerStateApiResult {
+    #[oai(status = 200)]
+    Ok(Json<ResetServerStateDto>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct PoolPreviewCandidateDto {
+    pub rank: i32,
+    pub server_id: uuid::Uuid,
+    pub server_name: String,
+    pub address: String,
+    pub protocol: String,
+    pub port_or_url: Option<String>,
+    pub weight: i32,
+    pub status: String,
+    pub accepting_connections: bool,
+    pub active_connections: i64,
+    pub latency_ms: Option<f64>,
+    pub loss_pct: Option<f64>,
+    pub throughput_mbps: Option<f64>,
+    pub health_tier: String,
+    pub reason: String,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct PoolPreviewDto {
+    pub pool_id: uuid::Uuid,
+    pub pool_name: String,
+    pub strategy: String,
+    pub candidates: Vec<PoolPreviewCandidateDto>,
+}
+
+#[derive(ApiResponse)]
+pub enum GetPoolPreviewResponse {
+    #[oai(status = 200)]
+    Ok(Json<PoolPreviewDto>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
 }
 
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
@@ -623,6 +787,8 @@ pub enum DownloadConfigResponse {
         PlainText<String>,
         #[oai(header = "Content-Disposition")] String,
     ),
+    #[oai(status = 401, content_type = "application/json")]
+    Unauthorized(Json<String>),
     #[oai(status = 404, content_type = "application/json")]
     NotFound(Json<String>),
     #[oai(status = 500, content_type = "application/json")]
@@ -633,6 +799,8 @@ pub enum DownloadConfigResponse {
 pub enum QrPageResponse {
     #[oai(status = 200, content_type = "text/html")]
     Ok(PlainText<String>),
+    #[oai(status = 401, content_type = "application/json")]
+    Unauthorized(Json<String>),
     #[oai(status = 404, content_type = "application/json")]
     NotFound(Json<String>),
     #[oai(status = 500, content_type = "application/json")]

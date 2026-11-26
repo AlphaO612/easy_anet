@@ -4,7 +4,8 @@ import ipaddress
 import json
 from pathlib import Path
 import re
-import tomllib
+
+from topology import load_toml
 
 
 def overlay(binding):
@@ -41,8 +42,7 @@ def overlay(binding):
         if not re.fullmatch(r"anet-up[0-9]{1,4}", dev) or dev in result:
             raise ValueError(f"invalid or repeated uplink {dev}")
         file = Path(path["config"]).resolve(strict=True)
-        with file.open("rb") as fd:
-            config = tomllib.load(fd)
+        config = load_toml(file)
         if config["main"]["tun_name"] != dev or config["main"].get("manual_routing") is not True:
             raise ValueError(f"{file} requires manual_routing and tun_name={dev}")
         result[dev] = {

@@ -1,5 +1,7 @@
-"""Manage profile routing policies and preview a new flow using observed link metrics."""
+"""Manage profile routing policies, local probing, and multi-exit load balancing."""
+import ast
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import argparse
 import difflib
 import hashlib
@@ -7,6 +9,8 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
+import socket
 import sqlite3
 import tempfile
 from release import client_supported, record_issuance, verified_manifest
@@ -15,7 +19,85 @@ import urllib.request
 import urllib.parse
 
 
-STRATEGIES = {"strict-ip", "prefer-route", "speed", "auto"}
+STRATEGIES = {"strict-ip", "prefer-route", "speed", "auto", "weighted", "least-load", "balanced"}
+FAIL_MODES = {"fail-closed", "fail-open", "degrade"}
+
+
+def parse_toml_minimal(text):
+    """Minimal TOML parser fallback for Python 3.10 environments without tomli."""
+    root = {}
+    current = root
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[[") and line.endswith("]]"):
+            section = line[2:-2].strip()
+            target = root
+            parts = [p.strip() for p in section.split(".")]
+            for part in parts[:-1]:
+                target = target.setdefault(part, {})
+            arr = target.setdefault(parts[-1], [])
+            item = {}
+            arr.append(item)
+            current = item
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            target = root
+            for part in (p.strip() for p in section.split(".")):
+                target = target.setdefault(part, {})
+            current = target
+            continue
+        if "=" not in line:
+            continue
+        key, raw_val = (part.strip() for part in line.split("=", 1))
+        # Strip inline comments outside quoted strings
+        in_str = None
+        escaped = False
+        cleaned = []
+        for ch in raw_val:
+            if escaped:
+                cleaned.append(ch)
+                escaped = False
+                continue
+            if ch == "\\" and in_str == '"':
+                cleaned.append(ch)
+                escaped = True
+                continue
+            if ch in ('"', "'"):
+                if in_str is None:
+                    in_str = ch
+                elif in_str == ch:
+                    in_str = None
+            if ch == "#" and in_str is None:
+                break
+            cleaned.append(ch)
+        val_str = "".join(cleaned).strip()
+        if val_str == "true":
+            value = True
+        elif val_str == "false":
+            value = False
+        else:
+            try:
+                value = json.loads(val_str)
+            except ValueError:
+                value = ast.literal_eval(val_str)
+        current[key] = value
+    return root
+
+
+def load_toml(path):
+    data = Path(path).read_bytes()
+    try:
+        import tomllib
+        return tomllib.loads(data.decode("utf-8"))
+    except ModuleNotFoundError:
+        try:
+            import tomli
+            return tomli.loads(data.decode("utf-8"))
+        except ModuleNotFoundError:
+            return parse_toml_minimal(data.decode("utf-8"))
 
 
 def require(condition, message):
@@ -30,6 +112,12 @@ def validate(config):
     for name, path in paths.items():
         require(all(isinstance(path[k], str) and path[k] for k in ("entry", "exit", "transport")), name)
         ipaddress.ip_address(path["external_ip"])
+        if "weight" in path:
+            w = path["weight"]
+            require(type(w) is int and 1 <= w <= 1000, f"{name}: weight must be integer 1..1000")
+        if "probe_target" in path:
+            require(isinstance(path["probe_target"], str) and bool(path["probe_target"].strip()),
+                    f"{name}: invalid probe_target")
     outgoing = defaultdict(list)
     incoming = Counter()
     for path in paths.values():
@@ -50,10 +138,14 @@ def validate(config):
             if not incoming[target]:
                 ready.append(target)
     require(visited == len(incoming), "cyclic route")
+    allowed_profile_fields = {
+        "paths", "entry", "strategy", "external_ip", "user", "groups",
+        "rules", "require_domain", "credential_id", "ingress", "dns_path",
+        "weights", "fail_mode", "local_probe",
+    }
     for name, profile in profiles.items():
         require(profile["strategy"] in STRATEGIES, f"{name}: unknown strategy")
-        require(set(profile) <= {"paths", "entry", "strategy", "external_ip", "user", "groups",
-                                 "rules", "require_domain", "credential_id", "ingress", "dns_path"}, f"{name}: unknown profile field")
+        require(set(profile) <= allowed_profile_fields, f"{name}: unknown profile field")
         if "groups" in profile:
             require(isinstance(profile["groups"], list) and all(isinstance(g, str) for g in profile["groups"]), name)
         members = profile["paths"]
@@ -61,12 +153,115 @@ def validate(config):
         require(all(p in paths and paths[p]["entry"] == profile["entry"] for p in members), name)
         if profile["strategy"] == "strict-ip":
             ipaddress.ip_address(profile["external_ip"])
+        if "weights" in profile:
+            weights = profile["weights"]
+            require(isinstance(weights, dict) and set(weights) <= set(members), f"{name}: invalid weights keys")
+            require(all(type(v) is int and 1 <= v <= 1000 for v in weights.values()),
+                    f"{name}: weights must be integers 1..1000")
+        if "fail_mode" in profile:
+            require(profile["fail_mode"] in FAIL_MODES, f"{name}: invalid fail_mode")
+            if profile["strategy"] == "strict-ip":
+                require(profile["fail_mode"] == "fail-closed", f"{name}: strict-ip requires fail-closed")
+        if "local_probe" in profile:
+            require(isinstance(profile["local_probe"], bool), f"{name}: local_probe must be boolean")
         for rule in profile.get("rules", []):
             require(isinstance(rule["id"], str) and rule["id"], f"{name}: rule ID required")
             require(set(rule) <= {"user", "group", "protocol", "domain", "cidr", "allow", "id"}, "unknown rule field")
             require(isinstance(rule["allow"], list) and set(rule["allow"]) <= set(members), name)
             if "cidr" in rule:
                 ipaddress.ip_network(rule["cidr"])
+
+
+def _path_score(strategy, profile, paths, name, metrics):
+    m = metrics.get(name, {})
+    base_weight = float(profile.get("weights", {}).get(name, paths[name].get("weight", 1)))
+    mbps = float(m.get("mbps") if m.get("mbps") is not None else 10.0)
+    latency = max(float(m.get("latency_ms") if m.get("latency_ms") is not None else 50.0), 5.0)
+    loss = max(float(m.get("loss") if m.get("loss") is not None else 0.0), 0.0)
+    load = max(float(m.get("load", m.get("active_connections", 0.0)) or 0.0), 0.0)
+    if strategy == "speed":
+        return base_weight * max(mbps, 0.1)
+    if strategy == "weighted":
+        return base_weight
+    return base_weight * max(mbps, 1.0) / ((1.0 + loss * 10.0) * latency * (1.0 + load))
+
+
+def _compute_weights(strategy, profile, paths, available, metrics):
+    if not available:
+        return {}, []
+    if strategy in {"strict-ip", "prefer-route"}:
+        chosen = available[0]
+        return {chosen: 100}, [(chosen, 100)]
+    if strategy == "weighted":
+        weights = {p: int(profile.get("weights", {}).get(p, paths[p].get("weight", 1))) for p in available}
+        return weights, [(p, weights[p]) for p in available]
+    raw_scores = {p: max(_path_score(strategy, profile, paths, p, metrics), 1e-6) for p in available}
+    total = sum(raw_scores.values())
+    weights = {p: max(1, int(round(100.0 * raw_scores[p] / total))) for p in available}
+    return weights, [(p, weights[p]) for p in available]
+
+
+def _parse_probe_target(path_info):
+    target = path_info.get("probe_target")
+    if not target and isinstance(path_info.get("probe"), dict):
+        target = path_info["probe"].get("target")
+    if not target:
+        host = path_info.get("gateway") or path_info.get("external_ip")
+        return (host, 443) if host else None
+    target = str(target).strip()
+    if "://" in target:
+        parsed = urllib.parse.urlsplit(target)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return (host, port) if host else None
+    if target.startswith("["):
+        match = re.fullmatch(r"\[([^\]]+)\](?::([0-9]+))?", target)
+        if match:
+            return match.group(1), int(match.group(2) or 443)
+    if ":" in target and target.count(":") == 1:
+        host, port_str = target.rsplit(":", 1)
+        if port_str.isdigit():
+            return host, int(port_str)
+    return target, 443
+
+
+def _default_tcp_probe(host, port, interface, timeout):
+    start = time.monotonic()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        if interface and hasattr(socket, "SO_BINDTODEVICE"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, interface.encode("ascii") + b"\0")
+        sock.connect((host, port))
+        return (time.monotonic() - start) * 1000.0
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+def probe_local_paths(paths, timeout=2.0, *, tcp_probe=None, now=None):
+    """Probe egress paths directly (TCP connect + RTT) without requiring Prometheus/Blackbox."""
+    probe_fn = tcp_probe or _default_tcp_probe
+    timestamp = time.time() if now is None else now
+    if not paths:
+        return {}
+
+    def check(item):
+        name, info = item
+        endpoint = _parse_probe_target(info)
+        if not endpoint:
+            return name, dict(up=False, expires=timestamp + 45, loss=1.0, source="local_probe")
+        host, port = endpoint
+        rtt = probe_fn(host, port, info.get("interface"), timeout)
+        if rtt is None or rtt < 0:
+            return name, dict(up=False, expires=timestamp + 45, loss=1.0, source="local_probe")
+        return name, dict(up=True, expires=timestamp + 45, latency_ms=round(float(rtt), 2),
+                          loss=0.0, mbps=10.0, source="local_probe")
+
+    workers = min(8, len(paths))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return dict(pool.map(check, paths.items()))
 
 
 def decide(config, session, now):
@@ -96,23 +291,48 @@ def decide(config, session, now):
             allowed, reason = rule["allow"], rule["id"]
             break
     metrics = session["metrics"]
+    strategy = profile["strategy"]
+    fail_mode = profile.get("fail_mode", "fail-closed")
+    degraded = False
+
     available = [p for p in allowed if metrics.get(p, {}).get("up") is True and metrics[p]["expires"] > now]
-    if profile["strategy"] == "speed":
-        available = [p for p in available if "mbps" in metrics[p]]
-    if profile["strategy"] == "auto":
-        available = [p for p in available if "loss" in metrics[p] and "latency_ms" in metrics[p]]
+    if not available and allowed and fail_mode in {"fail-open", "degrade"} and strategy != "strict-ip":
+        any_fresh = any(p in metrics and metrics[p].get("expires", 0) > now for p in allowed)
+        if not any_fresh:
+            fallback = session.get("fallback_paths", allowed)
+            available = [p for p in allowed if p in fallback and metrics.get(p, {}).get("up") is not False]
+            if available:
+                degraded = True
+
+    if not degraded:
+        if strategy == "speed":
+            available = [p for p in available if "mbps" in metrics[p]]
+        if strategy == "auto":
+            available = [p for p in available if "loss" in metrics[p] and "latency_ms" in metrics[p]]
     previous = session.get("previous")
     old_ip = paths.get(previous, {}).get("external_ip")
-    strategy = profile["strategy"]
     if strategy == "strict-ip":
         available = [p for p in available if paths[p]["external_ip"] == profile["external_ip"]]
     if strategy in {"prefer-route", "strict-ip"}:
         available.sort(key=lambda p: (p != previous, paths[p]["external_ip"] != old_ip))
+    elif strategy == "weighted":
+        available.sort(key=lambda p: (
+            -int(profile.get("weights", {}).get(p, paths[p].get("weight", 1))),
+            metrics.get(p, {}).get("loss", 0),
+            metrics.get(p, {}).get("latency_ms", 0),
+            p != previous,
+        ))
+    elif strategy in {"least-load", "balanced"}:
+        scores = {p: _path_score(strategy, profile, paths, p, metrics) for p in available}
+        available.sort(key=lambda p: (-scores[p], metrics.get(p, {}).get("loss", 0),
+                                      metrics.get(p, {}).get("latency_ms", 0), p != previous))
     elif strategy == "auto":
-        available.sort(key=lambda p: (metrics[p]["loss"], metrics[p]["latency_ms"], -metrics[p].get("mbps", 0), p != previous))
+        available.sort(key=lambda p: (metrics.get(p, {}).get("loss", 0),
+                                      metrics.get(p, {}).get("latency_ms", 0),
+                                      -metrics.get(p, {}).get("mbps", 0), p != previous))
     else:
-        available.sort(key=lambda p: (-metrics[p]["mbps"], p != previous))
-        if previous in available and available[0] != previous:
+        available.sort(key=lambda p: (-metrics.get(p, {}).get("mbps", 0), p != previous))
+        if not degraded and previous in available and available[0] != previous:
             def sustained(p):
                 samples = metrics[p].get("history", [])[-3:]
                 baseline = metrics[previous].get("history", [])[-3:]
@@ -125,9 +345,11 @@ def decide(config, session, now):
             available.remove(chosen)
             available.insert(0, chosen)
     chosen = next(iter(available), None)
+    weights, distribution = _compute_weights(strategy, profile, paths, available, metrics)
     return dict(profile=session["profile"], rule=reason, strategy=strategy, previous=previous,
                 eligible=available, selected=chosen, action="route" if chosen else "deny",
-                previous_ip=old_ip, external_ip=paths[chosen]["external_ip"] if chosen else None)
+                previous_ip=old_ip, external_ip=paths[chosen]["external_ip"] if chosen else None,
+                weights=weights, distribution=distribution, degraded=degraded)
 
 
 def read(path):
@@ -191,7 +413,7 @@ def observed_metrics(config, snapshot, now):
             if len(windows) == 3 and all(value is not None for value in windows):
                 metrics[name]["history"] = [dict(at=int(now) - 15 * (2 - i), mbps=value)
                                             for i, value in enumerate(windows)]
-            for key in ("loss", "latency_ms", "mbps"):
+            for key in ("loss", "latency_ms", "mbps", "load", "active_connections"):
                 if link.get(key) is not None:
                     metrics[name][key] = link[key]
     return metrics

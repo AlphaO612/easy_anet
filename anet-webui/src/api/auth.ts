@@ -17,3 +17,9 @@ export async function login(data: LoginRequest): Promise<string> {
 
   return res.access_token
 }
+
+export async function logout(): Promise<void> {
+  await api<void>('/logout', {
+    method: 'POST',
+  })
+}

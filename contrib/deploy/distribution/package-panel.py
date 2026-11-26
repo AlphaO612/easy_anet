@@ -12,13 +12,16 @@ sys.path.insert(0, str(HERE.parent / "scripts"))
 from bundle import pack
 
 
-def prepare(directory, image, tag):
+def prepare(directory, image, tag, auth_image=None):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag):
         raise ValueError("Invalid release tag")
     directory.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         bundle = Path(tmp) / "bundle"
-        pack(bundle, ["WEBUI_IMAGE="+image])
+        specs = ["WEBUI_IMAGE=" + image]
+        if auth_image:
+            specs.append("AUTH_IMAGE=" + auth_image)
+        pack(bundle, specs)
         archive = directory / "panel-update.tar.gz"
         with tarfile.open(archive,"w:gz",compresslevel=2) as tar:
             tar.add(bundle,arcname="bundle")
@@ -35,5 +38,6 @@ if __name__ == "__main__":
     parser.add_argument("directory", type=Path)
     parser.add_argument("image")
     parser.add_argument("tag")
+    parser.add_argument("--auth-image", help="optional AUTH_IMAGE to include alongside WEBUI_IMAGE")
     args = parser.parse_args()
-    prepare(args.directory, args.image, args.tag)
+    prepare(args.directory, args.image, args.tag, args.auth_image)

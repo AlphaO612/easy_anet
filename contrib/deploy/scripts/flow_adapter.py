@@ -6,9 +6,8 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import tomllib
 
-from topology import atomic_write
+from topology import atomic_write, load_toml
 
 HERE = Path(__file__).resolve().parent
 
@@ -35,8 +34,7 @@ def attach(overlay, local, state, listener):
                     shutil.copyfile(local[field], generated / "server" / dest)
                     (generated / "server" / dest).chmod(0o600)
             generated.rename(directory)
-    with (state / "entry/client.toml").open("rb") as file:
-        keys = tomllib.load(file)["keys"]
+    keys = load_toml(state / "entry/client.toml")["keys"]
     uplink = directory / "entry.toml"
     if not uplink.exists():
         atomic_write(uplink, '[main]\nmanual_routing = true\ntun_name = "anet-uplink"\n[keys]\n'

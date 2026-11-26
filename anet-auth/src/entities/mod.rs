@@ -33,3 +33,7 @@ pub mod flow_reports;
 pub mod uplink_keys;
 pub mod profile_credentials;
 pub mod flow_history;
+pub mod ingress_routes;
+pub mod user_devices;
+pub mod user_device_traffic_sources;
+pub mod user_subscriptions;
