@@ -27,6 +27,8 @@ pub struct ServerDto {
     pub ssh_user: Option<String>,
     pub is_active: bool,
     pub has_control_credential: bool,
+    pub region: String,
+    pub tags: String,
     pub runtime: Option<NodeRuntimeDto>,
 }
 
@@ -226,6 +228,8 @@ pub struct CreateServerRequest {
     pub wrtc_mode: Option<String>,
     pub ssh_user: Option<String>,
     pub is_active: Option<bool>,
+    pub region: Option<String>,
+    pub tags: Option<String>,
 }
 
 #[derive(ApiResponse)]
@@ -252,6 +256,8 @@ pub struct UpdateServerRequest {
     pub wrtc_mode: Option<Option<String>>,
     pub ssh_user: Option<Option<String>>,
     pub is_active: Option<bool>,
+    pub region: Option<String>,
+    pub tags: Option<String>,
 }
 
 #[derive(ApiResponse)]

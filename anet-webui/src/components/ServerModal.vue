@@ -4,6 +4,7 @@ import NodeInvitationSteps from './NodeInvitationSteps.vue'
 import { useAppMessage } from '@/composables/useAppMessage'
 import { GetNodeCommandStatus, IssueNodeInvitation, RotateNodeCredential, SetNodeAdmission, UpdateServer } from '@/api/servers'
 import type { Server } from '@/models/server'
+import { REGION_OPTIONS } from '@/utils/regions'
 
 // ИСПРАВЛЕНО: Убрано 'show', теперь ловит дефолтный v-model из родителя
 const show = defineModel<boolean>()
@@ -30,6 +31,8 @@ const form = ref({
   ahttp_url: '',
   wrtc_url: '',
   wrtc_mode: 'media_video',
+  region: '',
+  tags: '',
 })
 
 const wrtcModeOptions = [
@@ -127,6 +130,8 @@ watch(
           ahttp_url: val.ahttp_url || '',
           wrtc_url: val.wrtc_url || '',
           wrtc_mode: val.wrtc_mode || 'media_video',
+          region: val.region || '',
+          tags: val.tags || '',
         }
       }
     },
@@ -168,6 +173,28 @@ const close = () => {
       <v-card-text>
         <v-form>
           <v-text-field v-model="form.name" label="Название локации" variant="filled" class="mb-3" />
+
+          <v-row dense class="mb-2">
+            <v-col cols="12" sm="6">
+              <v-select
+                v-model="form.region"
+                :items="REGION_OPTIONS"
+                item-title="title"
+                item-value="code"
+                label="Страна / Регион"
+                variant="filled"
+                clearable
+              />
+            </v-col>
+            <v-col cols="12" sm="6">
+              <v-text-field
+                v-model="form.tags"
+                label="Группы / теги (через запятую)"
+                placeholder="Gateway, Exit, VLESS, Fast"
+                variant="filled"
+              />
+            </v-col>
+          </v-row>
 
           <!-- Изменили поле DSN на "IP Адрес или Домен" -->
           <v-text-field v-model="form.address" label="IP Адрес или Домен" placeholder="e.g. 203.0.113.10 или vpn.example.com" variant="filled" class="mb-3" />

@@ -7,6 +7,7 @@ import { api as request } from '@/api/client'
 import { CreateServer, IssueNodeInvitation } from '@/api/servers'
 import { advanced } from '@/composables/operatorMode'
 import type { CreateServerRequest, NodeCredential, Server } from '@/models/server'
+import { REGION_OPTIONS } from '@/utils/regions'
 
 const show = defineModel<boolean>()
 const emit = defineEmits<{ created: [] }>()
@@ -22,6 +23,8 @@ const defaults = (): CreateServerRequest => ({
   quic_port: 48010,
   ssh_port: 22,
   is_active: true,
+  region: '',
+  tags: '',
 })
 
 const form = ref<CreateServerRequest>(defaults())
@@ -257,6 +260,27 @@ onBeforeUnmount(() => {
                 type="number"
                 min="1"
                 max="65535"
+                variant="outlined"
+                density="comfortable"
+              />
+            </v-col>
+            <v-col cols="12" sm="6">
+              <v-select
+                v-model="form.region"
+                :items="REGION_OPTIONS"
+                item-title="title"
+                item-value="code"
+                label="Страна / Регион"
+                variant="outlined"
+                density="comfortable"
+                clearable
+              />
+            </v-col>
+            <v-col cols="12" sm="6">
+              <v-text-field
+                v-model="form.tags"
+                label="Группы / теги (через запятую)"
+                placeholder="Exit, Europe, Streaming"
                 variant="outlined"
                 density="comfortable"
               />

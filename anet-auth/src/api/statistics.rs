@@ -316,6 +316,24 @@ impl StatisticsApi {
             return DisconnectConnectionResponse::Unauthorized(Json(err));
         }
 
+        // Если это VLESS/WireGuard устройство (fingerprint вида "dev:<uuid> ..."), отзываем устройство
+        if let Some(rest) = req.0.fingerprint.strip_prefix("dev:") {
+            let uuid_part = rest.split_whitespace().next().unwrap_or(rest);
+            if let Ok(dev_id) = Uuid::parse_str(uuid_part) {
+                if let Ok(Some(dev)) = crate::entities::user_devices::Entity::find_by_id(dev_id)
+                    .one(&self.db)
+                    .await
+                {
+                    let mut active = dev.into_active_model();
+                    active.status = Set("revoked".to_string());
+                    return match active.update(&self.db).await {
+                        Ok(_) => DisconnectConnectionResponse::Ok,
+                        Err(e) => DisconnectConnectionResponse::Error(Json(e.to_string())),
+                    };
+                }
+            }
+        }
+
         let command_id = Uuid::new_v4();
         let command = node_commands::ActiveModel {
             id: Set(command_id),
@@ -645,6 +663,81 @@ impl StatisticsApi {
                 fingerprint: total.fingerprint, // <-- Передаем отпечаток
             });
         }
+
+        // Добавляем активные VLESS и WireGuard устройства (user_devices), у которых шёл трафик за последние 5 минут
+        let dev_threshold = now - chrono::Duration::seconds(300);
+        if let Ok(recent_devs) = crate::entities::user_devices::Entity::find()
+            .filter(crate::entities::user_devices::Column::Status.eq("active"))
+            .filter(crate::entities::user_devices::Column::LastTrafficAt.gte(dev_threshold))
+            .all(&self.db)
+            .await
+        {
+            if !recent_devs.is_empty() {
+                let users_map: HashMap<Uuid, String> = users::Entity::find()
+                    .all(&self.db)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|u| (u.id, u.uid.unwrap_or_else(|| u.id.to_string())))
+                    .collect();
+                let servers_map: HashMap<Uuid, String> = servers::Entity::find()
+                    .all(&self.db)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| (s.id, s.name))
+                    .collect();
+                let routes_map: HashMap<String, crate::entities::ingress_routes::Model> =
+                    crate::entities::ingress_routes::Entity::find()
+                        .all(&self.db)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|r| (r.id.clone(), r))
+                        .collect();
+
+                for dev in recent_devs {
+                    let rx = dev.upload_bytes.max(0);
+                    let tx = dev.download_bytes.max(0);
+                    if rx == 0 && tx == 0 {
+                        continue;
+                    }
+                    let route = dev.route_id.as_deref().and_then(|rid| routes_map.get(rid));
+                    let server_id = route
+                        .and_then(|r| r.entry_server_id.or(r.exit_server_id))
+                        .unwrap_or(Uuid::nil());
+                    let server_name = route
+                        .map(|r| {
+                            let base = r
+                                .entry_server_id
+                                .and_then(|sid| servers_map.get(&sid))
+                                .cloned()
+                                .unwrap_or_else(|| r.entry_host.clone());
+                            format!("{} → {}", base, r.exit_host)
+                        })
+                        .unwrap_or_else(|| "Gateway".to_string());
+                    let base_user = users_map
+                        .get(&dev.user_id)
+                        .cloned()
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    let username = format!("{} ({})", base_user, dev.name);
+
+                    dtos.push(ActiveConnectionDto {
+                        user_id: dev.user_id,
+                        username,
+                        server_id,
+                        server_name,
+                        rx_bytes: rx,
+                        tx_bytes: tx,
+                        connection_count: 1,
+                        protocol: dev.protocol.clone(),
+                        fingerprint: format!("dev:{} ({})", dev.id, dev.name),
+                    });
+                }
+            }
+        }
+
+        dtos.sort_by_key(|d| std::cmp::Reverse(d.rx_bytes.saturating_add(d.tx_bytes)));
 
         Ok(Json(dtos))
     }

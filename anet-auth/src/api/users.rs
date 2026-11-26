@@ -654,6 +654,8 @@ pub async fn build_user_client_toml(
         })
         .unwrap_or_default();
 
+    let sys_settings = crate::api::alerts_and_sites::load_system_settings(db).await;
+
     let mut config_output = template_content;
     if !config_output.contains("{{RULES_URL}}") && !config_output.contains("[routing]") {
         config_output.push_str(&format!(
@@ -661,6 +663,13 @@ pub async fn build_user_client_toml(
             computed_rules_url
         ));
     }
+    config_output.push_str(&format!(
+        "\n[acceleration]\noperating_mode = \"{}\"\nmulti_exit_enabled = {}\nparallel_transports = {}\nauto_failover = {}\n",
+        sys_settings.operating_mode,
+        sys_settings.multi_exit_enabled,
+        sys_settings.parallel_transports,
+        sys_settings.auto_failover
+    ));
     config_output.push_str(&servers_toml);
 
     let final_output = config_output

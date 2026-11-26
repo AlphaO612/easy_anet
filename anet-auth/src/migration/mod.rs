@@ -43,6 +43,7 @@ mod m20261122_000042_flow_history;
 mod m20261122_000038_operator_incidents;
 pub mod m20261126_000043_unified_ingress_and_devices;
 pub mod m20261126_000044_telemetry_alerts_and_sites;
+pub mod m20261126_000045_settings_regions_and_multibond;
 
 use sea_orm_migration::prelude::*;
 
@@ -96,6 +97,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261122_000042_flow_history::Migration),
             Box::new(m20261126_000043_unified_ingress_and_devices::Migration),
             Box::new(m20261126_000044_telemetry_alerts_and_sites::Migration),
+            Box::new(m20261126_000045_settings_regions_and_multibond::Migration),
         ]
     }
 }

@@ -24,6 +24,8 @@ const tgForm = reactive({
   bot_token: '',
   chat_id: '',
   cooldown_minutes: 15,
+  proxy_url: '',
+  api_base_url: '',
 })
 
 async function loadTelegram() {
@@ -33,6 +35,8 @@ async function loadTelegram() {
     tgForm.enabled = cfg.enabled
     tgForm.chat_id = cfg.chat_id
     tgForm.cooldown_minutes = cfg.cooldown_minutes
+    tgForm.proxy_url = cfg.proxy_url || ''
+    tgForm.api_base_url = cfg.api_base_url || ''
     tgForm.bot_token = ''
     tgHasToken.value = cfg.has_bot_token
     tgUpdatedAt.value = cfg.updated_at ?? null
@@ -51,6 +55,8 @@ async function saveTelegram() {
       bot_token: tgForm.bot_token.trim() || null,
       chat_id: tgForm.chat_id.trim(),
       cooldown_minutes: Number(tgForm.cooldown_minutes) || 15,
+      proxy_url: tgForm.proxy_url.trim(),
+      api_base_url: tgForm.api_base_url.trim(),
     })
     tgHasToken.value = saved.has_bot_token
     tgUpdatedAt.value = saved.updated_at ?? null
@@ -185,6 +191,24 @@ onMounted(() => {
             min="1"
             max="1440"
             label="Интервал повтора (мин)"
+            variant="outlined"
+            density="comfortable"
+          />
+        </v-col>
+        <v-col cols="12" md="6">
+          <v-text-field
+            v-model="tgForm.proxy_url"
+            label="HTTP/HTTPS прокси (опционально, если Telegram недоступен напрямую)"
+            placeholder="http://user:pass@exit-vps:3128"
+            variant="outlined"
+            density="comfortable"
+          />
+        </v-col>
+        <v-col cols="12" md="6">
+          <v-text-field
+            v-model="tgForm.api_base_url"
+            label="Альтернативный Bot API URL (reverse proxy на exit-ноде)"
+            placeholder="https://tg-relay.example.com"
             variant="outlined"
             density="comfortable"
           />

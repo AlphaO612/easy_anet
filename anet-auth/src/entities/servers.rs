@@ -32,6 +32,8 @@ pub struct Model {
     pub probe_manifest: Option<String>,
     pub probe_applied: i64,
     pub probe_error: Option<String>,
+    pub region: String,
+    pub tags: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

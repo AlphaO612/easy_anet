@@ -11,6 +11,7 @@ import { exportNodeInventory } from '@/api/probes'
 import type { Server } from '@/models/server'
 import type { CreateIngressRouteRequest, CreateIngressRouteResponse, IngressRoute } from '@/models/device'
 import { copyText, extractApiError, formatDateTime, formatUptime } from '@/utils/format'
+import { formatRegionBadge, formatRegionFull, parseTags } from '@/utils/regions'
 import ServerModal from '@/components/ServerModal.vue'
 import ProbeRevisionDialog from '@/components/ProbeRevisionDialog.vue'
 import CreateServerModal from '@/components/CreateServerModal.vue'
@@ -41,11 +42,73 @@ const probeNode = ref<Server | null>(null)
 const data = ref<Server[]>([])
 const loading = ref(false)
 const searchQuery = ref('')
+const selectedRegion = ref<string>('ALL')
+const selectedTag = ref<string>('ALL')
+const groupByRegion = ref(false)
 const starter = ref<StarterProfile[]>([])
 const loadError = ref('')
 const inventoryError = ref('')
 const admissionBusy = reactive<Record<string, boolean>>({})
 const actionBusy = reactive<Record<string, boolean>>({})
+
+const regionFilterOptions = computed(() => {
+  const counts = new Map<string, number>()
+  for (const s of data.value) {
+    const code = (s.region || '').trim().toUpperCase() || 'UNSET'
+    counts.set(code, (counts.get(code) ?? 0) + 1)
+  }
+  return Array.from(counts.entries())
+    .sort((a, b) => (a[0] === 'UNSET' ? 1 : b[0] === 'UNSET' ? -1 : a[0].localeCompare(b[0])))
+    .map(([code, count]) => ({
+      code,
+      label: code === 'UNSET' ? 'Без страны' : formatRegionBadge(code),
+      count,
+    }))
+})
+
+const tagFilterOptions = computed(() => {
+  const counts = new Map<string, number>()
+  for (const s of data.value) {
+    for (const t of parseTags(s.tags)) {
+      counts.set(t, (counts.get(t) ?? 0) + 1)
+    }
+  }
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([tag, count]) => ({ tag, count }))
+})
+
+const filteredServers = computed(() => {
+  const q = searchQuery.value.trim().toLowerCase()
+  return data.value.filter((s) => {
+    const code = (s.region || '').trim().toUpperCase() || 'UNSET'
+    if (selectedRegion.value !== 'ALL' && code !== selectedRegion.value) return false
+    if (selectedTag.value !== 'ALL' && !parseTags(s.tags).includes(selectedTag.value)) return false
+    if (q) {
+      const hay = `${s.name} ${s.address} ${s.region || ''} ${s.tags || ''}`.toLowerCase()
+      if (!hay.includes(q)) return false
+    }
+    return true
+  })
+})
+
+const groupedServers = computed(() => {
+  const groups = new Map<string, Server[]>()
+  for (const s of filteredServers.value) {
+    const code = (s.region || '').trim().toUpperCase() || 'UNSET'
+    const list = groups.get(code) ?? []
+    list.push(s)
+    groups.set(code, list)
+  }
+  return Array.from(groups.entries())
+    .sort((a, b) => (a[0] === 'UNSET' ? 1 : b[0] === 'UNSET' ? -1 : a[0].localeCompare(b[0])))
+    .map(([code, items]) => ({
+      code,
+      title: code === 'UNSET' ? '🌐 Без страны / группы' : formatRegionFull(code),
+      items,
+      onlineCount: items.filter((i) => i.runtime?.status === 'online').length,
+    }))
+})
 
 const addressCounts = computed(() => {
   const counts = new Map<string, number>()
@@ -363,17 +426,28 @@ onBeforeUnmount(() => {
 
     <!-- Вкладка 1: Ноды ANet -->
     <div v-if="activeTab === 'nodes'">
-      <div class="d-flex justify-space-between align-center flex-wrap ga-2 mb-4">
-        <v-text-field
-          v-model="searchQuery"
-          prepend-inner-icon="mdi-magnify"
-          label="Поиск по названию или IP..."
-          variant="outlined"
-          density="compact"
-          hide-details
-          single-line
-          style="max-width: 300px"
-        />
+      <div class="d-flex justify-space-between align-center flex-wrap ga-2 mb-3">
+        <div class="d-flex align-center flex-wrap ga-2">
+          <v-text-field
+            v-model="searchQuery"
+            prepend-inner-icon="mdi-magnify"
+            label="Поиск по названию, IP, стране, тегу..."
+            variant="outlined"
+            density="compact"
+            hide-details
+            single-line
+            style="min-width: 260px; max-width: 320px"
+          />
+          <v-switch
+            v-model="groupByRegion"
+            label="Группировать по странам"
+            color="primary"
+            density="compact"
+            hide-details
+            inset
+            class="ms-1"
+          />
+        </div>
         <div class="d-flex align-center ga-2">
           <v-btn v-if="advanced" :loading="exporting" variant="text" @click="downloadInventory">Экспорт inventory</v-btn>
           <v-btn color="primary" prepend-icon="mdi-plus" @click="showCreateModal = true">
@@ -382,27 +456,126 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
+      <!-- Фильтры по странам и тегам -->
+      <div v-if="regionFilterOptions.length || tagFilterOptions.length" class="d-flex flex-wrap align-center ga-2 mb-4">
+        <v-chip
+          size="small"
+          :color="selectedRegion === 'ALL' ? 'primary' : undefined"
+          :variant="selectedRegion === 'ALL' ? 'flat' : 'outlined'"
+          @click="selectedRegion = 'ALL'"
+        >
+          Все страны ({{ data.length }})
+        </v-chip>
+        <v-chip
+          v-for="r in regionFilterOptions"
+          :key="r.code"
+          size="small"
+          :color="selectedRegion === r.code ? 'primary' : undefined"
+          :variant="selectedRegion === r.code ? 'flat' : 'outlined'"
+          @click="selectedRegion = selectedRegion === r.code ? 'ALL' : r.code"
+        >
+          {{ r.label }} ({{ r.count }})
+        </v-chip>
+
+        <v-divider v-if="tagFilterOptions.length" vertical class="mx-1" />
+
+        <v-chip
+          v-for="t in tagFilterOptions"
+          :key="t.tag"
+          size="small"
+          prepend-icon="mdi-tag-outline"
+          :color="selectedTag === t.tag ? 'secondary' : undefined"
+          :variant="selectedTag === t.tag ? 'flat' : 'tonal'"
+          @click="selectedTag = selectedTag === t.tag ? 'ALL' : t.tag"
+        >
+          {{ t.tag }} ({{ t.count }})
+        </v-chip>
+      </div>
+
       <v-alert v-if="loadError || inventoryError" type="warning" variant="tonal" class="mb-3">{{ loadError || inventoryError }}</v-alert>
       <v-alert v-if="exportError" type="error" variant="tonal" class="mb-3">{{ exportError }}</v-alert>
 
+      <!-- Сгруппированный вид по странам -->
+      <div v-if="groupByRegion" class="d-flex flex-column ga-4">
+        <v-card v-for="grp in groupedServers" :key="grp.code" variant="outlined" class="rounded-lg">
+          <v-card-title class="d-flex align-center justify-space-between py-3 px-4 border-b">
+            <span class="text-subtitle-1 font-weight-bold">{{ grp.title }}</span>
+            <div class="d-flex align-center ga-2">
+              <v-chip size="x-small" color="success" variant="tonal">
+                Онлайн: {{ grp.onlineCount }} / {{ grp.items.length }}
+              </v-chip>
+            </div>
+          </v-card-title>
+          <v-table density="comfortable" hover>
+            <thead>
+              <tr>
+                <th>Название и теги</th>
+                <th>Адрес</th>
+                <th class="text-center">Состояние</th>
+                <th class="text-end">Сессии</th>
+                <th class="text-end">Uptime</th>
+                <th class="text-center">Действия</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="item in grp.items" :key="item.id" class="cursor-pointer" @click="openEdit(item)">
+                <td>
+                  <div class="font-weight-bold">{{ item.name }}</div>
+                  <div v-if="parseTags(item.tags).length" class="d-flex flex-wrap ga-1 mt-1">
+                    <v-chip v-for="tg in parseTags(item.tags)" :key="tg" size="x-small" variant="tonal" color="secondary">
+                      {{ tg }}
+                    </v-chip>
+                  </div>
+                </td>
+                <td>
+                  <code class="text-primary">{{ displayEndpoint(item) }}</code>
+                </td>
+                <td class="text-center">
+                  <v-chip :color="!item.runtime ? 'default' : item.runtime.status === 'online' ? 'success' : 'error'" size="small">
+                    {{ !item.runtime ? 'Нет телеметрии' : item.runtime.status === 'online' ? 'На связи' : 'Связь потеряна' }}
+                  </v-chip>
+                </td>
+                <td class="text-end">{{ item.runtime?.active_connections ?? '—' }}</td>
+                <td class="text-end text-caption text-medium-emphasis">{{ formatUptime(item.runtime?.uptime_seconds) }}</td>
+                <td class="text-center" @click.stop>
+                  <v-btn icon="mdi-lan-connect" variant="text" size="small" title="Проверки связности" @click="probeNode = item" />
+                  <v-btn icon="mdi-pencil" size="small" variant="text" title="Редактировать" @click="openEdit(item)" />
+                  <v-btn icon="mdi-delete" size="small" variant="text" color="error" title="Удалить" @click="deleteNode(item)" />
+                </td>
+              </tr>
+            </tbody>
+          </v-table>
+        </v-card>
+      </div>
+
       <v-data-table
+        v-else
         :headers="headers"
-        :items="data"
-        :search="searchQuery"
+        :items="filteredServers"
         :loading="loading"
-        :items-per-page="10"
+        :items-per-page="20"
         :items-per-page-options="[10, 20, 50]"
-        items-per-page-text="Items per page:"
+        items-per-page-text="Строк на странице:"
         loading-text="Загрузка нод…"
-        no-data-text="Серверов пока нет — добавьте первую ноду!"
+        no-data-text="Серверы не найдены"
         density="comfortable"
         class="border rounded-lg"
         hover
         @click:row="(_: unknown, row: { item: Server }) => openEdit(row.item)"
       >
         <template #item.name="{ item }">
-          <div class="font-weight-bold">{{ item.name }}</div>
-          <div v-if="exitIds.has(item.id)" class="text-caption text-medium-emphasis">Выход по плану установки</div>
+          <div class="d-flex align-center flex-wrap ga-1">
+            <v-chip v-if="item.region" size="x-small" variant="tonal" color="primary">
+              {{ formatRegionBadge(item.region) }}
+            </v-chip>
+            <span class="font-weight-bold">{{ item.name }}</span>
+          </div>
+          <div v-if="parseTags(item.tags).length || exitIds.has(item.id)" class="d-flex flex-wrap align-center ga-1 mt-1">
+            <v-chip v-for="tg in parseTags(item.tags)" :key="tg" size="x-small" variant="outlined" color="secondary">
+              {{ tg }}
+            </v-chip>
+            <span v-if="exitIds.has(item.id)" class="text-caption text-medium-emphasis">Выход</span>
+          </div>
         </template>
 
         <template #item.address="{ item }">
@@ -526,7 +699,7 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- Вкладка 2: Входные точки VLESS / WireGuard -->
-    <div v-else>
+    <div v-else-if="activeTab === 'ingress'">
       <v-alert v-if="ingressOrigin" type="info" variant="tonal" density="compact" class="mb-4">
         <div class="d-flex align-center justify-space-between flex-wrap ga-2">
           <div>

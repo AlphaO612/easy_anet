@@ -557,7 +557,18 @@ const connectionHeaders = [
         <v-tabs v-model="activeTab" color="primary">
           <v-tab value="nodes">По узлам</v-tab>
           <v-tab value="users">По пользователям</v-tab>
-          <v-tab value="connections">Активные подключения</v-tab>
+          <v-tab value="connections">
+            Активные подключения
+            <v-chip
+              v-if="activeConnections.length"
+              size="x-small"
+              color="success"
+              variant="tonal"
+              class="ms-2"
+            >
+              {{ activeConnections.length }}
+            </v-chip>
+          </v-tab>
         </v-tabs>
         <v-text-field
             v-model="searchQuery"
@@ -652,7 +663,12 @@ const connectionHeaders = [
               <span class="metric total">{{ value }}</span>
             </template>
             <template #item.protocol="{ value }">
-              <v-chip size="small" variant="tonal" class="text-uppercase" color="info">
+              <v-chip
+                size="small"
+                variant="tonal"
+                class="text-uppercase"
+                :color="value === 'vless' ? 'primary' : value === 'wireguard' ? 'teal' : 'info'"
+              >
                 {{ value }}
               </v-chip>
             </template>

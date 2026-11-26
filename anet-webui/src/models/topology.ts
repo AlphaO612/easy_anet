@@ -21,6 +21,8 @@ export interface GraphNode {
   probe_revision: number
   probe_applied: number
   probe_error?: string | null
+  region?: string
+  tags?: string
 }
 
 export interface GraphEdge {

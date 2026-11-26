@@ -209,6 +209,8 @@ pub struct GraphNodeDto {
     pub probe_revision: i64,
     pub probe_applied: i64,
     pub probe_error: Option<String>,
+    pub region: String,
+    pub tags: String,
 }
 
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +333,15 @@ fn resolve_subscription_origin() -> String {
         .ok()
         .map(|u| u.trim().trim_end_matches('/').to_string())
         .unwrap_or_default()
+}
+
+async fn resolve_subscription_origin_async(db: &DatabaseConnection) -> String {
+    let settings = crate::api::alerts_and_sites::load_system_settings(db).await;
+    let override_url = settings.subscription_origin_override.trim().trim_end_matches('/');
+    if !override_url.is_empty() {
+        return override_url.to_string();
+    }
+    resolve_subscription_origin()
 }
 
 /// Автоматически импортирует маршруты из смонтированных каталогов мастера в `ingress_routes`
@@ -561,7 +572,7 @@ async fn device_to_dto(
             }
         }
         "anet" => {
-            let origin = resolve_subscription_origin();
+            let origin = resolve_subscription_origin_async(db).await;
             let base = if origin.is_empty() { None } else { Some(origin) };
             match build_user_client_toml(db, client_template_path, dev.user_id, base).await {
                 Ok((_, toml)) => (None, Some(toml)),
@@ -611,7 +622,7 @@ impl DevicesApi {
             .map_err(InternalServerError)?;
 
         Ok(Json(IngressRoutesResponseDto {
-            origin: resolve_subscription_origin(),
+            origin: resolve_subscription_origin_async(&self.db).await,
             routes: rows.into_iter().map(route_to_dto).collect(),
         }))
     }
@@ -779,7 +790,7 @@ impl DevicesApi {
         Ok(Json(UserDevicesResponseDto {
             user_id: id.0,
             subscription_active: sub_active,
-            subscription_origin: resolve_subscription_origin(),
+            subscription_origin: resolve_subscription_origin_async(&self.db).await,
             devices: dtos,
         }))
     }
@@ -1185,7 +1196,7 @@ impl DevicesApi {
             .map_err(InternalServerError)?;
 
             let path = format!("/api/v1/subscriptions/{}", token);
-            let origin = resolve_subscription_origin();
+            let origin = resolve_subscription_origin_async(&self.db).await;
             let url = if origin.is_empty() {
                 path.clone()
             } else {
@@ -1259,7 +1270,7 @@ impl DevicesApi {
         .map_err(InternalServerError)?;
 
         let path = format!("/api/v1/subscriptions/{}", token);
-        let origin = resolve_subscription_origin();
+        let origin = resolve_subscription_origin_async(&self.db).await;
         let url = if origin.is_empty() {
             path.clone()
         } else {
@@ -1333,8 +1344,18 @@ impl DevicesApi {
             .map_err(InternalServerError)?;
 
         let encryptor = DbEncryptor::new();
-        // Сортируем активные VLESS-устройства: сначала живые маршруты с минимальной задержкой (RTT)
-        let mut ranked: Vec<(u8, f64, String)> = Vec::new();
+        let settings = crate::api::alerts_and_sites::load_system_settings(&self.db).await;
+        let server_regions: HashMap<Uuid, String> = servers::Entity::find()
+            .all(&self.db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !s.region.trim().is_empty())
+            .map(|s| (s.id, s.region))
+            .collect();
+
+        // Сортируем активные VLESS-устройства согласно режиму работы (сначала живые маршруты с минимальной задержкой)
+        let mut ranked: Vec<(u8, f64, i64, String)> = Vec::new();
         for dev in devices {
             if let Some(route) = dev.route_id.as_deref().and_then(|rid| routes.get(rid)) {
                 let uuid = dev
@@ -1348,14 +1369,40 @@ impl DevicesApi {
                     _ => 0,
                 };
                 let rtt = route.last_latency_ms.unwrap_or(9_999.0);
-                ranked.push((health_rank, rtt, render_vless_uri(&uuid, route, &dev.name)));
+                let exit_region = route
+                    .exit_server_id
+                    .and_then(|sid| server_regions.get(&sid))
+                    .cloned()
+                    .unwrap_or_default();
+                let mut label_meta: Vec<String> = Vec::new();
+                if !exit_region.is_empty() {
+                    label_meta.push(exit_region);
+                }
+                if let Some(ms) = route.last_latency_ms {
+                    label_meta.push(format!("{}ms", ms.round() as i64));
+                }
+                let display_name = if label_meta.is_empty() {
+                    dev.name.clone()
+                } else {
+                    format!("{} [{}]", dev.name, label_meta.join(" · "))
+                };
+                let load_score = dev.upload_bytes.saturating_add(dev.download_bytes);
+                ranked.push((health_rank, rtt, load_score, render_vless_uri(&uuid, route, &display_name)));
             }
         }
         ranked.sort_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            let health = a.0.cmp(&b.0);
+            if health != std::cmp::Ordering::Equal {
+                return health;
+            }
+            if settings.operating_mode == "high_throughput" {
+                a.2.cmp(&b.2)
+                    .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            } else {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            }
         });
-        let uris: Vec<String> = ranked.into_iter().map(|(_, _, uri)| uri).collect();
+        let uris: Vec<String> = ranked.into_iter().map(|(_, _, _, uri)| uri).collect();
 
         if uris.is_empty() {
             return Err(Error::from_string(
@@ -1499,6 +1546,7 @@ impl DevicesApi {
 
         let source = req.0.source.trim().to_string();
         let mut updated_device_ids: HashSet<Uuid> = HashSet::new();
+        let mut active_delta_ids: HashSet<Uuid> = HashSet::new();
         if !source.is_empty() {
             for (key, pair) in &req.0.totals {
                 if pair.len() != 2 {
@@ -1540,6 +1588,9 @@ impl DevicesApi {
                 };
 
                 // Записываем дельту VLESS/WireGuard в traffic_hourly для графика истории трафика
+                if delta_up > 0 || delta_down > 0 {
+                    active_delta_ids.insert(dev_id);
+                }
                 if (delta_up > 0 || delta_down > 0) && stat_server_id.is_some() {
                     if let (Some(srv_id), Some(dev_row)) = (stat_server_id, dev_map.get(&dev_id)) {
                         let fp = format!("{}:{}", dev_row.protocol, dev_row.id);
@@ -1580,7 +1631,7 @@ impl DevicesApi {
             }
         }
 
-        // Обновляем суммарные счётчики по всем устройствам маршрута (включая 0 Б — чтобы было видно, что отчёт пришёл)
+        // Обновляем суммарные счётчики по всем устройствам маршрута; last_traffic_at двигаем при реальной дельте байт
         for dev in &route_devices {
             let sources = user_device_traffic_sources::Entity::find()
                 .filter(user_device_traffic_sources::Column::DeviceId.eq(dev.id))
@@ -1590,9 +1641,13 @@ impl DevicesApi {
             let total_up: i64 = sources.iter().map(|s| s.upload_bytes.max(0)).sum();
             let total_down: i64 = sources.iter().map(|s| s.download_bytes.max(0)).sum();
             let mut active = dev.clone().into_active_model();
-            if updated_device_ids.contains(&dev.id) || dev.last_traffic_at.is_none() {
+            if updated_device_ids.contains(&dev.id) {
                 active.upload_bytes = Set(total_up);
                 active.download_bytes = Set(total_down);
+            }
+            if active_delta_ids.contains(&dev.id)
+                || (dev.last_traffic_at.is_none() && (total_up > 0 || total_down > 0))
+            {
                 active.last_traffic_at = Set(Some(now));
             }
             active.synced_at = Set(Some(now));
@@ -1930,7 +1985,7 @@ impl DevicesApi {
             let sid = s.id.to_string();
             let rt = runtimes.get(&s.id);
             let heartbeat_age_sec = rt.map(|r| now.signed_duration_since(r.last_seen_at).num_seconds().max(0));
-            let is_online = heartbeat_age_sec.is_some_and(|age| age <= 45);
+            let is_online = heartbeat_age_sec.is_some_and(|age| age <= 90);
             let accepting = rt.map_or(true, |r| r.accepting_connections);
             let status = if rt.is_none() {
                 "unknown"
@@ -1992,6 +2047,8 @@ impl DevicesApi {
                 probe_revision: s.probe_revision,
                 probe_applied: s.probe_applied,
                 probe_error: s.probe_error.clone(),
+                region: s.region.clone(),
+                tags: s.tags.clone(),
             });
         }
 
@@ -2016,6 +2073,8 @@ impl DevicesApi {
                 probe_revision: 0,
                 probe_applied: 0,
                 probe_error: None,
+                region: String::new(),
+                tags: String::new(),
             });
         }
 
@@ -2073,7 +2132,20 @@ impl DevicesApi {
             });
         }
 
-        let total_active_sessions: i64 = all_sessions.iter().map(|s| s.sessions.max(0) as i64).sum();
+        let recent_vless_wg_sessions: i64 = all_devices
+            .iter()
+            .filter(|d| {
+                d.status == "active"
+                    && (d.upload_bytes > 0 || d.download_bytes > 0)
+                    && d.last_traffic_at
+                        .is_some_and(|ts| now.signed_duration_since(ts).num_seconds() <= 300)
+            })
+            .count() as i64;
+        let total_active_sessions: i64 = all_sessions
+            .iter()
+            .map(|s| s.sessions.max(0) as i64)
+            .sum::<i64>()
+            + recent_vless_wg_sessions;
 
         Ok(Json(TopologyGraphDto {
             generated_at: now.and_utc().to_rfc3339(),

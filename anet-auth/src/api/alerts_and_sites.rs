@@ -2,19 +2,20 @@ use crate::api::api::{matches_token_hash, node_token_is_valid, sha256_hex, valid
 use crate::api::dto::AdminToken;
 use crate::crypto::DbEncryptor;
 use crate::entities::{
-    ingress_routes, node_runtime_states, servers, site_bundles, telegram_alert_configs,
+    ingress_routes, node_runtime_states, servers, site_bundles, system_settings,
+    telegram_alert_configs, traffic_hourly,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::Utc;
 use log::{info, warn};
 use poem::{error::InternalServerError, http::StatusCode, Error, Result};
 use poem_openapi::{
-    param::{Header, Path},
+    param::{Header, Path, Query},
     payload::Json,
     Object, OpenApi,
 };
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{DatabaseConnection, EntityTrait, QueryOrder, Set};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,8 @@ pub struct TelegramAlertConfigDto {
     pub has_bot_token: bool,
     pub chat_id: String,
     pub cooldown_minutes: i32,
+    pub proxy_url: String,
+    pub api_base_url: String,
     pub updated_at: Option<String>,
 }
 
@@ -38,12 +41,59 @@ pub struct SaveTelegramAlertRequest {
     pub bot_token: Option<String>,
     pub chat_id: String,
     pub cooldown_minutes: Option<i32>,
+    /// HTTP/HTTPS прокси для доставки уведомлений (например http://user:pass@exit:3128)
+    pub proxy_url: Option<String>,
+    /// Альтернативный адрес Telegram Bot API (например reverse-proxy на зарубежном exit-сервере)
+    pub api_base_url: Option<String>,
 }
 
 #[derive(Object, Debug, Clone)]
 pub struct TelegramTestResponse {
     pub ok: bool,
     pub message: String,
+}
+
+#[derive(Object, Debug, Clone)]
+pub struct SitePreviewDto {
+    pub domain: String,
+    pub mode: String,
+    pub preset: String,
+    pub title: String,
+    pub html: String,
+}
+
+#[derive(Object, Debug, Clone)]
+pub struct SystemSettingsDto {
+    /// "balanced" | "low_latency" | "high_throughput" | "failover_only"
+    pub operating_mode: String,
+    pub multi_exit_enabled: bool,
+    pub parallel_transports: bool,
+    pub auto_failover: bool,
+    pub metrics_enabled: bool,
+    pub metrics_retention_days: i32,
+    pub probe_interval_seconds: i32,
+    pub sync_interval_seconds: i32,
+    pub subscription_origin_override: String,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Object, Debug, Clone)]
+pub struct SaveSystemSettingsRequest {
+    pub operating_mode: String,
+    pub multi_exit_enabled: bool,
+    pub parallel_transports: bool,
+    pub auto_failover: bool,
+    pub metrics_enabled: bool,
+    pub metrics_retention_days: i32,
+    pub probe_interval_seconds: i32,
+    pub sync_interval_seconds: i32,
+    pub subscription_origin_override: String,
+}
+
+#[derive(Object, Debug, Clone)]
+pub struct PruneMetricsResponse {
+    pub deleted_rows: u64,
+    pub retention_days: i32,
 }
 
 #[derive(Object, Debug, Clone)]
@@ -189,11 +239,49 @@ pub async fn resolve_site_bundle_for_domain(
         .flatten()
 }
 
-async fn send_telegram_message(bot_token: &str, chat_id: &str, text: &str) -> anyhow::Result<()> {
-    let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token.trim());
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .build()?;
+pub async fn load_system_settings(db: &DatabaseConnection) -> system_settings::Model {
+    if let Ok(Some(row)) = system_settings::Entity::find_by_id(1).one(db).await {
+        return row;
+    }
+    system_settings::Model {
+        id: 1,
+        operating_mode: "balanced".to_string(),
+        multi_exit_enabled: true,
+        parallel_transports: true,
+        auto_failover: true,
+        metrics_enabled: true,
+        metrics_retention_days: 30,
+        probe_interval_seconds: 30,
+        sync_interval_seconds: 30,
+        subscription_origin_override: String::new(),
+        updated_at: Utc::now().naive_utc(),
+    }
+}
+
+async fn send_telegram_message(
+    bot_token: &str,
+    chat_id: &str,
+    text: &str,
+    proxy_url: &str,
+    api_base_url: &str,
+) -> anyhow::Result<()> {
+    let base = api_base_url.trim().trim_end_matches('/');
+    let base_url = if base.is_empty() {
+        "https://api.telegram.org"
+    } else if base.starts_with("https://") || base.starts_with("http://") {
+        base
+    } else {
+        anyhow::bail!("API Base URL должен начинаться с https:// или http://");
+    };
+    let url = format!("{}/bot{}/sendMessage", base_url, bot_token.trim());
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(14));
+    let proxy_clean = proxy_url.trim();
+    if !proxy_clean.is_empty() {
+        let proxy = reqwest::Proxy::all(proxy_clean)
+            .map_err(|e| anyhow::anyhow!("Некорректный proxy_url '{}': {}", proxy_clean, e))?;
+        builder = builder.proxy(proxy);
+    }
+    let client = builder.build()?;
     let resp = client
         .post(&url)
         .json(&serde_json::json!({
@@ -211,16 +299,38 @@ async fn send_telegram_message(bot_token: &str, chat_id: &str, text: &str) -> an
     Ok(())
 }
 
-/// Фоновый мониторинг узлов и маршрутов с отправкой алертов в Telegram при падении и восстановлении.
+/// Фоновый мониторинг узлов и маршрутов с отправкой алертов в Telegram при падении и восстановлении
+/// + автоматическая ротация старых метрик по расписанию.
 pub fn spawn_alert_monitor(db: DatabaseConnection) {
     tokio::spawn(async move {
         let mut unhealthy_since: HashMap<String, Instant> = HashMap::new();
         let mut last_notified: HashMap<String, Instant> = HashMap::new();
+        let mut last_prune = Instant::now();
         // Прогрев 60с после старта, чтобы шлюзы успели прислать первый синк
         tokio::time::sleep(Duration::from_secs(60)).await;
-        info!("Telegram alert monitor started");
+        info!("Telegram alert monitor & metrics retention worker started");
 
         loop {
+            // Автоматическая ротация старых метрик раз в 6 часов
+            if last_prune.elapsed() >= Duration::from_secs(6 * 3600) {
+                let settings = load_system_settings(&db).await;
+                let days = settings.metrics_retention_days.clamp(1, 365);
+                let cutoff = Utc::now().naive_utc() - chrono::Duration::days(days as i64);
+                if let Ok(res) = traffic_hourly::Entity::delete_many()
+                    .filter(traffic_hourly::Column::BucketStart.lt(cutoff))
+                    .exec(&db)
+                    .await
+                {
+                    if res.rows_affected > 0 {
+                        info!(
+                            "Metrics retention pruned {} traffic_hourly rows older than {} days",
+                            res.rows_affected, days
+                        );
+                    }
+                }
+                last_prune = Instant::now();
+            }
+
             if let Ok(Some(cfg)) = telegram_alert_configs::Entity::find_by_id(1).one(&db).await {
                 if cfg.enabled && !cfg.chat_id.trim().is_empty() {
                     let encryptor = DbEncryptor::new();
@@ -304,7 +414,15 @@ pub fn spawn_alert_monitor(db: DatabaseConnection) {
                                 .get(key)
                                 .map_or(true, |prev| now_inst.duration_since(*prev) >= cooldown);
                             if should_send {
-                                match send_telegram_message(&bot_token, &cfg.chat_id, msg).await {
+                                match send_telegram_message(
+                                    &bot_token,
+                                    &cfg.chat_id,
+                                    msg,
+                                    &cfg.proxy_url,
+                                    &cfg.api_base_url,
+                                )
+                                .await
+                                {
                                     Ok(()) => {
                                         last_notified.insert(key.clone(), now_inst);
                                     }
@@ -323,7 +441,15 @@ pub fn spawn_alert_monitor(db: DatabaseConnection) {
                             unhealthy_since.remove(&key);
                             if last_notified.remove(&key).is_some() {
                                 let msg = format!("🟢 Восстановлено: {}", key);
-                                if let Err(e) = send_telegram_message(&bot_token, &cfg.chat_id, &msg).await {
+                                if let Err(e) = send_telegram_message(
+                                    &bot_token,
+                                    &cfg.chat_id,
+                                    &msg,
+                                    &cfg.proxy_url,
+                                    &cfg.api_base_url,
+                                )
+                                .await
+                                {
                                     warn!("Failed to send Telegram recovery alert: {}", e);
                                 }
                             }
@@ -357,6 +483,8 @@ impl AlertsAndSitesApi {
                 has_bot_token: m.encrypted_bot_token.as_deref().is_some_and(|s| !s.is_empty()),
                 chat_id: m.chat_id,
                 cooldown_minutes: m.cooldown_minutes,
+                proxy_url: m.proxy_url,
+                api_base_url: m.api_base_url,
                 updated_at: Some(m.updated_at.and_utc().to_rfc3339()),
             },
             None => TelegramAlertConfigDto {
@@ -364,12 +492,14 @@ impl AlertsAndSitesApi {
                 has_bot_token: false,
                 chat_id: String::new(),
                 cooldown_minutes: 15,
+                proxy_url: String::new(),
+                api_base_url: String::new(),
                 updated_at: None,
             },
         }))
     }
 
-    /// Сохранить настройки Telegram-уведомлений.
+    /// Сохранить настройки Telegram-уведомлений (включая прокси / альтернативный API-маршрут).
     #[oai(path = "/alerts/telegram", method = "put")]
     async fn save_telegram_config(
         &self,
@@ -397,6 +527,25 @@ impl AlertsAndSitesApi {
 
         let cooldown = req.0.cooldown_minutes.unwrap_or(15).clamp(1, 1440);
         let chat_id = req.0.chat_id.trim().to_string();
+        let proxy_url = req
+            .0
+            .proxy_url
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| existing.as_ref().map(|m| m.proxy_url.clone()).unwrap_or_default());
+        let api_base_url = req
+            .0
+            .api_base_url
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .unwrap_or_else(|| existing.as_ref().map(|m| m.api_base_url.clone()).unwrap_or_default());
+        if !api_base_url.is_empty()
+            && !api_base_url.starts_with("https://")
+            && !api_base_url.starts_with("http://")
+        {
+            return Err(Error::from_string(
+                "API Base URL должен начинаться с https:// или http://",
+                StatusCode::BAD_REQUEST,
+            ));
+        }
         let now = Utc::now().naive_utc();
 
         telegram_alert_configs::Entity::insert(telegram_alert_configs::ActiveModel {
@@ -405,6 +554,8 @@ impl AlertsAndSitesApi {
             encrypted_bot_token: Set(encrypted_token.clone()),
             chat_id: Set(chat_id.clone()),
             cooldown_minutes: Set(cooldown),
+            proxy_url: Set(proxy_url.clone()),
+            api_base_url: Set(api_base_url.clone()),
             updated_at: Set(now),
         })
         .on_conflict(
@@ -414,6 +565,8 @@ impl AlertsAndSitesApi {
                     telegram_alert_configs::Column::EncryptedBotToken,
                     telegram_alert_configs::Column::ChatId,
                     telegram_alert_configs::Column::CooldownMinutes,
+                    telegram_alert_configs::Column::ProxyUrl,
+                    telegram_alert_configs::Column::ApiBaseUrl,
                     telegram_alert_configs::Column::UpdatedAt,
                 ])
                 .to_owned(),
@@ -427,6 +580,8 @@ impl AlertsAndSitesApi {
             has_bot_token: encrypted_token.is_some(),
             chat_id,
             cooldown_minutes: cooldown,
+            proxy_url,
+            api_base_url,
             updated_at: Some(now.and_utc().to_rfc3339()),
         }))
     }
@@ -455,14 +610,232 @@ impl AlertsAndSitesApi {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| Error::from_string("Не указан Bot Token", StatusCode::BAD_REQUEST))?;
 
-        let msg = "✅ ANet Easy: тестовое уведомление успешно доставлено. Мониторинг нод и шлюзов активен.";
-        match send_telegram_message(&token, &cfg.chat_id, msg).await {
+        let route_note = if !cfg.api_base_url.trim().is_empty() {
+            format!(" (через {})", cfg.api_base_url.trim())
+        } else if !cfg.proxy_url.trim().is_empty() {
+            " (через HTTP-прокси)".to_string()
+        } else {
+            " (напрямую)".to_string()
+        };
+        let msg = format!(
+            "✅ ANet Easy: тестовое уведомление успешно доставлено{}. Мониторинг нод и шлюзов активен.",
+            route_note
+        );
+        match send_telegram_message(&token, &cfg.chat_id, &msg, &cfg.proxy_url, &cfg.api_base_url).await {
             Ok(()) => Ok(Json(TelegramTestResponse {
                 ok: true,
-                message: "Сообщение отправлено в Telegram".into(),
+                message: format!("Сообщение отправлено в Telegram{}", route_note),
             })),
             Err(e) => Err(Error::from_string(e.to_string(), StatusCode::BAD_GATEWAY)),
         }
+    }
+
+    /// Предпросмотр встроенного пресета сайта маскировки (возвращает готовый HTML).
+    #[oai(path = "/sites/preview", method = "get")]
+    async fn preview_site_preset(
+        &self,
+        auth: AdminToken,
+        preset: Query<Option<String>>,
+        title: Query<Option<String>>,
+    ) -> Result<Json<SitePreviewDto>> {
+        validate_admin_session(&self.db, &auth.0.token)
+            .await
+            .map_err(|e| Error::from_string(e, StatusCode::UNAUTHORIZED))?;
+
+        let preset_id = preset
+            .0
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("studio")
+            .to_lowercase();
+        let custom_title = title.0.unwrap_or_default();
+        let html = render_preset_html(&preset_id, &custom_title);
+        Ok(Json(SitePreviewDto {
+            domain: "*".into(),
+            mode: "preset".into(),
+            preset: preset_id,
+            title: custom_title,
+            html,
+        }))
+    }
+
+    /// Получить сохранённый HTML сайта маскировки для домена (для live-предпросмотра в WebUI).
+    #[oai(path = "/sites/:domain/html", method = "get")]
+    async fn get_site_html(
+        &self,
+        auth: AdminToken,
+        domain: Path<String>,
+    ) -> Result<Json<SitePreviewDto>> {
+        validate_admin_session(&self.db, &auth.0.token)
+            .await
+            .map_err(|e| Error::from_string(e, StatusCode::UNAUTHORIZED))?;
+
+        let dom = domain.0.trim().to_lowercase();
+        if let Some(bundle) = resolve_site_bundle_for_domain(&self.db, &dom).await {
+            let html = if bundle.mode == "custom_zip" {
+                format!(
+                    r#"<!doctype html><html lang="ru"><head><meta charset="utf-8"><style>body{{margin:0;background:#0f172a;color:#e2e8f0;font:15px/1.6 system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}}.card{{max-width:34rem;padding:2rem;background:#1e293b;border:1px solid #334155;border-radius:14px}}h2{{margin:0 0 .5rem}}code{{color:#38bdf8}}</style></head><body><div class="card"><h2>ZIP-архив для {}</h2><p>Загружен многофайловый статический бандл (SHA-256: <code>{}</code>). Для проверки откройте живой домен в новой вкладке.</p></div></body></html>"#,
+                    escape_html(&dom),
+                    escape_html(&bundle.bundle_sha256.chars().take(16).collect::<String>())
+                )
+            } else {
+                STANDARD
+                    .decode(&bundle.bundle_base64)
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or_else(|| render_preset_html(&bundle.preset, &bundle.title))
+            };
+            Ok(Json(SitePreviewDto {
+                domain: dom,
+                mode: bundle.mode,
+                preset: bundle.preset,
+                title: bundle.title,
+                html,
+            }))
+        } else {
+            Ok(Json(SitePreviewDto {
+                domain: dom,
+                mode: "preset".into(),
+                preset: "studio".into(),
+                title: "Этюды формы".into(),
+                html: render_preset_html("studio", ""),
+            }))
+        }
+    }
+
+    /// Получить глобальные системные настройки (режим работы, ускорение, метрики и их ротация).
+    #[oai(path = "/settings", method = "get")]
+    async fn get_system_settings(&self, auth: AdminToken) -> Result<Json<SystemSettingsDto>> {
+        validate_admin_session(&self.db, &auth.0.token)
+            .await
+            .map_err(|e| Error::from_string(e, StatusCode::UNAUTHORIZED))?;
+
+        let m = load_system_settings(&self.db).await;
+        Ok(Json(SystemSettingsDto {
+            operating_mode: m.operating_mode,
+            multi_exit_enabled: m.multi_exit_enabled,
+            parallel_transports: m.parallel_transports,
+            auto_failover: m.auto_failover,
+            metrics_enabled: m.metrics_enabled,
+            metrics_retention_days: m.metrics_retention_days,
+            probe_interval_seconds: m.probe_interval_seconds,
+            sync_interval_seconds: m.sync_interval_seconds,
+            subscription_origin_override: m.subscription_origin_override,
+            updated_at: Some(m.updated_at.and_utc().to_rfc3339()),
+        }))
+    }
+
+    /// Сохранить глобальные системные настройки.
+    #[oai(path = "/settings", method = "put")]
+    async fn save_system_settings(
+        &self,
+        auth: AdminToken,
+        req: Json<SaveSystemSettingsRequest>,
+    ) -> Result<Json<SystemSettingsDto>> {
+        validate_admin_session(&self.db, &auth.0.token)
+            .await
+            .map_err(|e| Error::from_string(e, StatusCode::UNAUTHORIZED))?;
+
+        let mode = req.0.operating_mode.trim().to_lowercase();
+        if !matches!(
+            mode.as_str(),
+            "balanced" | "low_latency" | "high_throughput" | "failover_only"
+        ) {
+            return Err(Error::from_string(
+                "Режим работы должен быть balanced, low_latency, high_throughput или failover_only",
+                StatusCode::BAD_REQUEST,
+            ));
+        }
+
+        let retention = req.0.metrics_retention_days.clamp(1, 365);
+        let probe_int = req.0.probe_interval_seconds.clamp(10, 600);
+        let sync_int = req.0.sync_interval_seconds.clamp(10, 300);
+        let origin = req
+            .0
+            .subscription_origin_override
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        if !origin.is_empty() && !origin.starts_with("https://") && !origin.starts_with("http://") {
+            return Err(Error::from_string(
+                "Адрес подписки должен начинаться с https:// или http://",
+                StatusCode::BAD_REQUEST,
+            ));
+        }
+        let now = Utc::now().naive_utc();
+
+        system_settings::Entity::insert(system_settings::ActiveModel {
+            id: Set(1),
+            operating_mode: Set(mode.clone()),
+            multi_exit_enabled: Set(req.0.multi_exit_enabled),
+            parallel_transports: Set(req.0.parallel_transports),
+            auto_failover: Set(req.0.auto_failover),
+            metrics_enabled: Set(req.0.metrics_enabled),
+            metrics_retention_days: Set(retention),
+            probe_interval_seconds: Set(probe_int),
+            sync_interval_seconds: Set(sync_int),
+            subscription_origin_override: Set(origin.clone()),
+            updated_at: Set(now),
+        })
+        .on_conflict(
+            OnConflict::column(system_settings::Column::Id)
+                .update_columns([
+                    system_settings::Column::OperatingMode,
+                    system_settings::Column::MultiExitEnabled,
+                    system_settings::Column::ParallelTransports,
+                    system_settings::Column::AutoFailover,
+                    system_settings::Column::MetricsEnabled,
+                    system_settings::Column::MetricsRetentionDays,
+                    system_settings::Column::ProbeIntervalSeconds,
+                    system_settings::Column::SyncIntervalSeconds,
+                    system_settings::Column::SubscriptionOriginOverride,
+                    system_settings::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec_without_returning(&self.db)
+        .await
+        .map_err(InternalServerError)?;
+
+        Ok(Json(SystemSettingsDto {
+            operating_mode: mode,
+            multi_exit_enabled: req.0.multi_exit_enabled,
+            parallel_transports: req.0.parallel_transports,
+            auto_failover: req.0.auto_failover,
+            metrics_enabled: req.0.metrics_enabled,
+            metrics_retention_days: retention,
+            probe_interval_seconds: probe_int,
+            sync_interval_seconds: sync_int,
+            subscription_origin_override: origin,
+            updated_at: Some(now.and_utc().to_rfc3339()),
+        }))
+    }
+
+    /// Ручная ротация/очистка старых записей истории трафика старше заданного срока хранения.
+    #[oai(path = "/settings/prune-metrics", method = "post")]
+    async fn prune_metrics(
+        &self,
+        auth: AdminToken,
+        days: Query<Option<i32>>,
+    ) -> Result<Json<PruneMetricsResponse>> {
+        validate_admin_session(&self.db, &auth.0.token)
+            .await
+            .map_err(|e| Error::from_string(e, StatusCode::UNAUTHORIZED))?;
+
+        let settings = load_system_settings(&self.db).await;
+        let retention_days = days.0.unwrap_or(settings.metrics_retention_days).clamp(1, 365);
+        let cutoff = Utc::now().naive_utc() - chrono::Duration::days(retention_days as i64);
+        let res = traffic_hourly::Entity::delete_many()
+            .filter(traffic_hourly::Column::BucketStart.lt(cutoff))
+            .exec(&self.db)
+            .await
+            .map_err(InternalServerError)?;
+
+        Ok(Json(PruneMetricsResponse {
+            deleted_rows: res.rows_affected,
+            retention_days,
+        }))
     }
 
     /// Список сайтов маскировки HTTPS (пресеты и загруженные HTML/ZIP бандлы по доменам).

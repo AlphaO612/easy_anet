@@ -10,6 +10,8 @@ pub struct Model {
     pub encrypted_bot_token: Option<String>,
     pub chat_id: String,
     pub cooldown_minutes: i32,
+    pub proxy_url: String,
+    pub api_base_url: String,
     pub updated_at: DateTime,
 }
 

@@ -15,6 +15,8 @@ export type Server = {
     ahttp_url: string | null
     wrtc_url: string | null
     wrtc_mode: string | null
+    region?: string
+    tags?: string
 }
 
 export type NodeRuntime = {
@@ -62,4 +64,6 @@ export type CreateServerRequest = {
     ahttp_url?: string | null
     wrtc_url?: string | null
     wrtc_mode?: string | null
+    region?: string
+    tags?: string
 }

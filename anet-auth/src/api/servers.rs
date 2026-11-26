@@ -94,6 +94,26 @@ fn validate_server_urls(
     Ok(())
 }
 
+fn normalize_region(raw: Option<String>) -> String {
+    raw.unwrap_or_default()
+        .trim()
+        .to_uppercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(12)
+        .collect()
+}
+
+fn normalize_tags(raw: Option<String>) -> String {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .take(12)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[OpenApi]
 impl ServersApi {
     /// Регистрация нового физического VPN-сервера (ноды) в системе
@@ -117,6 +137,8 @@ impl ServersApi {
             ));
         }
 
+        let region = normalize_region(req.0.region.clone());
+        let tags = normalize_tags(req.0.tags.clone());
         let server_id = Uuid::new_v4();
         let new_server = servers::ActiveModel {
             id: Set(server_id),
@@ -139,6 +161,8 @@ impl ServersApi {
             probe_manifest: Set(None),
             probe_applied: Set(0),
             probe_error: Set(None),
+            region: Set(region),
+            tags: Set(tags),
             created_at: Set(Utc::now().naive_utc()),
             updated_at: Set(Utc::now().naive_utc()),
         };
@@ -159,6 +183,8 @@ impl ServersApi {
                 ssh_user: saved.ssh_user,
                 is_active: saved.is_active,
                 has_control_credential: saved.control_token_hash.is_some(),
+                region: saved.region,
+                tags: saved.tags,
                 runtime: None,
             })),
             Err(e) => Err(poem::error::InternalServerError(e)),
@@ -244,6 +270,14 @@ impl ServersApi {
             active_model.wrtc_mode = Set(wrtc_mode);
             changed = true;
         }
+        if let Some(region) = req.0.region {
+            active_model.region = Set(normalize_region(Some(region)));
+            changed = true;
+        }
+        if let Some(tags) = req.0.tags {
+            active_model.tags = Set(normalize_tags(Some(tags)));
+            changed = true;
+        }
 
         if changed {
             active_model.updated_at = Set(Utc::now().naive_utc());
@@ -263,6 +297,8 @@ impl ServersApi {
                     ssh_user: saved.ssh_user,
                     is_active: saved.is_active,
                     has_control_credential: saved.control_token_hash.is_some(),
+                    region: saved.region,
+                    tags: saved.tags,
                     runtime: None,
                 })),
                 Err(e) => crate::api::dto::UpdateServerApiResult::Error(Json(e.to_string())),
@@ -283,6 +319,8 @@ impl ServersApi {
                 ssh_user: server_model.ssh_user,
                 is_active: server_model.is_active,
                 has_control_credential: server_model.control_token_hash.is_some(),
+                region: server_model.region,
+                tags: server_model.tags,
                 runtime: None,
             }))
         }
@@ -311,7 +349,7 @@ impl ServersApi {
                     .map(|s| ServerDto {
                         runtime: runtime_by_server.get(&s.id).map(|state| NodeRuntimeDto {
                             status: if now.signed_duration_since(state.last_seen_at).num_seconds()
-                                <= 45
+                                <= 90
                             {
                                 "online".to_string()
                             } else {
@@ -337,6 +375,8 @@ impl ServersApi {
                         ssh_user: s.ssh_user,
                         is_active: s.is_active,
                         has_control_credential: s.control_token_hash.is_some(),
+                        region: s.region,
+                        tags: s.tags,
                     })
                     .collect();
                 GetServersResponse::Ok(Json(dtos))

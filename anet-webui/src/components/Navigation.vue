@@ -27,9 +27,10 @@ const navigation: NavItem[] = [
   { label: 'Почтовые ящики', path: '/mailboxes', icon: 'mdi-email-outline', group: 'Управление' },
   { label: 'Статистика', path: '/statistics', icon: 'mdi-chart-line', group: 'Наблюдение' },
   { label: 'Инциденты', path: '/operator-incidents', icon: 'mdi-alert-outline', group: 'Наблюдение' },
+  { label: 'Настройки', path: '/settings', icon: 'mdi-cog-outline', group: 'Система' },
 ]
 
-const groups = ['Обзор', 'Управление', 'Наблюдение']
+const groups = ['Обзор', 'Управление', 'Наблюдение', 'Система']
 </script>
 
 <template>

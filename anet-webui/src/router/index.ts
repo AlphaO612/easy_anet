@@ -33,6 +33,7 @@ const router = createRouter({
     { path: '/statistics', component: Statistics, meta: { title: 'Статистика' } },
     { path: '/operator-incidents', component: () => import('@/ui/IncidentReports.vue'), meta: { title: 'Инциденты' } },
     { path: '/mailboxes', component: Mailboxes, meta: { title: 'Почтовые ящики' } },
+    { path: '/settings', component: () => import('@/ui/Settings.vue'), meta: { title: 'Настройки' } },
   ],
 })
 
