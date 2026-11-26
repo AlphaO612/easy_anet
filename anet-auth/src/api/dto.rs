@@ -29,6 +29,7 @@ pub struct ServerDto {
     pub has_control_credential: bool,
     pub region: String,
     pub tags: String,
+    pub node_role: String,
     pub runtime: Option<NodeRuntimeDto>,
 }
 
@@ -230,6 +231,7 @@ pub struct CreateServerRequest {
     pub is_active: Option<bool>,
     pub region: Option<String>,
     pub tags: Option<String>,
+    pub node_role: Option<String>,
 }
 
 #[derive(ApiResponse)]
@@ -258,6 +260,7 @@ pub struct UpdateServerRequest {
     pub is_active: Option<bool>,
     pub region: Option<String>,
     pub tags: Option<String>,
+    pub node_role: Option<String>,
 }
 
 #[derive(ApiResponse)]

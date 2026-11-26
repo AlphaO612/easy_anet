@@ -34,6 +34,7 @@ pub struct Model {
     pub probe_error: Option<String>,
     pub region: String,
     pub tags: String,
+    pub node_role: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

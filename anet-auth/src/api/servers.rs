@@ -114,6 +114,16 @@ fn normalize_tags(raw: Option<String>) -> String {
         .join(", ")
 }
 
+fn normalize_node_role(raw: Option<String>) -> String {
+    match raw.as_deref().map(str::trim).unwrap_or("auto").to_lowercase().as_str() {
+        "entry" => "entry".into(),
+        "exit" => "exit".into(),
+        "both" => "both".into(),
+        "observer" => "observer".into(),
+        _ => "auto".into(),
+    }
+}
+
 #[OpenApi]
 impl ServersApi {
     /// Регистрация нового физического VPN-сервера (ноды) в системе
@@ -139,6 +149,7 @@ impl ServersApi {
 
         let region = normalize_region(req.0.region.clone());
         let tags = normalize_tags(req.0.tags.clone());
+        let node_role = normalize_node_role(req.0.node_role.clone());
         let server_id = Uuid::new_v4();
         let new_server = servers::ActiveModel {
             id: Set(server_id),
@@ -163,6 +174,7 @@ impl ServersApi {
             probe_error: Set(None),
             region: Set(region),
             tags: Set(tags),
+            node_role: Set(node_role),
             created_at: Set(Utc::now().naive_utc()),
             updated_at: Set(Utc::now().naive_utc()),
         };
@@ -185,6 +197,7 @@ impl ServersApi {
                 has_control_credential: saved.control_token_hash.is_some(),
                 region: saved.region,
                 tags: saved.tags,
+                node_role: saved.node_role,
                 runtime: None,
             })),
             Err(e) => Err(poem::error::InternalServerError(e)),
@@ -278,6 +291,10 @@ impl ServersApi {
             active_model.tags = Set(normalize_tags(Some(tags)));
             changed = true;
         }
+        if let Some(node_role) = req.0.node_role {
+            active_model.node_role = Set(normalize_node_role(Some(node_role)));
+            changed = true;
+        }
 
         if changed {
             active_model.updated_at = Set(Utc::now().naive_utc());
@@ -299,6 +316,7 @@ impl ServersApi {
                     has_control_credential: saved.control_token_hash.is_some(),
                     region: saved.region,
                     tags: saved.tags,
+                    node_role: saved.node_role,
                     runtime: None,
                 })),
                 Err(e) => crate::api::dto::UpdateServerApiResult::Error(Json(e.to_string())),
@@ -321,6 +339,7 @@ impl ServersApi {
                 has_control_credential: server_model.control_token_hash.is_some(),
                 region: server_model.region,
                 tags: server_model.tags,
+                node_role: server_model.node_role,
                 runtime: None,
             }))
         }
@@ -377,6 +396,7 @@ impl ServersApi {
                         has_control_credential: s.control_token_hash.is_some(),
                         region: s.region,
                         tags: s.tags,
+                        node_role: s.node_role,
                     })
                     .collect();
                 GetServersResponse::Ok(Json(dtos))

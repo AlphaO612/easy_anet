@@ -3,8 +3,8 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import NodeInvitationSteps from './NodeInvitationSteps.vue'
 import { useAppMessage } from '@/composables/useAppMessage'
 import { GetNodeCommandStatus, IssueNodeInvitation, RotateNodeCredential, SetNodeAdmission, UpdateServer } from '@/api/servers'
-import type { Server } from '@/models/server'
-import { REGION_OPTIONS } from '@/utils/regions'
+import type { NodeRole, Server } from '@/models/server'
+import { NODE_ROLE_OPTIONS, REGION_OPTIONS } from '@/utils/regions'
 
 // ИСПРАВЛЕНО: Убрано 'show', теперь ловит дефолтный v-model из родителя
 const show = defineModel<boolean>()
@@ -33,6 +33,7 @@ const form = ref({
   wrtc_mode: 'media_video',
   region: '',
   tags: '',
+  node_role: 'auto' as NodeRole,
 })
 
 const wrtcModeOptions = [
@@ -132,6 +133,7 @@ watch(
           wrtc_mode: val.wrtc_mode || 'media_video',
           region: val.region || '',
           tags: val.tags || '',
+          node_role: val.node_role || 'auto',
         }
       }
     },
@@ -173,6 +175,15 @@ const close = () => {
       <v-card-text>
         <v-form>
           <v-text-field v-model="form.name" label="Название локации" variant="filled" class="mb-3" />
+
+          <div class="mb-3">
+            <div class="text-caption text-medium-emphasis mb-1">Тип ноды</div>
+            <v-btn-toggle v-model="form.node_role" mandatory color="primary" variant="outlined" density="compact" class="flex-wrap">
+              <v-btn v-for="r in NODE_ROLE_OPTIONS" :key="r.value" :value="r.value" :prepend-icon="r.icon" size="small">
+                {{ r.short }}
+              </v-btn>
+            </v-btn-toggle>
+          </div>
 
           <v-row dense class="mb-2">
             <v-col cols="12" sm="6">

@@ -1997,11 +1997,17 @@ impl DevicesApi {
                 "online"
             };
 
-            let role = match (is_entry.contains(&sid), is_exit.contains(&sid)) {
-                (true, true) => "both",
-                (true, false) => "entry",
-                (false, true) => "exit",
-                (false, false) => "both",
+            let role = match s.node_role.as_str() {
+                "entry" => "entry",
+                "exit" => "exit",
+                "both" => "both",
+                "observer" => "observer",
+                _ => match (is_entry.contains(&sid), is_exit.contains(&sid)) {
+                    (true, true) => "both",
+                    (true, false) => "entry",
+                    (false, true) => "exit",
+                    (false, false) => "both",
+                },
             };
 
             let mut transports = Vec::new();

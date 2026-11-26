@@ -17,7 +17,7 @@ trap 'rm -rf -- "$stage"' EXIT
 if [[ ${1:-} = --stdin ]]; then
     IFS= read -r invitation || fail 'Ожидается одна строка приглашения.'
 fi
-tag=anet-easy-2026.11.23.2
+tag=anet-easy-2026.11.26.1
 base="https://github.com/AlphaO612/easy_anet/releases/download/$tag"
 zip=anet-easy-linux-amd64.zip
 cache="${XDG_CACHE_HOME:-$HOME/.cache}/anet-join/$tag"
@@ -115,7 +115,7 @@ port=$(cat "$stage/port")
 chown -R anet-vpn: "$stage"
 echo '[4/4] Обмен приглашения и запуск сервера'
 "${run[@]}" env VPN_PORT="$port" COMPOSE_PROJECT_NAME="anet-node-$node" bash -c '
-    exec sh "$1/contrib/deploy/install.sh" --profile standalone --bundle "$1" --host "$2" \
+    cd "$HOME" && exec sh "$1/contrib/deploy/install.sh" --profile standalone --bundle "$1" --host "$2" \
       --state "$HOME/.local/state/anet-nodes/$3" --join-panel "$1/join.json"
 ' _ "$stage" "$host" "$node" ||
     fail 'Установка прервана. Проверьте вывод выше. Если приглашение истекло, выпустите новое для той же записи и повторите. Скачанный ZIP сохранён.'

@@ -4,10 +4,11 @@ import { isAxiosError } from 'axios'
 import { useRouter } from 'vue-router'
 import NodeInvitationSteps from './NodeInvitationSteps.vue'
 import { api as request } from '@/api/client'
+import { GetIngressRoutes } from '@/api/devices'
 import { CreateServer, IssueNodeInvitation } from '@/api/servers'
 import { advanced } from '@/composables/operatorMode'
-import type { CreateServerRequest, NodeCredential, Server } from '@/models/server'
-import { REGION_OPTIONS } from '@/utils/regions'
+import type { CreateServerRequest, NodeCredential, NodeRole, Server } from '@/models/server'
+import { NODE_ROLE_OPTIONS, REGION_OPTIONS } from '@/utils/regions'
 
 const show = defineModel<boolean>()
 const emit = defineEmits<{ created: [] }>()
@@ -25,12 +26,14 @@ const defaults = (): CreateServerRequest => ({
   is_active: true,
   region: '',
   tags: '',
+  node_role: 'exit',
 })
 
 const form = ref<CreateServerRequest>(defaults())
-const role = ref<'entry' | 'exit'>('exit')
+const role = ref<NodeRole>('exit')
 const sshPassword = ref('')
 const panelApiUrl = ref('')
+const panelApiCandidates = ref<string[]>([])
 const server = ref<Server>()
 const invitation = ref<NodeCredential>()
 const busy = ref(false)
@@ -121,6 +124,27 @@ watch(show, (open) => {
   role.value = 'exit'
   sshPassword.value = ''
   panelApiUrl.value = detectExternalApi()
+  panelApiCandidates.value = panelApiUrl.value ? [panelApiUrl.value] : []
+  void GetIngressRoutes().then((res) => {
+    const list = [...panelApiCandidates.value]
+    const pushUrl = (raw?: string | null) => {
+      const clean = (raw || '').trim().replace(/\/+$/, '')
+      if (!clean) return
+      const full = clean.endsWith('/api/v1') ? clean : `${clean}/api/v1`
+      if (full.startsWith('https://') && !list.includes(full)) list.push(full)
+    }
+    pushUrl(res.origin)
+    for (const r of res.routes || []) {
+      const host = (r.sni || r.entry_host || '').trim()
+      if (host && host.includes('.') && !/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+        pushUrl(`https://${host}`)
+      }
+    }
+    panelApiCandidates.value = list
+    if (!panelApiUrl.value && list.length) {
+      panelApiUrl.value = list[0]!
+    }
+  }).catch(() => {})
   server.value = undefined
   invitation.value = undefined
   hostFingerprint.value = ''
@@ -135,6 +159,7 @@ async function createAndInvite() {
     if (!server.value) {
       server.value = await CreateServer({
         ...form.value,
+        node_role: role.value,
         ssh_user: form.value.ssh_user?.trim() || 'root',
       })
       emit('created')
@@ -160,6 +185,7 @@ async function quickInstallBySsh() {
     if (!server.value) {
       server.value = await CreateServer({
         ...form.value,
+        node_role: role.value,
         ssh_user: form.value.ssh_user?.trim() || 'root',
       })
       emit('created')
@@ -244,13 +270,12 @@ onBeforeUnmount(() => {
             <v-col cols="12" sm="6">
               <v-select
                 v-model="role"
-                label="Роль ноды"
+                label="Тип ноды"
                 variant="outlined"
                 density="comfortable"
-                :items="[
-                  { title: 'Выход — выпускает трафик в интернет', value: 'exit' },
-                  { title: 'Вход — принимает клиентов', value: 'entry' },
-                ]"
+                :items="NODE_ROLE_OPTIONS"
+                item-title="title"
+                item-value="value"
               />
             </v-col>
             <v-col cols="12" sm="6">
@@ -328,9 +353,10 @@ onBeforeUnmount(() => {
               />
             </v-col>
             <v-col cols="12">
-              <v-text-field
+              <v-combobox
                 v-model.trim="panelApiUrl"
-                label="HTTPS-адрес API панели (для обратного подключения ноды)"
+                :items="panelApiCandidates"
+                label="HTTPS-адрес API панели (выберите шлюз или введите свой)"
                 placeholder="https://gateway1.altnight.art/api/v1"
                 variant="outlined"
                 density="compact"

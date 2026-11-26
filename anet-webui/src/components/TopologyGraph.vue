@@ -369,7 +369,7 @@ const layout = computed(() => {
   const edges = viewModel.value.edges
   const byProto = graph.value?.clients_summary.by_protocol ?? { vless: 0, wireguard: 0, anet: 0 }
 
-  const entryNodes = nodes.filter((n) => n.role === 'entry' || n.role === 'both')
+  const entryNodes = nodes.filter((n) => n.role === 'entry' || n.role === 'both' || n.role === 'observer')
   const exitNodes = nodes.filter((n) => n.role === 'exit')
 
   const clientsH = 3 * BUBBLE_H + 2 * BUBBLE_GAP
@@ -632,6 +632,7 @@ function isCloudDimmed(): boolean {
 function roleLabel(role: GraphNode['role']): string {
   if (role === 'entry') return 'ENTRY'
   if (role === 'exit') return 'EXIT'
+  if (role === 'observer') return 'OBS'
   return 'BOTH'
 }
 

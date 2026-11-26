@@ -45,6 +45,7 @@ pub mod m20261126_000043_unified_ingress_and_devices;
 pub mod m20261126_000044_telemetry_alerts_and_sites;
 pub mod m20261126_000045_settings_regions_and_multibond;
 mod m20261126_000046_telegram_exit_route;
+mod m20261126_000047_server_role;
 
 use sea_orm_migration::prelude::*;
 
@@ -100,6 +101,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261126_000044_telemetry_alerts_and_sites::Migration),
             Box::new(m20261126_000045_settings_regions_and_multibond::Migration),
             Box::new(m20261126_000046_telegram_exit_route::Migration),
+            Box::new(m20261126_000047_server_role::Migration),
         ]
     }
 }

@@ -11,7 +11,7 @@ import { exportNodeInventory } from '@/api/probes'
 import type { Server } from '@/models/server'
 import type { CreateIngressRouteRequest, CreateIngressRouteResponse, IngressRoute } from '@/models/device'
 import { copyText, extractApiError, formatDateTime, formatUptime } from '@/utils/format'
-import { formatRegionBadge, formatRegionFull, parseTags } from '@/utils/regions'
+import { formatRegionBadge, formatRegionFull, NODE_ROLE_OPTIONS, nodeRoleMeta, parseTags } from '@/utils/regions'
 import ServerModal from '@/components/ServerModal.vue'
 import ProbeRevisionDialog from '@/components/ProbeRevisionDialog.vue'
 import CreateServerModal from '@/components/CreateServerModal.vue'
@@ -44,6 +44,7 @@ const loading = ref(false)
 const searchQuery = ref('')
 const selectedRegion = ref<string>('ALL')
 const selectedTag = ref<string>('ALL')
+const selectedRole = ref<string>('ALL')
 const groupByRegion = ref(false)
 const starter = ref<StarterProfile[]>([])
 const loadError = ref('')
@@ -83,6 +84,7 @@ const filteredServers = computed(() => {
   return data.value.filter((s) => {
     const code = (s.region || '').trim().toUpperCase() || 'UNSET'
     if (selectedRegion.value !== 'ALL' && code !== selectedRegion.value) return false
+    if (selectedRole.value !== 'ALL' && (s.node_role || 'auto') !== selectedRole.value) return false
     if (selectedTag.value !== 'ALL' && !parseTags(s.tags).includes(selectedTag.value)) return false
     if (q) {
       const hay = `${s.name} ${s.address} ${s.region || ''} ${s.tags || ''}`.toLowerCase()
@@ -299,6 +301,29 @@ watch(() => ingressForm.protocol, (proto) => {
   if (proto === 'wireguard' && ingressForm.entry_port === 443) ingressForm.entry_port = 51820
 })
 
+watch(() => ingressForm.entry_server_id, (sid) => {
+  const srv = data.value.find(s => s.id === sid)
+  if (!srv) return
+  ingressForm.entry_host = srv.address
+  if (ingressForm.protocol === 'vless' && !ingressForm.sni.trim()) {
+    ingressForm.sni = srv.address
+  }
+  const exitSrv = data.value.find(s => s.id === ingressForm.exit_server_id)
+  if (!ingressForm.name.trim() && exitSrv) {
+    ingressForm.name = `${ingressForm.protocol.toUpperCase()} ${srv.name} → ${exitSrv.name}`
+  }
+})
+
+watch(() => ingressForm.exit_server_id, (sid) => {
+  const srv = data.value.find(s => s.id === sid)
+  if (!srv) return
+  ingressForm.exit_host = srv.address
+  const entrySrv = data.value.find(s => s.id === ingressForm.entry_server_id)
+  if (!ingressForm.name.trim() && entrySrv) {
+    ingressForm.name = `${ingressForm.protocol.toUpperCase()} ${entrySrv.name} → ${srv.name}`
+  }
+})
+
 const loadIngressRoutes = async () => {
   ingressLoading.value = true
   ingressError.value = ''
@@ -477,6 +502,20 @@ onBeforeUnmount(() => {
           {{ r.label }} ({{ r.count }})
         </v-chip>
 
+        <v-divider vertical class="mx-1" />
+
+        <v-chip
+          v-for="rOpt in NODE_ROLE_OPTIONS.filter(x => x.value !== 'auto')"
+          :key="rOpt.value"
+          size="small"
+          :prepend-icon="rOpt.icon"
+          :color="selectedRole === rOpt.value ? rOpt.color : undefined"
+          :variant="selectedRole === rOpt.value ? 'flat' : 'outlined'"
+          @click="selectedRole = selectedRole === rOpt.value ? 'ALL' : rOpt.value"
+        >
+          {{ rOpt.short }}
+        </v-chip>
+
         <v-divider v-if="tagFilterOptions.length" vertical class="mx-1" />
 
         <v-chip
@@ -567,6 +606,14 @@ onBeforeUnmount(() => {
           <div class="d-flex align-center flex-wrap ga-1">
             <v-chip v-if="item.region" size="x-small" variant="tonal" color="primary">
               {{ formatRegionBadge(item.region) }}
+            </v-chip>
+            <v-chip
+              v-if="item.node_role && item.node_role !== 'auto'"
+              size="x-small"
+              variant="tonal"
+              :color="nodeRoleMeta(item.node_role).color"
+            >
+              {{ nodeRoleMeta(item.node_role).short }}
             </v-chip>
             <span class="font-weight-bold">{{ item.name }}</span>
           </div>

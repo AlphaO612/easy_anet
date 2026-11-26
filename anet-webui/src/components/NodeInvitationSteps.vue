@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import { GetIngressRoutes } from '@/api/devices'
 import type { NodeCredential, Server } from '@/models/server'
 import AutoNodeInstall from './AutoNodeInstall.vue'
 
@@ -16,6 +17,34 @@ function externalApi(value: string) {
 }
 const suggested = window.location.origin + '/api/v1'
 const api = ref(externalApi(suggested) ? suggested : '')
+const apiCandidates = ref<string[]>(externalApi(suggested) ? [suggested] : [])
+
+onMounted(async () => {
+  try {
+    const res = await GetIngressRoutes()
+    const list: string[] = [...apiCandidates.value]
+    const pushUrl = (raw?: string | null) => {
+      const clean = (raw || '').trim().replace(/\/+$/, '')
+      if (!clean) return
+      const full = clean.endsWith('/api/v1') ? clean : `${clean}/api/v1`
+      if (externalApi(full) && !list.includes(full)) list.push(full)
+    }
+    pushUrl(res.origin)
+    for (const r of res.routes || []) {
+      const host = (r.sni || r.entry_host || '').trim()
+      if (host && host.includes('.') && !/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+        pushUrl(`https://${host}`)
+      }
+    }
+    apiCandidates.value = list
+    if (!validApi.value && list.length) {
+      api.value = list[0]!
+    }
+  } catch {
+    // ignore
+  }
+})
+
 const validApi = computed(() => externalApi(api.value))
 const ssh = computed(() => {
   const { address, ssh_user, ssh_port } = props.server
@@ -25,7 +54,7 @@ const ssh = computed(() => {
     || !Number.isInteger(port) || port < 1 || port > 65535) return ''
   return `ssh -p ${port} ${user}@${address}`
 })
-const install = 'file=$(mktemp) && curl -fLsS --retry 2 -o "$file" https://github.com/AlphaO612/easy_anet/releases/download/anet-easy-2026.11.26.2/join-node.sh && bash "$file"'
+const install = 'file=$(mktemp) && curl -fLsS --retry 2 -o "$file" https://github.com/AlphaO612/easy_anet/releases/download/anet-easy-2026.11.26.3/join-node.sh && bash "$file"'
 const payload = computed(() => {
   if (!validApi.value) return ''
   const json = JSON.stringify({
@@ -49,9 +78,17 @@ async function copy(label: string, text: string) {
 
 <template>
   <p class="mb-3">Приглашение предназначено администратору VPS <strong>{{ server.address }}</strong>. Оно действует 15 минут и используется один раз.</p>
-  <v-text-field v-model.trim="api" label="HTTPS-адрес API панели для новой VPS" placeholder="https://panel.example.org/api/v1"
-    hint="Укажите адрес, доступный с новой VPS. При открытии панели через SSH-туннель потребуется отдельный HTTPS-адрес API." persistent-hint
-    :error-messages="api && !validApi ? ['Укажите HTTPS-адрес с окончанием /api/v1, доступный вне localhost.'] : []" />
+  <v-combobox
+    v-model.trim="api"
+    :items="apiCandidates"
+    label="HTTPS-адрес API панели для новой VPS"
+    placeholder="https://gateway1.altnight.art/api/v1"
+    hint="Выберите шлюз из списка или укажите свой HTTPS-адрес API панели."
+    persistent-hint
+    variant="outlined"
+    density="comfortable"
+    :error-messages="api && !validApi ? ['Укажите HTTPS-адрес с окончанием /api/v1, доступный вне localhost.'] : []"
+  />
   <v-radio-group v-model="mode" inline label="Как установить узел" class="mt-4">
     <v-radio label="Автоматически по SSH" value="auto" />
     <v-radio label="Самостоятельно" value="manual" />

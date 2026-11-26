@@ -1,4 +1,4 @@
-export type GraphNodeRole = 'entry' | 'exit' | 'both'
+export type GraphNodeRole = 'entry' | 'exit' | 'both' | 'observer'
 export type GraphNodeStatus = 'online' | 'offline' | 'draining' | 'unknown'
 export type GraphEdgeStatus = 'up' | 'degraded' | 'down' | 'unknown'
 

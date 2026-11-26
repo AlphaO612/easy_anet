@@ -1,3 +1,5 @@
+export type NodeRole = 'auto' | 'entry' | 'exit' | 'both' | 'observer'
+
 // Состояние, которое нода сообщает панели через исходящий heartbeat.
 export type Server = {
     id: string
@@ -17,6 +19,7 @@ export type Server = {
     wrtc_mode: string | null
     region?: string
     tags?: string
+    node_role?: NodeRole
 }
 
 export type NodeRuntime = {
@@ -66,4 +69,5 @@ export type CreateServerRequest = {
     wrtc_mode?: string | null
     region?: string
     tags?: string
+    node_role?: NodeRole
 }

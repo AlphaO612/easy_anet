@@ -212,6 +212,19 @@ server {{
         proxy_set_header Authorization "";
         proxy_set_header Cookie "";
     }}
+    location = /api/v1/node-healthz {{
+        access_log off;
+        default_type text/plain;
+        return 200 "ANet node API";
+    }}
+    location ~ "^/api/v1/(?:control/nodes/|check_access$)" {{
+        access_log off;
+        client_max_body_size 256k;
+        proxy_pass http://127.0.0.1:{port};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        add_header Cache-Control no-store always;
+    }}
 """
         http += f"""server {{
     {listener(443, " ssl")}

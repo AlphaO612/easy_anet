@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { api } from '@/api/client'
+import { GetIngressRoutes } from '@/api/devices'
 import {
   GetTelegramAlertConfig,
   SaveTelegramAlertConfig,
@@ -104,7 +105,17 @@ type Report = { id: string; operator_id: string; reported_at: string; observatio
 
 const form = reactive(blank())
 const rows = ref<Report[]>([])
+const routeSuggestions = ref<{ direction: string; transport: string }[]>([])
+const directionItems = computed(() => routeSuggestions.value.map(r => r.direction))
+const transportItems = ['VLESS', 'WIREGUARD', 'QUIC', 'WS', 'AHTTP', 'WRTC']
 const message = ref('')
+
+function onDirectionPicked(val: string) {
+  const found = routeSuggestions.value.find(r => r.direction === val)
+  if (found && !form.transport.trim()) {
+    form.transport = found.transport
+  }
+}
 const busy = ref(false)
 const deletingId = ref<string | null>(null)
 const ready = computed(() => Object.values(form).every(v => v.trim()))
@@ -157,6 +168,12 @@ async function removeReport(report: Report) {
 onMounted(() => {
   load()
   loadTelegram()
+  void GetIngressRoutes().then((res) => {
+    routeSuggestions.value = (res.routes || []).map((r) => ({
+      direction: `${r.entry_host}:${r.entry_port} → ${r.exit_host} (${r.id})`,
+      transport: r.protocol.toUpperCase(),
+    }))
+  }).catch(() => {})
 })
 </script>
 
@@ -249,8 +266,13 @@ onMounted(() => {
     <h1 class="text-h5 font-weight-bold mb-3">Ручные сообщения об инцидентах</h1>
     <v-form @submit.prevent="submit">
       <v-text-field v-model="form.observer" label="Точка наблюдения" maxlength="256" />
-      <v-text-field v-model="form.direction" label="Направление (вход → выход)" maxlength="512" />
-      <v-text-field v-model="form.transport" label="Транспорт" maxlength="128" />
+      <v-combobox
+        v-model="form.direction"
+        :items="directionItems"
+        label="Направление (выберите маршрут из списка или введите свой)"
+        @update:model-value="onDirectionPicked"
+      />
+      <v-combobox v-model="form.transport" :items="transportItems" label="Транспорт" />
       <v-textarea v-model="form.evidence" label="Наблюдаемые признаки и результат внешней проверки" maxlength="8192" />
       <v-btn type="submit" :disabled="busy || !ready" :loading="busy">Записать сообщение</v-btn>
     </v-form>

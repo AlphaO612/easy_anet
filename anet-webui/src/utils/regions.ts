@@ -46,3 +46,25 @@ export function parseTags(tags?: string | null): string[] {
     .map((t) => t.trim())
     .filter(Boolean)
 }
+
+export interface NodeRoleOption {
+  value: 'auto' | 'entry' | 'exit' | 'both' | 'observer'
+  title: string
+  short: string
+  color: string
+  icon: string
+}
+
+export const NODE_ROLE_OPTIONS: NodeRoleOption[] = [
+  { value: 'entry', title: 'Вход (Gateway / Entry) — принимает клиентов', short: 'ВХОД', color: 'primary', icon: 'mdi-login-variant' },
+  { value: 'exit', title: 'Выход (Exit) — выпускает трафик в интернет', short: 'ВЫХОД', color: 'success', icon: 'mdi-logout-variant' },
+  { value: 'both', title: 'Оба (Вход + Выход)', short: 'ОБА', color: 'info', icon: 'mdi-swap-horizontal' },
+  { value: 'observer', title: 'Наблюдение (Мониторинг и пробы)', short: 'НАБЛЮД.', color: 'warning', icon: 'mdi-radar' },
+  { value: 'auto', title: 'Авто (определяется по маршрутам)', short: 'АВТО', color: 'default', icon: 'mdi-auto-fix' },
+]
+
+const ROLE_MAP = new Map(NODE_ROLE_OPTIONS.map((r) => [r.value, r]))
+
+export function nodeRoleMeta(role?: string | null): NodeRoleOption {
+  return ROLE_MAP.get((role || 'auto') as NodeRoleOption['value']) ?? NODE_ROLE_OPTIONS[4]!
+}
