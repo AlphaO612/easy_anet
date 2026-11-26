@@ -262,23 +262,29 @@ def _probe_uplink_and_rtt(project, uplink_toml_path):
     loss_pct = None
     p = Path(uplink_toml_path)
     if p.is_file():
-        m = re.search(r'(?m)^\s*(?:endpoint|host|address)\s*=\s*"([^"]+)"', p.read_text(errors="ignore"))
-        if m:
-            raw = m.group(1).strip()
-            exit_host = raw[1:raw.index("]:")] if (raw.startswith("[") and "]:" in raw) else (raw.rsplit(":", 1)[0] if ":" in raw else raw)
-            if exit_host:
-                samples = []
-                attempts = 3
-                for _ in range(attempts):
-                    t0 = time.monotonic()
-                    try:
-                        with socket.create_connection((exit_host, 22), timeout=2.5):
-                            samples.append((time.monotonic() - t0) * 1000.0)
-                    except OSError:
-                        pass
-                loss_pct = round(((attempts - len(samples)) / attempts) * 100.0, 1)
-                if samples:
-                    latency_ms = round(sum(samples) / len(samples), 2)
+        text = p.read_text(errors="ignore")
+        exit_host = ""
+        m_dsn = re.search(r'(?m)^\s*dsn\s*=\s*"([^"]+)"', text)
+        if m_dsn:
+            exit_host = urlsplit(m_dsn.group(1).strip()).hostname or ""
+        if not exit_host:
+            m = re.search(r'(?m)^\s*(?:endpoint|host|address)\s*=\s*"([^"]+)"', text)
+            if m:
+                raw = m.group(1).strip()
+                exit_host = raw[1:raw.index("]:")] if (raw.startswith("[") and "]:" in raw) else (raw.rsplit(":", 1)[0] if ":" in raw else raw)
+        if exit_host:
+            samples = []
+            attempts = 3
+            for _ in range(attempts):
+                t0 = time.monotonic()
+                try:
+                    with socket.create_connection((exit_host, 22), timeout=2.5):
+                        samples.append((time.monotonic() - t0) * 1000.0)
+                except OSError:
+                    pass
+            loss_pct = round(((attempts - len(samples)) / attempts) * 100.0, 1)
+            if samples:
+                latency_ms = round(sum(samples) / len(samples), 2)
 
     uptime_seconds = None
     try:

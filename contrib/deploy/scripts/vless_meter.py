@@ -242,6 +242,11 @@ def _extract_exit_host(uplink_toml_path):
     if not p.is_file():
         return ""
     text = p.read_text(errors="ignore")
+    m = re.search(r'(?m)^\s*dsn\s*=\s*"([^"]+)"', text)
+    if m:
+        parsed = urlsplit(m.group(1).strip())
+        if parsed.hostname:
+            return parsed.hostname
     m = re.search(r'(?m)^\s*(?:endpoint|host|address)\s*=\s*"([^"]+)"', text)
     if not m:
         return ""
