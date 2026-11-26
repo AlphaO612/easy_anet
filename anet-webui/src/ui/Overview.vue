@@ -1,13 +1,20 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import TopologyGraph from '@/components/TopologyGraph.vue'
+import QuickLinkModal from '@/components/QuickLinkModal.vue'
 import type { GraphNode, TopologyGraphResponse } from '@/models/topology'
 import { formatBytes, formatHeartbeatAge } from '@/utils/format'
 
 const topology = ref<TopologyGraphResponse | null>(null)
+const graphRef = ref<{ reload: () => Promise<void> } | null>(null)
+const showQuickLink = ref(false)
 
 function onTopologyUpdated(data: TopologyGraphResponse) {
   topology.value = data
+}
+
+function onServersLinked() {
+  void graphRef.value?.reload()
 }
 
 const onlineNodes = computed(
@@ -66,6 +73,9 @@ const nodeAlerts = computed<NodeAlert[]>(() => {
         </p>
       </div>
       <div class="d-flex flex-wrap ga-2">
+        <v-btn color="success" variant="tonal" prepend-icon="mdi-link-variant-plus" @click="showQuickLink = true">
+          Связать серверы
+        </v-btn>
         <v-btn to="/profile-topology" variant="tonal" prepend-icon="mdi-routes">
           Маршруты
         </v-btn>
@@ -128,7 +138,9 @@ const nodeAlerts = computed<NodeAlert[]>(() => {
     </section>
 
     <!-- Main Topology Graph Centerpiece -->
-    <TopologyGraph @updated="onTopologyUpdated" />
+    <TopologyGraph ref="graphRef" @updated="onTopologyUpdated" />
+
+    <QuickLinkModal v-model="showQuickLink" @linked="onServersLinked" />
 
     <!-- Compact Node Alerts List -->
     <v-card v-if="nodeAlerts.length" class="mt-4" border>

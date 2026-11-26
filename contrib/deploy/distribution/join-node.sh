@@ -12,7 +12,7 @@ if [[ $(id -u) != 0 ]]; then
     echo 'Введите пароль sudo для подготовки VPS. Сервер будет работать от пользователя anet-vpn.'
     exec sudo -H bash "$0" "$@"
 fi
-stage=$(mktemp -d /tmp/anet-join.XXXXXXXX)
+stage=$(mktemp -d /var/tmp/anet-join.XXXXXXXX)
 trap 'rm -rf -- "$stage"' EXIT
 if [[ ${1:-} = --stdin ]]; then
     IFS= read -r invitation || fail 'Ожидается одна строка приглашения.'

@@ -22,6 +22,10 @@ import { formatRegionBadge } from '@/utils/regions'
 
 const emit = defineEmits<{ updated: [data: TopologyGraphResponse] }>()
 
+defineExpose({
+  reload: () => loadGraph(false),
+})
+
 const message = useAppMessage()
 const { confirmAction } = useConfirmDialog()
 

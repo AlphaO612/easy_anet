@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import { advanced } from '@/composables/operatorMode'
 import { GetUsers } from '@/api/users'
 import ProbeRevisionDialog from '@/components/ProbeRevisionDialog.vue'
+import QuickLinkModal from '@/components/QuickLinkModal.vue'
 import StarterProfiles from '@/components/StarterProfiles.vue'
 import VlessRecipients from '@/components/VlessRecipients.vue'
 import { api } from '@/api/client'
@@ -41,6 +42,7 @@ const nodes = ref<Server[]>([])
 const links = ref<Link[]>([])
 const route = useRoute()
 const editProbe = ref(false)
+const showQuickLink = ref(false)
 const users = ref<string[]>([])
 const userError = ref('')
 let searchNumber = 0
@@ -66,6 +68,10 @@ watch(availableLinks, items => {
   if (!items.some(item => item.value === probe.value)) probe.value = items[0]?.value ?? ''
 })
 const entryNode = computed(() => nodes.value.find(n => n.id === entry.value))
+watch(exit, () => {
+  const target = nodes.value.find(n => n.id === exit.value)
+  if (target) externalIp.value = target.address
+})
 async function loadNodes() {
   try {
     const [servers, graph] = await Promise.all([api<Server[]>('/servers'), api<{links: Link[]}>('/probe-links')])
@@ -205,7 +211,13 @@ onMounted(() => { load(); loadNodes(); loadReports(); searchUsers() })
 
 <template>
   <v-container>
-    <h1>Профили и маршруты</h1>
+    <div class="d-flex justify-space-between align-center flex-wrap ga-3 mb-4">
+      <h1 class="text-h5 font-weight-bold">Профили и маршруты</h1>
+      <v-btn color="primary" prepend-icon="mdi-link-variant-plus" @click="showQuickLink = true">
+        Связать два сервера в 1 шаг
+      </v-btn>
+    </div>
+    <QuickLinkModal v-model="showQuickLink" @linked="() => { load(); loadNodes(); loadReports() }" />
     <VlessRecipients />
     <StarterProfiles />
     <p v-if="saved">Опубликованная ревизия {{ saved.revision }}</p>
