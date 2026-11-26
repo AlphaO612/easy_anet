@@ -9,6 +9,7 @@ import {
   DeleteUserDevice,
   GetIngressRoutes,
   GetUserDevices,
+  QuickProvisionUser,
   RevokeUserDevice,
   RevokeUserSubscription,
 } from '@/api/devices'
@@ -67,6 +68,7 @@ const togglingStatus = ref(false)
 const resettingTraffic = ref(false)
 const deletingUser = ref(false)
 const creatingDevice = ref(false)
+const quickProvisionBusy = ref(false)
 const subscriptionBusy = ref(false)
 const deviceActionId = ref('')
 
@@ -105,6 +107,29 @@ const subscriptionActive = computed(() => Boolean(devicesData.value?.subscriptio
 const subscriptionOrigin = computed(
   () => devicesData.value?.subscription_origin?.trim() || ingressOrigin.value.trim() || '',
 )
+
+const mirrorSubscriptionUrls = computed(() => {
+  if (!subscriptionUrl.value) return [] as { host: string; url: string }[]
+  const match = subscriptionUrl.value.match(/(\/api\/v1\/subscriptions\/[A-Za-z0-9_-]+)$/)
+  if (!match) return []
+  const path = match[1]
+  let primaryHost = ''
+  try {
+    primaryHost = new URL(subscriptionUrl.value).hostname.toLowerCase()
+  } catch {
+    primaryHost = ''
+  }
+  const seen = new Set<string>(primaryHost ? [primaryHost] : [])
+  const mirrors: { host: string; url: string }[] = []
+  for (const r of ingressRoutes.value) {
+    if (r.protocol !== 'vless') continue
+    const host = (r.sni || r.entry_host || '').trim().toLowerCase()
+    if (!host || seen.has(host)) continue
+    seen.add(host)
+    mirrors.push({ host, url: `https://${host}${path}` })
+  }
+  return mirrors
+})
 
 const userGroup = computed(() =>
   user.value?.group_id ? groups.value.find((g) => g.id === user.value?.group_id) ?? null : null,
@@ -501,6 +526,32 @@ const handleDeleteDevice = async (device: UserDevice) => {
   }
 }
 
+const handleQuickProvision = async () => {
+  if (!user.value || quickProvisionBusy.value) return
+  quickProvisionBusy.value = true
+  subscriptionError.value = ''
+  try {
+    const res = await QuickProvisionUser(user.value.id, {
+      include_vless: true,
+      include_wireguard: true,
+      include_anet: false,
+      device_prefix: user.value.uid || undefined,
+    })
+    if (res.subscription?.url) {
+      subscriptionUrl.value = res.subscription.url
+    }
+    await loadDevices()
+    const createdText = res.created_count > 0 ? `создано устройств: ${res.created_count}` : 'все активные маршруты уже выданы'
+    message.success(`Готово (${createdText}), HTTPS-подписка обновлена`)
+  } catch (e: unknown) {
+    const errText = extractApiError(e, 'Не удалось выполнить быструю выдачу доступа')
+    subscriptionError.value = errText
+    message.error(errText)
+  } finally {
+    quickProvisionBusy.value = false
+  }
+}
+
 const handleSaveUser = async () => {
   if (!user.value || !userFormValid.value) return
   try {
@@ -686,15 +737,26 @@ const handleToggleClientQr = async () => {
 
           <div class="d-flex flex-wrap ga-2">
             <v-btn
-              color="primary"
+              color="success"
               variant="flat"
+              size="small"
+              prepend-icon="mdi-flash"
+              :loading="quickProvisionBusy"
+              :disabled="!user.is_active || subscriptionBusy"
+              @click="handleQuickProvision"
+            >
+              Выдать всё в 1 клик (VLESS + WG + Подписка)
+            </v-btn>
+            <v-btn
+              color="primary"
+              variant="tonal"
               size="small"
               prepend-icon="mdi-link-plus"
               :loading="subscriptionBusy"
-              :disabled="!user.is_active"
+              :disabled="!user.is_active || quickProvisionBusy"
               @click="handleCreateSubscription"
             >
-              Создать/обновить подписку
+              Обновить подписку
             </v-btn>
             <v-btn
               variant="tonal"
@@ -768,6 +830,42 @@ const handleToggleClientQr = async () => {
         />
         <div v-else-if="subscriptionActive" class="text-caption text-medium-emphasis mb-2">
           Подписка активна. Для показа новой ссылки нажмите «Создать/обновить подписку» (прежняя ссылка станет недействительной).
+        </div>
+
+        <div v-if="mirrorSubscriptionUrls.length" class="mb-3">
+          <div class="text-caption text-medium-emphasis mb-1">
+            Зеркала подписки с других входных шлюзов (содержат все ваши активные VLESS-маршруты):
+          </div>
+          <div
+            v-for="mirror in mirrorSubscriptionUrls"
+            :key="mirror.host"
+            class="d-flex align-center flex-wrap ga-2 mb-1"
+          >
+            <code class="mono text-caption">{{ mirror.url }}</code>
+            <v-btn
+              size="x-small"
+              variant="tonal"
+              prepend-icon="mdi-content-copy"
+              @click="copyText(mirror.url).then(ok => ok ? message.success(`Зеркало ${mirror.host} скопировано`) : message.error('Не удалось скопировать'))"
+            >
+              Копировать
+            </v-btn>
+            <v-btn
+              size="x-small"
+              variant="text"
+              prepend-icon="mdi-qrcode"
+              @click="
+                openQrModal({
+                  value: mirror.url,
+                  title: `Подписка (${mirror.host}) · ${user.uid}`,
+                  subtitle: 'Локальный QR-код зеркала подписки',
+                  filename: `${sanitizeFilePart(user.uid, 'user')}-${mirror.host}-subscription.txt`,
+                })
+              "
+            >
+              QR
+            </v-btn>
+          </div>
         </div>
 
         <div class="text-caption text-medium-emphasis">

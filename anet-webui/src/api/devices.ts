@@ -4,6 +4,8 @@ import type {
   CreateIngressRouteRequest,
   CreateIngressRouteResponse,
   IngressRoutesResponse,
+  QuickProvisionRequest,
+  QuickProvisionResponse,
   SubscriptionResponse,
   UserDevice,
   UserDevicesResponse,
@@ -50,5 +52,15 @@ export function CreateUserSubscription(userId: string): Promise<SubscriptionResp
 export function RevokeUserSubscription(userId: string): Promise<void> {
   return api<void>(`/users/${encodeURIComponent(userId)}/subscription`, {
     method: 'DELETE',
+  })
+}
+
+export function QuickProvisionUser(
+  userId: string,
+  data: QuickProvisionRequest = { include_vless: true, include_wireguard: true, include_anet: false },
+): Promise<QuickProvisionResponse> {
+  return api<QuickProvisionResponse>(`/users/${encodeURIComponent(userId)}/quick-provision`, {
+    method: 'POST',
+    data,
   })
 }

@@ -15,6 +15,9 @@ export interface IngressRoute {
   sync_mode: 'live' | 'legacy_pool'
   last_sync_at?: string | null
   created_at: string
+  last_latency_ms?: number | null
+  last_loss_pct?: number | null
+  uplink_up?: boolean | null
 }
 
 export interface IngressRoutesResponse {
@@ -82,4 +85,17 @@ export interface SubscriptionResponse {
   path: string
   url: string
   token: string
+}
+
+export interface QuickProvisionRequest {
+  include_vless?: boolean
+  include_wireguard?: boolean
+  include_anet?: boolean
+  device_prefix?: string | null
+}
+
+export interface QuickProvisionResponse {
+  created_count: number
+  devices: UserDevice[]
+  subscription?: SubscriptionResponse | null
 }

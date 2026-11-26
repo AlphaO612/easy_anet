@@ -1,3 +1,4 @@
+pub mod alerts_and_sites;
 pub mod api;
 pub mod auth;
 pub mod compiled_rules;
@@ -36,6 +37,7 @@ pub fn get_api(
             probes::ProbesApi { db: db.clone() },
             topology::TopologyApi { db: db.clone() },
             incidents::IncidentsApi { db: db.clone() },
+            alerts_and_sites::AlertsAndSitesApi { db: db.clone() },
             devices::DevicesApi {
                 db: db.clone(),
                 client_template_path,

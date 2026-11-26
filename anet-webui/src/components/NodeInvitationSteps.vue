@@ -25,7 +25,7 @@ const ssh = computed(() => {
     || !Number.isInteger(port) || port < 1 || port > 65535) return ''
   return `ssh -p ${port} ${user}@${address}`
 })
-const install = 'file=$(mktemp) && curl -fLsS --retry 2 -o "$file" https://github.com/AlphaO612/easy_anet/releases/download/anet-easy-2026.11.23.2/join-node.sh && bash "$file"'
+const install = 'file=$(mktemp) && curl -fLsS --retry 2 -o "$file" https://github.com/AlphaO612/easy_anet/releases/download/anet-easy-2026.11.26.2/join-node.sh && bash "$file"'
 const payload = computed(() => {
   if (!validApi.value) return ''
   const json = JSON.stringify({

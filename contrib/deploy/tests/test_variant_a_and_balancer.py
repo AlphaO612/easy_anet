@@ -271,12 +271,15 @@ class LiveSyncTests(unittest.TestCase):
 
             self.assertEqual(diff["added"], [new_id])
             self.assertEqual(diff["removed"], [old_id])
-            self.assertEqual(len(calls), 2)
-            self.assertIn("rmu", calls[0][0])
-            self.assertIn("old@anet.invalid", calls[0][0])
-            self.assertIn("adu", calls[1][0])
-            adu_payload = json.loads(calls[1][1])
+            rmu_calls = [c for c in calls if "rmu" in c[0]]
+            adu_calls = [c for c in calls if any("adu" in str(arg) for arg in c[0])]
+            self.assertEqual(len(rmu_calls), 1)
+            self.assertEqual(len(adu_calls), 1)
+            self.assertIn("old@anet.invalid", rmu_calls[0][0])
+            adu_payload = json.loads(adu_calls[0][1])
             self.assertEqual(adu_payload["inbounds"][0]["tag"], "vless-in")
+            self.assertEqual(adu_payload["inbounds"][0]["port"], 8443)
+            self.assertEqual(adu_payload["inbounds"][0]["settings"]["decryption"], "none")
             self.assertEqual(adu_payload["inbounds"][0]["settings"]["clients"][0]["id"], new_id)
 
             persisted = json.loads(server_json.read_text())

@@ -14,12 +14,13 @@ import { copyText, extractApiError, formatDateTime, formatUptime } from '@/utils
 import ServerModal from '@/components/ServerModal.vue'
 import ProbeRevisionDialog from '@/components/ProbeRevisionDialog.vue'
 import CreateServerModal from '@/components/CreateServerModal.vue'
+import SitesManager from '@/components/SitesManager.vue'
 
 const { confirmAction } = useConfirmDialog()
 const appMessage = useAppMessage()
 const route = useRoute()
 
-const activeTab = ref<'nodes' | 'ingress'>('nodes')
+const activeTab = ref<'nodes' | 'ingress' | 'sites'>('nodes')
 
 // === Ноды ANet ===
 const exporting = ref(false)
@@ -357,6 +358,7 @@ onBeforeUnmount(() => {
     <v-tabs v-model="activeTab" color="primary" class="mb-4 border-b">
       <v-tab value="nodes" prepend-icon="mdi-server-network">Ноды ANet</v-tab>
       <v-tab value="ingress" prepend-icon="mdi-transit-connection-variant">Входные точки VLESS / WireGuard</v-tab>
+      <v-tab value="sites" prepend-icon="mdi-web">Сайты маскировки (HTTPS)</v-tab>
     </v-tabs>
 
     <!-- Вкладка 1: Ноды ANet -->
@@ -588,13 +590,23 @@ onBeforeUnmount(() => {
                 <code>{{ item.exit_host }}</code>
               </td>
               <td>
-                <v-chip
-                  size="small"
-                  variant="tonal"
-                  :color="item.sync_mode === 'live' ? 'success' : 'warning'"
-                >
-                  {{ item.sync_mode === 'live' ? 'live' : 'legacy_pool' }}
-                </v-chip>
+                <div class="d-flex align-center flex-wrap ga-1">
+                  <v-chip
+                    size="small"
+                    variant="tonal"
+                    :color="item.uplink_up === false ? 'error' : item.sync_mode === 'live' ? 'success' : 'warning'"
+                  >
+                    {{ item.uplink_up === false ? 'uplink down' : item.sync_mode === 'live' ? 'live' : 'legacy_pool' }}
+                  </v-chip>
+                  <v-chip
+                    v-if="item.last_latency_ms != null"
+                    size="x-small"
+                    variant="outlined"
+                    :color="(item.last_loss_pct ?? 0) >= 15 ? 'warning' : 'success'"
+                  >
+                    {{ Math.round(item.last_latency_ms) }} мс{{ item.last_loss_pct != null ? ` · ${item.last_loss_pct.toFixed(0)}%` : '' }}
+                  </v-chip>
+                </div>
               </td>
               <td>
                 <span class="text-caption text-medium-emphasis">
@@ -616,6 +628,11 @@ onBeforeUnmount(() => {
           </tbody>
         </v-table>
       </v-card>
+    </div>
+
+    <!-- Вкладка 3: Сайты маскировки (HTTPS) -->
+    <div v-if="activeTab === 'sites'">
+      <SitesManager />
     </div>
 
     <!-- Модалка добавления входной точки VLESS / WireGuard -->

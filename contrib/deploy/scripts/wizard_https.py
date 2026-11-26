@@ -203,6 +203,15 @@ server {{
         proxy_set_header Authorization "";
         proxy_set_header Cookie "";
     }}
+    location ~ "^/api/v1/ingress-sync/[A-Za-z0-9_-]+/site$" {{
+        access_log off;
+        limit_except GET {{ deny all; }}
+        proxy_pass http://127.0.0.1:{port};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
+    }}
 """
         http += f"""server {{
     {listener(443, " ssl")}

@@ -356,6 +356,35 @@ impl StatisticsApi {
             entry.0 = entry.0.saturating_add(total.rx_bytes.max(0) as i64);
             entry.1 = entry.1.saturating_add(total.tx_bytes.max(0) as i64);
         }
+        // Добавляем трафик VLESS и WireGuard устройств (user_devices) к соответствующим шлюзам и выходам
+        if let (Ok(routes), Ok(devs)) = (
+            crate::entities::ingress_routes::Entity::find().all(&self.db).await,
+            crate::entities::user_devices::Entity::find().all(&self.db).await,
+        ) {
+            let route_map: HashMap<String, crate::entities::ingress_routes::Model> =
+                routes.into_iter().map(|r| (r.id.clone(), r)).collect();
+            for dev in devs {
+                let up = dev.upload_bytes.max(0);
+                let down = dev.download_bytes.max(0);
+                if up == 0 && down == 0 {
+                    continue;
+                }
+                if let Some(route) = dev.route_id.as_deref().and_then(|rid| route_map.get(rid)) {
+                    if let Some(eid) = route.entry_server_id {
+                        let e = aggregate.entry(eid).or_default();
+                        e.0 = e.0.saturating_add(up);
+                        e.1 = e.1.saturating_add(down);
+                    }
+                    if let Some(xid) = route.exit_server_id {
+                        if Some(xid) != route.entry_server_id {
+                            let e = aggregate.entry(xid).or_default();
+                            e.0 = e.0.saturating_add(up);
+                            e.1 = e.1.saturating_add(down);
+                        }
+                    }
+                }
+            }
+        }
         GetNodeTrafficStatsResponse::Ok(Json(
             nodes
                 .into_iter()
@@ -402,6 +431,29 @@ impl StatisticsApi {
             });
             entry.rx_bytes = entry.rx_bytes.saturating_add(total.rx_bytes.max(0) as i64);
             entry.tx_bytes = entry.tx_bytes.saturating_add(total.tx_bytes.max(0) as i64);
+        }
+        // Добавляем трафик VLESS и WireGuard устройств (user_devices) к статистике пользователей
+        if let Ok(devs) = crate::entities::user_devices::Entity::find().all(&self.db).await {
+            for dev in devs {
+                let up = dev.upload_bytes.max(0);
+                let down = dev.download_bytes.max(0);
+                if up == 0 && down == 0 {
+                    continue;
+                }
+                let user = users_by_id.get(&dev.user_id);
+                let fp = user
+                    .map(|u| u.fingerprint.clone())
+                    .unwrap_or_else(|| dev.user_id.to_string());
+                let entry = aggregate.entry(fp.clone()).or_insert_with(|| UserTrafficStatDto {
+                    user_id: Some(dev.user_id),
+                    uid: user.and_then(|u| u.uid.clone()),
+                    fingerprint: fp,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                });
+                entry.rx_bytes = entry.rx_bytes.saturating_add(up);
+                entry.tx_bytes = entry.tx_bytes.saturating_add(down);
+            }
         }
         let mut stats: Vec<_> = aggregate.into_values().collect();
         stats.sort_by_key(|item| std::cmp::Reverse(item.rx_bytes.saturating_add(item.tx_bytes)));

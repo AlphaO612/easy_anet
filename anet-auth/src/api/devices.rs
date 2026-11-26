@@ -7,11 +7,12 @@ use crate::api::users::build_user_client_toml;
 use crate::crypto::DbEncryptor;
 use crate::entities::{
     active_sessions, ingress_routes, node_runtime_states, rates, servers, topology_publications,
-    traffic_totals, user_device_traffic_sources, user_devices, user_subscriptions, users,
+    traffic_hourly, traffic_totals, user_device_traffic_sources, user_devices, user_subscriptions,
+    users,
 };
 use anet_common::probe_revision::ProbeRevision;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use ipnet::Ipv4Net;
 use poem::{error::InternalServerError, http::StatusCode, Error, Result};
 use poem_openapi::{
@@ -52,6 +53,9 @@ pub struct IngressRouteDto {
     pub sync_mode: String,
     pub last_sync_at: Option<String>,
     pub created_at: String,
+    pub last_latency_ms: Option<f64>,
+    pub last_loss_pct: Option<f64>,
+    pub uplink_up: Option<bool>,
 }
 
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
@@ -127,11 +131,41 @@ pub struct SubscriptionResponseDto {
 }
 
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct QuickProvisionRequestDto {
+    #[oai(default = "default_true")]
+    pub include_vless: bool,
+    #[oai(default = "default_true")]
+    pub include_wireguard: bool,
+    #[oai(default)]
+    pub include_anet: bool,
+    pub device_prefix: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct QuickProvisionResponseDto {
+    pub created_count: i32,
+    pub devices: Vec<UserDeviceDto>,
+    pub subscription: Option<SubscriptionResponseDto>,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
 pub struct IngressSyncRequest {
     pub protocol: String,
     pub source: String,
     pub wg_server_public_key: Option<String>,
     pub totals: HashMap<String, Vec<i64>>,
+    #[oai(default)]
+    pub uplink_up: Option<bool>,
+    #[oai(default)]
+    pub latency_ms: Option<f64>,
+    #[oai(default)]
+    pub loss_pct: Option<f64>,
+    #[oai(default)]
+    pub uptime_seconds: Option<i64>,
 }
 
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +186,7 @@ pub struct IngressSyncResponse {
     pub protocol: String,
     pub active_vless_clients: Vec<ActiveVlessClientDto>,
     pub active_wg_peers: Vec<ActiveWgPeerDto>,
+    pub site_sha256: Option<String>,
 }
 
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +382,9 @@ async fn sync_wizard_routes(db: &DatabaseConnection) {
                     sync_mode: Set("legacy_pool".into()),
                     last_sync_at: Set(None),
                     created_at: Set(now),
+                    last_latency_ms: Set(None),
+                    last_loss_pct: Set(None),
+                    uplink_up: Set(None),
                 };
                 let _ = model.insert(db).await;
             }
@@ -391,6 +429,9 @@ async fn sync_wizard_routes(db: &DatabaseConnection) {
                         sync_mode: Set("live".into()),
                         last_sync_at: Set(None),
                         created_at: Set(now),
+                        last_latency_ms: Set(None),
+                        last_loss_pct: Set(None),
+                        uplink_up: Set(None),
                     };
                     let _ = model.insert(db).await;
                 }
@@ -415,6 +456,9 @@ fn route_to_dto(m: ingress_routes::Model) -> IngressRouteDto {
         sync_mode: m.sync_mode,
         last_sync_at: m.last_sync_at.map(|t| t.and_utc().to_rfc3339()),
         created_at: m.created_at.and_utc().to_rfc3339(),
+        last_latency_ms: m.last_latency_ms,
+        last_loss_pct: m.last_loss_pct,
+        uplink_up: m.uplink_up,
     }
 }
 
@@ -656,6 +700,9 @@ impl DevicesApi {
             sync_mode: Set("live".into()),
             last_sync_at: Set(None),
             created_at: Set(now),
+            last_latency_ms: Set(None),
+            last_loss_pct: Set(None),
+            uplink_up: Set(None),
         };
 
         let saved = model.insert(&self.db).await.map_err(InternalServerError)?;
@@ -947,6 +994,231 @@ impl DevicesApi {
         Ok(())
     }
 
+    /// Быстрая выдача в 1 клик: создаёт VLESS-устройства на всех живых шлюзах + лучший WireGuard + HTTPS-подписку.
+    #[oai(path = "/users/:id/quick-provision", method = "post")]
+    async fn quick_provision(
+        &self,
+        auth: AdminToken,
+        id: Path<Uuid>,
+        req: Json<QuickProvisionRequestDto>,
+    ) -> Result<Json<QuickProvisionResponseDto>> {
+        validate_admin_session(&self.db, &auth.0.token)
+            .await
+            .map_err(|e| Error::from_string(e, StatusCode::UNAUTHORIZED))?;
+        sync_wizard_routes(&self.db).await;
+
+        let user = users::Entity::find_by_id(id.0)
+            .one(&self.db)
+            .await
+            .map_err(InternalServerError)?
+            .ok_or_else(|| Error::from_string("Пользователь не найден", StatusCode::NOT_FOUND))?;
+
+        let all_routes = ingress_routes::Entity::find()
+            .order_by_asc(ingress_routes::Column::Name)
+            .all(&self.db)
+            .await
+            .map_err(InternalServerError)?;
+        let existing_devices = user_devices::Entity::find()
+            .filter(user_devices::Column::UserId.eq(user.id))
+            .filter(user_devices::Column::Status.eq("active"))
+            .all(&self.db)
+            .await
+            .map_err(InternalServerError)?;
+
+        let existing_route_ids: HashSet<String> = existing_devices
+            .iter()
+            .filter_map(|d| d.route_id.clone())
+            .collect();
+        let has_active_wg = existing_devices.iter().any(|d| d.protocol == "wireguard");
+        let has_active_anet = existing_devices.iter().any(|d| d.protocol == "anet");
+
+        let prefix = req
+            .0
+            .device_prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| user.uid.clone().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| "Device".into());
+
+        let encryptor = DbEncryptor::new();
+        let now = Utc::now().naive_utc();
+        let mut created_count = 0_i32;
+
+        // 1. Все живые VLESS-маршруты (отсортированы по лучшему RTT)
+        if req.0.include_vless {
+            let mut vless_routes: Vec<&ingress_routes::Model> = all_routes
+                .iter()
+                .filter(|r| r.protocol == "vless" && r.uplink_up != Some(false))
+                .collect();
+            vless_routes.sort_by(|a, b| {
+                a.last_latency_ms
+                    .unwrap_or(9_999.0)
+                    .partial_cmp(&b.last_latency_ms.unwrap_or(9_999.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for route in vless_routes {
+                if existing_route_ids.contains(&route.id) {
+                    continue;
+                }
+                let vless_uuid = Uuid::new_v4().to_string();
+                let enc_secret = encryptor
+                    .encrypt(&vless_uuid)
+                    .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
+                let short_host = route.entry_host.split('.').next().unwrap_or(&route.entry_host);
+                let dev_name = format!("{} · {} ({})", prefix, short_host, route.exit_host);
+                let model = user_devices::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    user_id: Set(user.id),
+                    protocol: Set("vless".into()),
+                    name: Set(dev_name),
+                    route_id: Set(Some(route.id.clone())),
+                    credential_id: Set(vless_uuid),
+                    encrypted_secret: Set(Some(enc_secret)),
+                    assigned_ip: Set(None),
+                    status: Set("active".into()),
+                    synced_at: Set(None),
+                    upload_bytes: Set(0),
+                    download_bytes: Set(0),
+                    last_traffic_at: Set(None),
+                    created_at: Set(now),
+                };
+                model.insert(&self.db).await.map_err(InternalServerError)?;
+                created_count += 1;
+            }
+        }
+
+        // 2. Один WireGuard на лучшем живом WG-маршруте (если ещё нет активного WG)
+        if req.0.include_wireguard && !has_active_wg {
+            let mut wg_routes: Vec<&ingress_routes::Model> = all_routes
+                .iter()
+                .filter(|r| r.protocol == "wireguard" && r.uplink_up != Some(false))
+                .collect();
+            wg_routes.sort_by(|a, b| {
+                a.last_latency_ms
+                    .unwrap_or(9_999.0)
+                    .partial_cmp(&b.last_latency_ms.unwrap_or(9_999.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if let Some(route) = wg_routes.first() {
+                let used: HashSet<String> = user_devices::Entity::find()
+                    .filter(user_devices::Column::RouteId.eq(&route.id))
+                    .all(&self.db)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|d| d.assigned_ip)
+                    .collect();
+                let subnet = route.wg_subnet.as_deref().unwrap_or("10.79.0.0/24");
+                if let Some(ip) = allocate_wg_ip(subnet, &used) {
+                    let (priv_b64, pub_b64) = generate_wg_keypair();
+                    let enc_priv = encryptor
+                        .encrypt(&priv_b64)
+                        .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
+                    let short_host = route.entry_host.split('.').next().unwrap_or(&route.entry_host);
+                    let dev_name = format!("{} · WG {}", prefix, short_host);
+                    let model = user_devices::ActiveModel {
+                        id: Set(Uuid::new_v4()),
+                        user_id: Set(user.id),
+                        protocol: Set("wireguard".into()),
+                        name: Set(dev_name),
+                        route_id: Set(Some(route.id.clone())),
+                        credential_id: Set(pub_b64),
+                        encrypted_secret: Set(Some(enc_priv)),
+                        assigned_ip: Set(Some(ip)),
+                        status: Set("active".into()),
+                        synced_at: Set(None),
+                        upload_bytes: Set(0),
+                        download_bytes: Set(0),
+                        last_traffic_at: Set(None),
+                        created_at: Set(now),
+                    };
+                    model.insert(&self.db).await.map_err(InternalServerError)?;
+                    created_count += 1;
+                }
+            }
+        }
+
+        // 3. Опционально ANet-устройство
+        if req.0.include_anet && !has_active_anet {
+            let model = user_devices::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                user_id: Set(user.id),
+                protocol: Set("anet".into()),
+                name: Set(format!("{} · ANet", prefix)),
+                route_id: Set(None),
+                credential_id: Set(user.fingerprint.clone()),
+                encrypted_secret: Set(None),
+                assigned_ip: Set(None),
+                status: Set("active".into()),
+                synced_at: Set(Some(now)),
+                upload_bytes: Set(0),
+                download_bytes: Set(0),
+                last_traffic_at: Set(None),
+                created_at: Set(now),
+            };
+            model.insert(&self.db).await.map_err(InternalServerError)?;
+            created_count += 1;
+        }
+
+        // 4. Выпускаем/обновляем HTTPS-подписку, если есть VLESS
+        let subscription = if req.0.include_vless {
+            let token = generate_node_token();
+            let hash = sha256_hex(&token);
+            user_subscriptions::Entity::insert(user_subscriptions::ActiveModel {
+                user_id: Set(user.id),
+                token_hash: Set(hash),
+                created_at: Set(now),
+                updated_at: Set(now),
+            })
+            .on_conflict(
+                OnConflict::column(user_subscriptions::Column::UserId)
+                    .update_columns([
+                        user_subscriptions::Column::TokenHash,
+                        user_subscriptions::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec_without_returning(&self.db)
+            .await
+            .map_err(InternalServerError)?;
+
+            let path = format!("/api/v1/subscriptions/{}", token);
+            let origin = resolve_subscription_origin();
+            let url = if origin.is_empty() {
+                path.clone()
+            } else {
+                format!("{}{}", origin, path)
+            };
+            Some(SubscriptionResponseDto { path, url, token })
+        } else {
+            None
+        };
+
+        let routes_map: HashMap<String, ingress_routes::Model> = all_routes
+            .into_iter()
+            .map(|r| (r.id.clone(), r))
+            .collect();
+        let all_user_devs = user_devices::Entity::find()
+            .filter(user_devices::Column::UserId.eq(user.id))
+            .order_by_desc(user_devices::Column::CreatedAt)
+            .all(&self.db)
+            .await
+            .map_err(InternalServerError)?;
+        let mut device_dtos = Vec::with_capacity(all_user_devs.len());
+        for d in all_user_devs {
+            let route = d.route_id.as_deref().and_then(|rid| routes_map.get(rid));
+            device_dtos.push(device_to_dto(&self.db, &self.client_template_path, d, route, &encryptor).await);
+        }
+
+        Ok(Json(QuickProvisionResponseDto {
+            created_count,
+            devices: device_dtos,
+            subscription,
+        }))
+    }
+
     /// Создать или перевыпустить единую HTTPS-ссылку подписки пользователя.
     #[oai(path = "/users/:id/subscription", method = "post")]
     async fn create_subscription(
@@ -1061,7 +1333,8 @@ impl DevicesApi {
             .map_err(InternalServerError)?;
 
         let encryptor = DbEncryptor::new();
-        let mut uris = Vec::new();
+        // Сортируем активные VLESS-устройства: сначала живые маршруты с минимальной задержкой (RTT)
+        let mut ranked: Vec<(u8, f64, String)> = Vec::new();
         for dev in devices {
             if let Some(route) = dev.route_id.as_deref().and_then(|rid| routes.get(rid)) {
                 let uuid = dev
@@ -1069,9 +1342,20 @@ impl DevicesApi {
                     .as_deref()
                     .and_then(|ct| encryptor.decrypt(ct).ok())
                     .unwrap_or(dev.credential_id);
-                uris.push(render_vless_uri(&uuid, route, &dev.name));
+                let health_rank = match route.uplink_up {
+                    Some(false) => 2,
+                    _ if route.last_loss_pct.is_some_and(|l| l >= 50.0) => 1,
+                    _ => 0,
+                };
+                let rtt = route.last_latency_ms.unwrap_or(9_999.0);
+                ranked.push((health_rank, rtt, render_vless_uri(&uuid, route, &dev.name)));
             }
         }
+        ranked.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let uris: Vec<String> = ranked.into_iter().map(|(_, _, uri)| uri).collect();
 
         if uris.is_empty() {
             return Err(Error::from_string(
@@ -1143,7 +1427,52 @@ impl DevicesApi {
                 route_active.wg_server_public_key = Set(Some(trimmed.to_string()));
             }
         }
+        if let Some(up) = req.0.uplink_up {
+            route_active.uplink_up = Set(Some(up));
+        }
+        if let Some(lat) = req.0.latency_ms.filter(|v| v.is_finite() && *v >= 0.0) {
+            route_active.last_latency_ms = Set(Some(lat));
+        }
+        if let Some(loss) = req.0.loss_pct.filter(|v| v.is_finite() && *v >= 0.0 && *v <= 100.0) {
+            route_active.last_loss_pct = Set(Some(loss));
+        }
         let _ = route_active.update(&self.db).await;
+
+        // Обновляем runtime-состояние (online heartbeat) для шлюза и живого выхода, чтобы в Серверах/Пулах не висел unknown
+        let uptime_sec = req.0.uptime_seconds.unwrap_or(0).max(0);
+        let upsert_rt = |server_id: Uuid, version_label: &str| {
+            let db = self.db.clone();
+            let ver = version_label.to_string();
+            async move {
+                let _ = node_runtime_states::Entity::insert(node_runtime_states::ActiveModel {
+                    server_id: Set(server_id),
+                    last_seen_at: Set(now),
+                    version: Set(ver),
+                    uptime_seconds: Set(uptime_sec),
+                    active_connections: Set(0),
+                    accepting_connections: Set(true),
+                })
+                .on_conflict(
+                    OnConflict::column(node_runtime_states::Column::ServerId)
+                        .update_columns([
+                            node_runtime_states::Column::LastSeenAt,
+                            node_runtime_states::Column::UptimeSeconds,
+                        ])
+                        .to_owned(),
+                )
+                .exec_without_returning(&db)
+                .await;
+            }
+        };
+        if let Some(entry_sid) = route.entry_server_id {
+            upsert_rt(entry_sid, "ingress-sync").await;
+        }
+        let exit_healthy = req.0.uplink_up != Some(false) && req.0.loss_pct.unwrap_or(0.0) < 90.0;
+        if exit_healthy {
+            if let Some(exit_sid) = route.exit_server_id {
+                upsert_rt(exit_sid, "exit-verified").await;
+            }
+        }
 
         let route_devices = user_devices::Entity::find()
             .filter(user_devices::Column::RouteId.eq(&route.id))
@@ -1152,11 +1481,21 @@ impl DevicesApi {
             .map_err(InternalServerError)?;
 
         let mut dev_by_key: HashMap<String, Uuid> = HashMap::new();
+        let mut dev_map: HashMap<Uuid, &user_devices::Model> = HashMap::new();
         for d in &route_devices {
+            dev_map.insert(d.id, d);
             dev_by_key.insert(d.credential_id.clone(), d.id);
             dev_by_key.insert(d.id.to_string(), d.id);
+            dev_by_key.insert(format!("anet-dev-{}@anet.invalid", d.id), d.id);
             dev_by_key.insert(sha256_hex(&d.credential_id), d.id);
         }
+
+        let bucket_minute = (now.minute() / 15) * 15;
+        let bucket_start = now
+            .date()
+            .and_hms_opt(now.hour(), bucket_minute, 0)
+            .unwrap_or(now);
+        let stat_server_id = route.entry_server_id.or(route.exit_server_id);
 
         let source = req.0.source.trim().to_string();
         let mut updated_device_ids: HashSet<Uuid> = HashSet::new();
@@ -1178,13 +1517,16 @@ impl DevicesApi {
                 .await
                 .map_err(InternalServerError)?;
 
-                if let Some(prev) = existing {
+                let (delta_up, delta_down) = if let Some(prev) = existing {
                     let next_up = prev.upload_bytes.max(up);
                     let next_down = prev.download_bytes.max(down);
+                    let du = next_up.saturating_sub(prev.upload_bytes);
+                    let dd = next_down.saturating_sub(prev.download_bytes);
                     let mut active = prev.into_active_model();
                     active.upload_bytes = Set(next_up);
                     active.download_bytes = Set(next_down);
                     let _ = active.update(&self.db).await;
+                    (du, dd)
                 } else {
                     let _ = (user_device_traffic_sources::ActiveModel {
                         device_id: Set(dev_id),
@@ -1194,6 +1536,45 @@ impl DevicesApi {
                     })
                     .insert(&self.db)
                     .await;
+                    (up, down)
+                };
+
+                // Записываем дельту VLESS/WireGuard в traffic_hourly для графика истории трафика
+                if (delta_up > 0 || delta_down > 0) && stat_server_id.is_some() {
+                    if let (Some(srv_id), Some(dev_row)) = (stat_server_id, dev_map.get(&dev_id)) {
+                        let fp = format!("{}:{}", dev_row.protocol, dev_row.id);
+                        let proto = crate::entities::ProtocolType::Quic;
+                        let existing_h = traffic_hourly::Entity::find()
+                            .filter(traffic_hourly::Column::BucketStart.eq(bucket_start))
+                            .filter(traffic_hourly::Column::ServerId.eq(srv_id))
+                            .filter(traffic_hourly::Column::Fingerprint.eq(&fp))
+                            .filter(traffic_hourly::Column::Protocol.eq(proto))
+                            .one(&self.db)
+                            .await
+                            .ok()
+                            .flatten();
+                        if let Some(row_h) = existing_h {
+                            let mut act = row_h.into_active_model();
+                            act.rx_bytes = Set(act.rx_bytes.unwrap().saturating_add(delta_up));
+                            act.tx_bytes = Set(act.tx_bytes.unwrap().saturating_add(delta_down));
+                            act.updated_at = Set(now);
+                            let _ = act.update(&self.db).await;
+                        } else {
+                            let _ = (traffic_hourly::ActiveModel {
+                                id: Set(Uuid::new_v4()),
+                                bucket_start: Set(bucket_start),
+                                server_id: Set(srv_id),
+                                user_id: Set(Some(dev_row.user_id)),
+                                fingerprint: Set(fp),
+                                rx_bytes: Set(delta_up),
+                                tx_bytes: Set(delta_down),
+                                protocol: Set(proto),
+                                updated_at: Set(now),
+                            })
+                            .insert(&self.db)
+                            .await;
+                        }
+                    }
                 }
                 updated_device_ids.insert(dev_id);
             }
@@ -1262,11 +1643,20 @@ impl DevicesApi {
             }
         }
 
+        let target_domain = route.sni.clone().unwrap_or_else(|| route.entry_host.clone());
+        let site_sha256 = crate::api::alerts_and_sites::resolve_site_bundle_for_domain(
+            &self.db,
+            &target_domain,
+        )
+        .await
+        .map(|b| b.bundle_sha256);
+
         Ok(Json(IngressSyncResponse {
             route_id: route.id,
             protocol: route.protocol,
             active_vless_clients,
             active_wg_peers,
+            site_sha256,
         }))
     }
 
@@ -1324,10 +1714,26 @@ impl DevicesApi {
         }
 
         let mut route_traffic: HashMap<String, (i64, i64, i64)> = HashMap::new();
+        let route_by_id: HashMap<String, &ingress_routes::Model> =
+            all_routes.iter().map(|r| (r.id.clone(), r)).collect();
         let mut proto_vless: i64 = 0;
         let mut proto_wg: i64 = 0;
         let mut proto_anet: i64 = 0;
         for d in &all_devices {
+            let up = d.upload_bytes.max(0);
+            let down = d.download_bytes.max(0);
+            if let Some(ref rid) = d.route_id {
+                if let Some(r) = route_by_id.get(rid) {
+                    if let Some(eid) = r.entry_server_id {
+                        *node_rx.entry(eid).or_default() += up;
+                        *node_tx.entry(eid).or_default() += down;
+                    }
+                    if let Some(xid) = r.exit_server_id {
+                        *node_rx.entry(xid).or_default() += up;
+                        *node_tx.entry(xid).or_default() += down;
+                    }
+                }
+            }
             if d.status != "active" {
                 continue;
             }
@@ -1339,8 +1745,8 @@ impl DevicesApi {
             }
             if let Some(ref rid) = d.route_id {
                 let entry = route_traffic.entry(rid.clone()).or_insert((0, 0, 0));
-                entry.0 += d.upload_bytes.max(0);
-                entry.1 += d.download_bytes.max(0);
+                entry.0 += up;
+                entry.1 += down;
                 entry.2 += 1;
             }
         }
@@ -1395,11 +1801,28 @@ impl DevicesApi {
 
             if src_id != dst_id && seen_edges.insert((src_id.clone(), dst_id.clone(), route.protocol.clone())) {
                 let probe = edge_probes.get(&(src_id.clone(), dst_id.clone()));
-                let status = match probe.and_then(|p| p.available) {
-                    Some(true) if probe.and_then(|p| p.loss_pct).unwrap_or(0.0) >= 15.0 => "degraded",
-                    Some(true) => "up",
-                    Some(false) => "down",
-                    None => if route.last_sync_at.is_some() { "up" } else { "unknown" },
+                let latency_ms = probe.and_then(|p| p.latency_ms).or(route.last_latency_ms);
+                let loss_pct = probe.and_then(|p| p.loss_pct).or(route.last_loss_pct);
+                let throughput_mbps = probe.and_then(|p| p.throughput_mbps);
+                let status = if route.uplink_up == Some(false) {
+                    "down"
+                } else {
+                    match probe.and_then(|p| p.available) {
+                        Some(true) if loss_pct.unwrap_or(0.0) >= 15.0 => "degraded",
+                        Some(true) => "up",
+                        Some(false) => "down",
+                        None => {
+                            if loss_pct.is_some_and(|l| l >= 50.0) {
+                                "down"
+                            } else if loss_pct.is_some_and(|l| l >= 15.0) {
+                                "degraded"
+                            } else if route.last_sync_at.is_some() {
+                                "up"
+                            } else {
+                                "unknown"
+                            }
+                        }
+                    }
                 };
                 edges.push(GraphEdgeDto {
                     id: format!("route-{}", route.id),
@@ -1408,9 +1831,9 @@ impl DevicesApi {
                     transport: route.protocol.clone(),
                     route_id: Some(route.id.clone()),
                     status: status.to_string(),
-                    latency_ms: probe.and_then(|p| p.latency_ms),
-                    loss_pct: probe.and_then(|p| p.loss_pct),
-                    throughput_mbps: probe.and_then(|p| p.throughput_mbps),
+                    latency_ms,
+                    loss_pct,
+                    throughput_mbps,
                     rx_bytes: rx,
                     tx_bytes: tx,
                     last_measured_at: route.last_sync_at.map(|t| t.and_utc().to_rfc3339()),

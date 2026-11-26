@@ -564,5 +564,24 @@ pub async fn collect_probe_metrics(
         }
     }
 
+    // Дополняем метрики узлов и рёбер телеметрией от живых шлюзов (ingress_routes),
+    // если по конкретному направлению ещё нет данных Prometheus
+    if let Ok(routes) = crate::entities::ingress_routes::Entity::find().all(db).await {
+        for r in routes {
+            if let Some(exit_id) = r.exit_server_id {
+                let entry = node_metrics.entry(exit_id).or_default();
+                if entry.latency_ms.is_none() {
+                    entry.latency_ms = r.last_latency_ms;
+                }
+                if entry.loss_pct.is_none() {
+                    entry.loss_pct = r.last_loss_pct;
+                }
+                if entry.available.is_none() {
+                    entry.available = r.uplink_up;
+                }
+            }
+        }
+    }
+
     (node_metrics, edge_metrics)
 }

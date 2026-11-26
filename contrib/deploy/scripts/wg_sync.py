@@ -11,8 +11,10 @@ import os
 from pathlib import Path
 import re
 import secrets
+import socket
 import subprocess
 import sys
+import time
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener
 
@@ -239,6 +241,53 @@ def sync_wg_peers(project, wg_conf_path, desired_peers, *, starter_public_key=""
     }
 
 
+def _probe_uplink_and_rtt(project, uplink_toml_path):
+    uplink_up = None
+    try:
+        ps = ["docker", "ps", "-q", "--no-trunc",
+              "--filter", "label=com.docker.compose.project=" + project,
+              "--filter", "label=com.docker.compose.service=network"]
+        net_cids = subprocess.check_output(ps, text=True, timeout=6).split()
+        if net_cids:
+            out = subprocess.check_output(
+                ["docker", "exec", net_cids[0], "sh", "-c",
+                 "ip -4 -o addr show anet-uplink 2>/dev/null; ip -4 route show table 177 2>/dev/null"],
+                text=True, timeout=6,
+            )
+            uplink_up = (" inet " in out and "default dev anet-uplink" in out and "linkdown" not in out)
+    except Exception:
+        uplink_up = None
+
+    latency_ms = None
+    loss_pct = None
+    p = Path(uplink_toml_path)
+    if p.is_file():
+        m = re.search(r'(?m)^\s*(?:endpoint|host|address)\s*=\s*"([^"]+)"', p.read_text(errors="ignore"))
+        if m:
+            raw = m.group(1).strip()
+            exit_host = raw[1:raw.index("]:")] if (raw.startswith("[") and "]:" in raw) else (raw.rsplit(":", 1)[0] if ":" in raw else raw)
+            if exit_host:
+                samples = []
+                attempts = 3
+                for _ in range(attempts):
+                    t0 = time.monotonic()
+                    try:
+                        with socket.create_connection((exit_host, 22), timeout=2.5):
+                            samples.append((time.monotonic() - t0) * 1000.0)
+                    except OSError:
+                        pass
+                loss_pct = round(((attempts - len(samples)) / attempts) * 100.0, 1)
+                if samples:
+                    latency_ms = round(sum(samples) / len(samples), 2)
+
+    uptime_seconds = None
+    try:
+        uptime_seconds = int(float(Path("/proc/uptime").read_text().split()[0]))
+    except Exception:
+        pass
+    return uplink_up, latency_ms, loss_pct, uptime_seconds
+
+
 def collect(settings):
     with (settings.parent / "wg-sync.lock").open("a") as lock:
         _flock(lock)
@@ -251,15 +300,21 @@ def collect(settings):
         accumulate(saved, generation, counters)
         atomic_write(state, json.dumps(saved))
         if config.get("sync_endpoint"):
+            uplink_toml = config.get("uplink_toml") or str(settings.parent / "uplink.toml")
+            uplink_up, latency_ms, loss_pct, uptime_sec = _probe_uplink_and_rtt(config["project"], uplink_toml)
             message = {
                 "protocol": "wireguard",
                 "source": saved["source"],
                 "wg_server_public_key": config.get("wg_server_public_key", ""),
                 "totals": saved.get("totals", {}),
+                "uplink_up": uplink_up,
+                "latency_ms": latency_ms,
+                "loss_pct": loss_pct,
+                "uptime_seconds": uptime_sec,
             }
             request = Request(config["sync_endpoint"], data=json.dumps(message).encode(), headers={
                 "Content-Type": "application/json", "X-Usage-Token": config["token"]})
-            with build_opener(NoRedirect).open(request, timeout=8) as response:
+            with build_opener(NoRedirect).open(request, timeout=10) as response:
                 raw = response.read(256 * 1024)
             if raw:
                 reply = json.loads(raw)

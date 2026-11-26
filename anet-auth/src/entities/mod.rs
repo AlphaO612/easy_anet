@@ -37,3 +37,5 @@ pub mod ingress_routes;
 pub mod user_devices;
 pub mod user_device_traffic_sources;
 pub mod user_subscriptions;
+pub mod telegram_alert_configs;
+pub mod site_bundles;

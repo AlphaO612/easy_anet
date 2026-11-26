@@ -20,6 +20,9 @@ pub struct Model {
     pub sync_mode: String,
     pub last_sync_at: Option<DateTime>,
     pub created_at: DateTime,
+    pub last_latency_ms: Option<f64>,
+    pub last_loss_pct: Option<f64>,
+    pub uplink_up: Option<bool>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
