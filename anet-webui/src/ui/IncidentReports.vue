@@ -5,10 +5,12 @@ import {
   GetTelegramAlertConfig,
   SaveTelegramAlertConfig,
   TestTelegramAlert,
+  type TelegramExitOption,
 } from '@/api/alertsAndSites'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { useAppMessage } from '@/composables/useAppMessage'
 import { extractApiError, formatDateTime } from '@/utils/format'
+import { formatRegionBadge } from '@/utils/regions'
 
 const { confirmAction } = useConfirmDialog()
 const appMessage = useAppMessage()
@@ -18,15 +20,26 @@ const tgLoading = ref(false)
 const tgSaving = ref(false)
 const tgTesting = ref(false)
 const tgHasToken = ref(false)
+const tgAvailableExits = ref<TelegramExitOption[]>([])
 const tgUpdatedAt = ref<string | null>(null)
 const tgForm = reactive({
   enabled: false,
   bot_token: '',
   chat_id: '',
   cooldown_minutes: 15,
+  exit_route: 'auto',
   proxy_url: '',
   api_base_url: '',
 })
+
+const tgExitOptions = computed(() => [
+  { value: 'auto', title: '🌐 Авто — лучший живой выходной сервер' },
+  ...tgAvailableExits.value.map((ex) => ({
+    value: ex.exit_host,
+    title: `${ex.region ? `${formatRegionBadge(ex.region)} ` : ''}${ex.label}${ex.latency_ms != null ? ` · ${Math.round(ex.latency_ms)} мс` : ''}`,
+  })),
+  { value: 'direct', title: '⚡ Напрямую (без туннеля)' },
+])
 
 async function loadTelegram() {
   tgLoading.value = true
@@ -35,10 +48,12 @@ async function loadTelegram() {
     tgForm.enabled = cfg.enabled
     tgForm.chat_id = cfg.chat_id
     tgForm.cooldown_minutes = cfg.cooldown_minutes
+    tgForm.exit_route = cfg.exit_route || 'auto'
     tgForm.proxy_url = cfg.proxy_url || ''
     tgForm.api_base_url = cfg.api_base_url || ''
     tgForm.bot_token = ''
     tgHasToken.value = cfg.has_bot_token
+    tgAvailableExits.value = cfg.available_exits || []
     tgUpdatedAt.value = cfg.updated_at ?? null
   } catch (err) {
     appMessage.error(extractApiError(err, 'Не удалось загрузить настройки Telegram'))
@@ -55,10 +70,12 @@ async function saveTelegram() {
       bot_token: tgForm.bot_token.trim() || null,
       chat_id: tgForm.chat_id.trim(),
       cooldown_minutes: Number(tgForm.cooldown_minutes) || 15,
+      exit_route: tgForm.exit_route || 'auto',
       proxy_url: tgForm.proxy_url.trim(),
       api_base_url: tgForm.api_base_url.trim(),
     })
     tgHasToken.value = saved.has_bot_token
+    tgAvailableExits.value = saved.available_exits || []
     tgUpdatedAt.value = saved.updated_at ?? null
     tgForm.bot_token = ''
     appMessage.success('Настройки Telegram-уведомлений сохранены')
@@ -195,22 +212,16 @@ onMounted(() => {
             density="comfortable"
           />
         </v-col>
-        <v-col cols="12" md="6">
-          <v-text-field
-            v-model="tgForm.proxy_url"
-            label="HTTP/HTTPS прокси (опционально, если Telegram недоступен напрямую)"
-            placeholder="http://user:pass@exit-vps:3128"
+        <v-col cols="12">
+          <v-select
+            v-model="tgForm.exit_route"
+            :items="tgExitOptions"
+            item-title="title"
+            item-value="value"
+            label="Через какой выходной сервер отправлять уведомления Telegram"
             variant="outlined"
             density="comfortable"
-          />
-        </v-col>
-        <v-col cols="12" md="6">
-          <v-text-field
-            v-model="tgForm.api_base_url"
-            label="Альтернативный Bot API URL (reverse proxy на exit-ноде)"
-            placeholder="https://tg-relay.example.com"
-            variant="outlined"
-            density="comfortable"
+            prepend-inner-icon="mdi-routes"
           />
         </v-col>
       </v-row>

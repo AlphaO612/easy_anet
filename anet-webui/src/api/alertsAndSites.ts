@@ -1,12 +1,23 @@
 import { api } from './client'
 
+export interface TelegramExitOption {
+  exit_host: string
+  label: string
+  region: string
+  latency_ms?: number | null
+  tunnel_ready: boolean
+}
+
 export interface TelegramAlertConfig {
   enabled: boolean
   has_bot_token: boolean
   chat_id: string
   cooldown_minutes: number
+  exit_route: string
   proxy_url: string
   api_base_url: string
+  relay_online: boolean
+  available_exits: TelegramExitOption[]
   updated_at?: string | null
 }
 
@@ -15,6 +26,7 @@ export interface SaveTelegramAlertRequest {
   bot_token?: string | null
   chat_id: string
   cooldown_minutes?: number
+  exit_route?: string
   proxy_url?: string
   api_base_url?: string
 }

@@ -43,6 +43,7 @@ services:
       ANET_VLESS_CATALOG_PATH: /srv/anet-vless-catalog/index.json
       ANET_SUBSCRIPTION_ORIGIN_PATH: /srv/anet-vless-catalog/subscription-origin
       ANET_STARTER_PROFILES_PATH: /srv/anet-profiles/index.json
+      ANET_TELEGRAM_RELAY_URL: ${ANET_TELEGRAM_RELAY_URL:-}
     tmpfs: [/tmp]
     networks: [control, database, auth-egress]
     mem_limit: ${AUTH_MEMORY:-512m}

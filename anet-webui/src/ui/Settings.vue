@@ -8,9 +8,11 @@ import {
   SaveTelegramAlertConfig,
   TestTelegramAlert,
   type OperatingMode,
+  type TelegramExitOption,
 } from '@/api/alertsAndSites'
 import { useAppMessage } from '@/composables/useAppMessage'
 import { extractApiError, formatDateTime } from '@/utils/format'
+import { formatRegionBadge } from '@/utils/regions'
 
 const appMessage = useAppMessage()
 
@@ -59,30 +61,58 @@ const modeOptions: { value: OperatingMode; title: string; subtitle: string; icon
   },
 ]
 
-// === Telegram-уведомления и маршрут проксирования ===
+// === Telegram-уведомления и выбор выходного сервера ===
 const tgSaving = ref(false)
 const tgTesting = ref(false)
 const tgHasToken = ref(false)
+const tgRelayOnline = ref(false)
+const tgAvailableExits = ref<TelegramExitOption[]>([])
 const tgUpdatedAt = ref<string | null>(null)
-const tgRouteMode = ref<'direct' | 'proxy' | 'reverse_proxy'>('direct')
 
 const tgForm = reactive({
   enabled: false,
   bot_token: '',
   chat_id: '',
   cooldown_minutes: 15,
+  exit_route: 'auto',
   proxy_url: '',
   api_base_url: '',
 })
 
-const tgRouteHint = computed(() => {
-  if (tgRouteMode.value === 'proxy') {
-    return 'Запросы панели к api.telegram.org пойдут через указанный HTTP/HTTPS-прокси (например, поднятый на зарубежном exit-сервере).'
+const tgExitRouteItems = computed(() => {
+  const items: { value: string; title: string; subtitle: string }[] = [
+    {
+      value: 'auto',
+      title: '🌐 Авто — лучший живой выходной сервер (с failover)',
+      subtitle: tgRelayOnline.value
+        ? 'Автоматически отправляет через зашифрованный ANet-туннель ближайшего живого выхода'
+        : 'Туннель-релей не подключён (будет использован прямой канал)',
+    },
+  ]
+  for (const ex of tgAvailableExits.value) {
+    const flag = ex.region ? `${formatRegionBadge(ex.region)} ` : ''
+    const rtt = ex.latency_ms != null ? ` · ${Math.round(ex.latency_ms)} мс` : ''
+    items.push({
+      value: ex.exit_host,
+      title: `${flag}${ex.label}${rtt}`,
+      subtitle: ex.tunnel_ready
+        ? `Готовый зашифрованный туннель до ${ex.exit_host}`
+        : `Нет локального туннеля до ${ex.exit_host} на шлюзе панели`,
+    })
   }
-  if (tgRouteMode.value === 'reverse_proxy') {
-    return 'Вместо api.telegram.org панель будет отправлять запросы на ваш reverse-proxy URL (например Nginx proxy_pass https://api.telegram.org на EU exit-сервере).'
-  }
-  return 'Прямое соединение с https://api.telegram.org с хоста панели. Если провайдер блокирует Telegram API — выберите прокси или обратный прокси.'
+  items.push(
+    {
+      value: 'direct',
+      title: '⚡ Напрямую (без туннеля)',
+      subtitle: 'Прямой запрос к api.telegram.org с хоста панели',
+    },
+    {
+      value: 'custom',
+      title: '⚙️ Свой прокси / Bot API URL',
+      subtitle: 'Ручное указание HTTP-прокси или обратного прокси Bot API',
+    },
+  )
+  return items
 })
 
 async function loadAll() {
@@ -103,14 +133,14 @@ async function loadAll() {
     tgForm.enabled = tg.enabled
     tgForm.chat_id = tg.chat_id
     tgForm.cooldown_minutes = tg.cooldown_minutes
+    tgForm.exit_route = tg.exit_route || 'auto'
     tgForm.proxy_url = tg.proxy_url || ''
     tgForm.api_base_url = tg.api_base_url || ''
     tgForm.bot_token = ''
     tgHasToken.value = tg.has_bot_token
+    tgRelayOnline.value = tg.relay_online
+    tgAvailableExits.value = tg.available_exits || []
     tgUpdatedAt.value = tg.updated_at ?? null
-    if (tgForm.api_base_url) tgRouteMode.value = 'reverse_proxy'
-    else if (tgForm.proxy_url) tgRouteMode.value = 'proxy'
-    else tgRouteMode.value = 'direct'
   } catch (err) {
     appMessage.error(extractApiError(err, 'Не удалось загрузить системные настройки'))
   } finally {
@@ -161,13 +191,16 @@ async function saveTelegram() {
       bot_token: tgForm.bot_token.trim() || null,
       chat_id: tgForm.chat_id.trim(),
       cooldown_minutes: Number(tgForm.cooldown_minutes) || 15,
-      proxy_url: tgRouteMode.value === 'proxy' ? tgForm.proxy_url.trim() : '',
-      api_base_url: tgRouteMode.value === 'reverse_proxy' ? tgForm.api_base_url.trim() : '',
+      exit_route: tgForm.exit_route || 'auto',
+      proxy_url: tgForm.exit_route === 'custom' ? tgForm.proxy_url.trim() : '',
+      api_base_url: tgForm.exit_route === 'custom' ? tgForm.api_base_url.trim() : '',
     })
     tgHasToken.value = saved.has_bot_token
+    tgRelayOnline.value = saved.relay_online
+    tgAvailableExits.value = saved.available_exits || []
     tgUpdatedAt.value = saved.updated_at ?? null
     tgForm.bot_token = ''
-    appMessage.success('Настройки Telegram-маршрутизации сохранены')
+    appMessage.success('Настройки Telegram сохранены')
   } catch (err) {
     appMessage.error(extractApiError(err, 'Не удалось сохранить настройки Telegram'))
   } finally {
@@ -370,41 +403,45 @@ onMounted(loadAll)
       </div>
     </v-card>
 
-    <!-- Секция 3: Telegram-алерты с выбором маршрута / прокси -->
+    <!-- Секция 3: Telegram-алерты с выбором выходного сервера -->
     <v-card variant="outlined" class="pa-5 rounded-lg">
       <div class="d-flex justify-space-between align-center flex-wrap ga-2 mb-3">
         <div>
-          <h2 class="text-h6 font-weight-bold">Telegram-уведомления и маршрут проксирования</h2>
+          <h2 class="text-h6 font-weight-bold">Telegram-уведомления — выбор выходного сервера</h2>
           <div class="text-caption text-medium-emphasis">
-            Если входная нода с панелью находится в сети с блокировкой <code>api.telegram.org</code>, направьте запросы через прокси или зарубежный exit-сервер.
+            Запросы к <code>api.telegram.org</code> автоматически идут через зашифрованный ANet-туннель выбранного выходного сервера — настраивать прокси вручную не нужно.
           </div>
         </div>
-        <v-switch
-          v-model="tgForm.enabled"
-          :label="tgForm.enabled ? 'Включены' : 'Выключены'"
-          color="success"
-          inset
-          hide-details
-          density="compact"
-        />
+        <div class="d-flex align-center ga-3">
+          <v-chip size="small" variant="tonal" :color="tgRelayOnline ? 'success' : 'warning'">
+            {{ tgRelayOnline ? 'Туннель-релей активен' : 'Только прямой канал' }}
+          </v-chip>
+          <v-switch
+            v-model="tgForm.enabled"
+            :label="tgForm.enabled ? 'Включены' : 'Выключены'"
+            color="success"
+            inset
+            hide-details
+            density="compact"
+          />
+        </div>
       </div>
 
-      <v-btn-toggle
-        v-model="tgRouteMode"
-        mandatory
-        color="primary"
+      <v-select
+        v-model="tgForm.exit_route"
+        :items="tgExitRouteItems"
+        item-title="title"
+        item-value="value"
+        label="Выходной сервер для Telegram"
         variant="outlined"
-        density="compact"
+        density="comfortable"
+        prepend-inner-icon="mdi-routes"
         class="mb-3"
       >
-        <v-btn value="direct" prepend-icon="mdi-earth">Напрямую</v-btn>
-        <v-btn value="proxy" prepend-icon="mdi-transit-connection-variant">Через HTTP-прокси</v-btn>
-        <v-btn value="reverse_proxy" prepend-icon="mdi-server-network">Через свой Bot API URL</v-btn>
-      </v-btn-toggle>
-
-      <v-alert type="info" variant="tonal" density="compact" class="mb-4 text-caption">
-        {{ tgRouteHint }}
-      </v-alert>
+        <template #item="{ props: itemProps, item }">
+          <v-list-item v-bind="itemProps" :subtitle="item.raw.subtitle" />
+        </template>
+      </v-select>
 
       <v-row dense>
         <v-col cols="12" md="5">
@@ -438,29 +475,26 @@ onMounted(loadAll)
           />
         </v-col>
 
-        <v-col v-if="tgRouteMode === 'proxy'" cols="12">
-          <v-text-field
-            v-model="tgForm.proxy_url"
-            label="HTTP / HTTPS Proxy URL"
-            placeholder="http://user:password@78.17.180.196:3128"
-            hint="Поддерживаются http:// и https:// прокси (с авторизацией или без)"
-            persistent-hint
-            variant="outlined"
-            density="comfortable"
-          />
-        </v-col>
-
-        <v-col v-if="tgRouteMode === 'reverse_proxy'" cols="12">
-          <v-text-field
-            v-model="tgForm.api_base_url"
-            label="URL обратного прокси Telegram Bot API"
-            placeholder="https://tg-proxy.example.com"
-            hint="Панель будет обращаться к <URL>/bot<TOKEN>/sendMessage вместо https://api.telegram.org"
-            persistent-hint
-            variant="outlined"
-            density="comfortable"
-          />
-        </v-col>
+        <template v-if="tgForm.exit_route === 'custom'">
+          <v-col cols="12" md="6">
+            <v-text-field
+              v-model="tgForm.proxy_url"
+              label="HTTP / HTTPS Proxy URL (опционально)"
+              placeholder="http://user:password@host:3128"
+              variant="outlined"
+              density="comfortable"
+            />
+          </v-col>
+          <v-col cols="12" md="6">
+            <v-text-field
+              v-model="tgForm.api_base_url"
+              label="Свой Bot API URL (опционально)"
+              placeholder="https://tg-proxy.example.com"
+              variant="outlined"
+              density="comfortable"
+            />
+          </v-col>
+        </template>
       </v-row>
 
       <div class="d-flex align-center flex-wrap ga-2 mt-3">

@@ -24,13 +24,26 @@ pub struct AlertsAndSitesApi {
 }
 
 #[derive(Object, Debug, Clone)]
+pub struct TelegramExitOptionDto {
+    pub exit_host: String,
+    pub label: String,
+    pub region: String,
+    pub latency_ms: Option<f64>,
+    pub tunnel_ready: bool,
+}
+
+#[derive(Object, Debug, Clone)]
 pub struct TelegramAlertConfigDto {
     pub enabled: bool,
     pub has_bot_token: bool,
     pub chat_id: String,
     pub cooldown_minutes: i32,
+    /// "auto" | "direct" | "custom" | "<exit_ip_or_host>"
+    pub exit_route: String,
     pub proxy_url: String,
     pub api_base_url: String,
+    pub relay_online: bool,
+    pub available_exits: Vec<TelegramExitOptionDto>,
     pub updated_at: Option<String>,
 }
 
@@ -41,9 +54,11 @@ pub struct SaveTelegramAlertRequest {
     pub bot_token: Option<String>,
     pub chat_id: String,
     pub cooldown_minutes: Option<i32>,
-    /// HTTP/HTTPS прокси для доставки уведомлений (например http://user:pass@exit:3128)
+    /// "auto" | "direct" | "custom" | "<exit_ip_or_host>"
+    pub exit_route: Option<String>,
+    /// HTTP/HTTPS прокси (только для режима custom)
     pub proxy_url: Option<String>,
-    /// Альтернативный адрес Telegram Bot API (например reverse-proxy на зарубежном exit-сервере)
+    /// Альтернативный адрес Telegram Bot API (только для режима custom)
     pub api_base_url: Option<String>,
 }
 
@@ -258,14 +273,174 @@ pub async fn load_system_settings(db: &DatabaseConnection) -> system_settings::M
     }
 }
 
+fn telegram_relay_base_url() -> String {
+    std::env::var("ANET_TELEGRAM_RELAY_URL")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+}
+
+async fn fetch_relay_exits() -> (bool, HashSet<String>) {
+    let base = telegram_relay_base_url();
+    if base.is_empty() {
+        return (false, HashSet::new());
+    }
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(3)).build() {
+        Ok(c) => c,
+        Err(_) => return (false, HashSet::new()),
+    };
+    let resp = match client.get(format!("{}/health", base)).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return (false, HashSet::new()),
+    };
+    let val: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return (true, HashSet::new()),
+    };
+    let exits = val
+        .get("exits")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.trim().to_lowercase()))
+                .collect()
+        })
+        .unwrap_or_default();
+    (true, exits)
+}
+
+async fn collect_available_exits(db: &DatabaseConnection) -> (bool, Vec<TelegramExitOptionDto>) {
+    let (relay_online, relay_exits) = fetch_relay_exits().await;
+    let routes = ingress_routes::Entity::find().all(db).await.unwrap_or_default();
+    let srvs = servers::Entity::find().all(db).await.unwrap_or_default();
+
+    let mut region_by_host: HashMap<String, String> = HashMap::new();
+    let mut name_by_host: HashMap<String, String> = HashMap::new();
+    for s in &srvs {
+        let host = s.address.trim().to_lowercase();
+        if !s.region.trim().is_empty() {
+            region_by_host.entry(host.clone()).or_insert_with(|| s.region.clone());
+        }
+        name_by_host.entry(host).or_insert_with(|| s.name.clone());
+    }
+
+    let mut by_exit: HashMap<String, TelegramExitOptionDto> = HashMap::new();
+    for r in &routes {
+        let host = r.exit_host.trim().to_string();
+        if host.is_empty() {
+            continue;
+        }
+        let key = host.to_lowercase();
+        let ready = relay_exits.contains(&key);
+        let region = region_by_host.get(&key).cloned().unwrap_or_default();
+        let entry = by_exit.entry(key.clone()).or_insert_with(|| TelegramExitOptionDto {
+            exit_host: host.clone(),
+            label: format!("Выход · {}", host),
+            region,
+            latency_ms: r.last_latency_ms,
+            tunnel_ready: ready,
+        });
+        if let Some(ms) = r.last_latency_ms {
+            if entry.latency_ms.map_or(true, |cur| ms < cur) {
+                entry.latency_ms = Some(ms);
+            }
+        }
+    }
+    for host in &relay_exits {
+        by_exit.entry(host.clone()).or_insert_with(|| TelegramExitOptionDto {
+            exit_host: host.clone(),
+            label: name_by_host
+                .get(host)
+                .cloned()
+                .unwrap_or_else(|| format!("Выход · {}", host)),
+            region: region_by_host.get(host).cloned().unwrap_or_default(),
+            latency_ms: None,
+            tunnel_ready: true,
+        });
+    }
+
+    let mut list: Vec<TelegramExitOptionDto> = by_exit.into_values().collect();
+    list.sort_by(|a, b| {
+        b.tunnel_ready
+            .cmp(&a.tunnel_ready)
+            .then_with(|| {
+                a.latency_ms
+                    .unwrap_or(9_999.0)
+                    .partial_cmp(&b.latency_ms.unwrap_or(9_999.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.exit_host.cmp(&b.exit_host))
+    });
+    (relay_online, list)
+}
+
 async fn send_telegram_message(
     bot_token: &str,
     chat_id: &str,
     text: &str,
+    exit_route: &str,
     proxy_url: &str,
     api_base_url: &str,
-) -> anyhow::Result<()> {
-    let base = api_base_url.trim().trim_end_matches('/');
+) -> anyhow::Result<String> {
+    let route_clean = exit_route.trim();
+    let relay_base = telegram_relay_base_url();
+    let payload = serde_json::json!({
+        "chat_id": chat_id.trim(),
+        "text": text,
+        "disable_web_page_preview": true
+    });
+
+    // 1. Через встроенный зашифрованный туннель выбранного выходного сервера (или auto)
+    if !relay_base.is_empty()
+        && route_clean != "direct"
+        && route_clean != "custom"
+    {
+        let target = if route_clean.is_empty() { "auto" } else { route_clean };
+        let url = format!(
+            "{}/via/{}/bot{}/sendMessage",
+            relay_base,
+            target,
+            bot_token.trim()
+        );
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(18))
+            .build()?;
+        match client.post(&url).json(&payload).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let used_exit = resp
+                    .headers()
+                    .get("x-anet-exit-used")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or(target)
+                    .to_string();
+                if status.is_success() {
+                    return Ok(format!("через выходной сервер {}", used_exit));
+                }
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "Telegram через выход {} — HTTP {}: {}",
+                    used_exit,
+                    status,
+                    body.chars().take(300).collect::<String>()
+                );
+            }
+            Err(e) if target != "auto" => {
+                anyhow::bail!("Не удалось отправить через выходной сервер {}: {}", target, e);
+            }
+            Err(e) => {
+                warn!("Telegram relay auto failed ({}), falling back to direct", e);
+            }
+        }
+    }
+
+    // 2. Прямой маршрут или ручной прокси / Bot API URL
+    let base = if route_clean == "custom" {
+        api_base_url.trim().trim_end_matches('/')
+    } else {
+        ""
+    };
     let base_url = if base.is_empty() {
         "https://api.telegram.org"
     } else if base.starts_with("https://") || base.starts_with("http://") {
@@ -275,28 +450,30 @@ async fn send_telegram_message(
     };
     let url = format!("{}/bot{}/sendMessage", base_url, bot_token.trim());
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(14));
-    let proxy_clean = proxy_url.trim();
+    let proxy_clean = if route_clean == "custom" {
+        proxy_url.trim()
+    } else {
+        ""
+    };
     if !proxy_clean.is_empty() {
         let proxy = reqwest::Proxy::all(proxy_clean)
             .map_err(|e| anyhow::anyhow!("Некорректный proxy_url '{}': {}", proxy_clean, e))?;
         builder = builder.proxy(proxy);
     }
     let client = builder.build()?;
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({
-            "chat_id": chat_id.trim(),
-            "text": text,
-            "disable_web_page_preview": true
-        }))
-        .send()
-        .await?;
+    let resp = client.post(&url).json(&payload).send().await?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("Telegram API HTTP {}: {}", status, body.chars().take(300).collect::<String>());
     }
-    Ok(())
+    if !base.is_empty() {
+        Ok(format!("через {}", base))
+    } else if !proxy_clean.is_empty() {
+        Ok("через HTTP-прокси".to_string())
+    } else {
+        Ok("напрямую".to_string())
+    }
 }
 
 /// Фоновый мониторинг узлов и маршрутов с отправкой алертов в Telegram при падении и восстановлении
@@ -418,12 +595,13 @@ pub fn spawn_alert_monitor(db: DatabaseConnection) {
                                     &bot_token,
                                     &cfg.chat_id,
                                     msg,
+                                    &cfg.exit_route,
                                     &cfg.proxy_url,
                                     &cfg.api_base_url,
                                 )
                                 .await
                                 {
-                                    Ok(()) => {
+                                    Ok(_) => {
                                         last_notified.insert(key.clone(), now_inst);
                                     }
                                     Err(e) => warn!("Failed to send Telegram alert: {}", e),
@@ -445,6 +623,7 @@ pub fn spawn_alert_monitor(db: DatabaseConnection) {
                                     &bot_token,
                                     &cfg.chat_id,
                                     &msg,
+                                    &cfg.exit_route,
                                     &cfg.proxy_url,
                                     &cfg.api_base_url,
                                 )
@@ -477,14 +656,19 @@ impl AlertsAndSitesApi {
             .await
             .map_err(InternalServerError)?;
 
+        let (relay_online, available_exits) = collect_available_exits(&self.db).await;
+
         Ok(Json(match row {
             Some(m) => TelegramAlertConfigDto {
                 enabled: m.enabled,
                 has_bot_token: m.encrypted_bot_token.as_deref().is_some_and(|s| !s.is_empty()),
                 chat_id: m.chat_id,
                 cooldown_minutes: m.cooldown_minutes,
+                exit_route: if m.exit_route.trim().is_empty() { "auto".into() } else { m.exit_route },
                 proxy_url: m.proxy_url,
                 api_base_url: m.api_base_url,
+                relay_online,
+                available_exits,
                 updated_at: Some(m.updated_at.and_utc().to_rfc3339()),
             },
             None => TelegramAlertConfigDto {
@@ -492,14 +676,17 @@ impl AlertsAndSitesApi {
                 has_bot_token: false,
                 chat_id: String::new(),
                 cooldown_minutes: 15,
+                exit_route: "auto".into(),
                 proxy_url: String::new(),
                 api_base_url: String::new(),
+                relay_online,
+                available_exits,
                 updated_at: None,
             },
         }))
     }
 
-    /// Сохранить настройки Telegram-уведомлений (включая прокси / альтернативный API-маршрут).
+    /// Сохранить настройки Telegram-уведомлений (включая выбор выходного сервера).
     #[oai(path = "/alerts/telegram", method = "put")]
     async fn save_telegram_config(
         &self,
@@ -527,6 +714,18 @@ impl AlertsAndSitesApi {
 
         let cooldown = req.0.cooldown_minutes.unwrap_or(15).clamp(1, 1440);
         let chat_id = req.0.chat_id.trim().to_string();
+        let exit_route = req
+            .0
+            .exit_route
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|m| m.exit_route.clone())
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "auto".into())
+            });
         let proxy_url = req
             .0
             .proxy_url
@@ -554,6 +753,7 @@ impl AlertsAndSitesApi {
             encrypted_bot_token: Set(encrypted_token.clone()),
             chat_id: Set(chat_id.clone()),
             cooldown_minutes: Set(cooldown),
+            exit_route: Set(exit_route.clone()),
             proxy_url: Set(proxy_url.clone()),
             api_base_url: Set(api_base_url.clone()),
             updated_at: Set(now),
@@ -565,6 +765,7 @@ impl AlertsAndSitesApi {
                     telegram_alert_configs::Column::EncryptedBotToken,
                     telegram_alert_configs::Column::ChatId,
                     telegram_alert_configs::Column::CooldownMinutes,
+                    telegram_alert_configs::Column::ExitRoute,
                     telegram_alert_configs::Column::ProxyUrl,
                     telegram_alert_configs::Column::ApiBaseUrl,
                     telegram_alert_configs::Column::UpdatedAt,
@@ -575,13 +776,18 @@ impl AlertsAndSitesApi {
         .await
         .map_err(InternalServerError)?;
 
+        let (relay_online, available_exits) = collect_available_exits(&self.db).await;
+
         Ok(Json(TelegramAlertConfigDto {
             enabled: req.0.enabled,
             has_bot_token: encrypted_token.is_some(),
             chat_id,
             cooldown_minutes: cooldown,
+            exit_route,
             proxy_url,
             api_base_url,
+            relay_online,
+            available_exits,
             updated_at: Some(now.and_utc().to_rfc3339()),
         }))
     }
@@ -610,21 +816,20 @@ impl AlertsAndSitesApi {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| Error::from_string("Не указан Bot Token", StatusCode::BAD_REQUEST))?;
 
-        let route_note = if !cfg.api_base_url.trim().is_empty() {
-            format!(" (через {})", cfg.api_base_url.trim())
-        } else if !cfg.proxy_url.trim().is_empty() {
-            " (через HTTP-прокси)".to_string()
-        } else {
-            " (напрямую)".to_string()
-        };
-        let msg = format!(
-            "✅ ANet Easy: тестовое уведомление успешно доставлено{}. Мониторинг нод и шлюзов активен.",
-            route_note
-        );
-        match send_telegram_message(&token, &cfg.chat_id, &msg, &cfg.proxy_url, &cfg.api_base_url).await {
-            Ok(()) => Ok(Json(TelegramTestResponse {
+        let msg = "✅ ANet Easy: тестовое уведомление успешно доставлено. Мониторинг нод и шлюзов активен.";
+        match send_telegram_message(
+            &token,
+            &cfg.chat_id,
+            msg,
+            &cfg.exit_route,
+            &cfg.proxy_url,
+            &cfg.api_base_url,
+        )
+        .await
+        {
+            Ok(via) => Ok(Json(TelegramTestResponse {
                 ok: true,
-                message: format!("Сообщение отправлено в Telegram{}", route_note),
+                message: format!("Сообщение отправлено в Telegram ({})", via),
             })),
             Err(e) => Err(Error::from_string(e.to_string(), StatusCode::BAD_GATEWAY)),
         }

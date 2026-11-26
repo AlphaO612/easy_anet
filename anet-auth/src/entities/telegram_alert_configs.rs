@@ -12,6 +12,7 @@ pub struct Model {
     pub cooldown_minutes: i32,
     pub proxy_url: String,
     pub api_base_url: String,
+    pub exit_route: String,
     pub updated_at: DateTime,
 }
 
