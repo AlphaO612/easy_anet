@@ -6,6 +6,7 @@ import type { NodePool, ProtocolType, SaveNodePoolRequest } from '@/models/pool'
 import type { Server } from '@/models/server'
 import type { ImapMailbox } from '@/models/mailbox'
 import { useAppMessage } from '@/composables/useAppMessage'
+import { formatRegionBadge } from '@/utils/regions'
 
 const show = defineModel<boolean>()
 
@@ -41,9 +42,25 @@ const loadMailboxes = async () => {
 }
 
 const strategyOptions = [
-  { title: 'Weighted rendezvous', value: 'weighted' },
-  { title: 'Least connections', value: 'least_connections' },
+  { title: 'Latency (Мин. задержка / Пинг)', value: 'latency' },
+  { title: 'Speed (Макс. скорость / Мульти-выход)', value: 'speed' },
+  { title: 'Least connections (Мин. подключений)', value: 'least_connections' },
+  { title: 'Weighted rendezvous (По весам)', value: 'weighted' },
 ]
+
+function serverDefaultEndpoint(serverId: string, protocol: ProtocolType): string | null {
+  const s = serverById.value.get(serverId)
+  if (!s) return null
+  if (protocol === 'quic') return s.quic_port ? String(s.quic_port) : null
+  if (protocol === 'ssh') return s.ssh_port ? String(s.ssh_port) : null
+  if (protocol === 'vnc') return s.vnc_port ? String(s.vnc_port) : null
+  if (protocol === 'ws') return s.websocket_url || null
+  if (protocol === 'ahttp') return s.ahttp_url || null
+  if (protocol === 'wrtc') return s.wrtc_url || null
+  return null
+}
+
+const customPortOpen = ref<Record<number, boolean>>({})
 
 const protocolOptions: { title: string; value: ProtocolType }[] = [
   { title: 'QUIC', value: 'quic' },
@@ -119,9 +136,17 @@ watch(
 )
 
 const addNode = (serverId: string) => {
+  const srv = serverById.value.get(serverId)
+  let proto: ProtocolType = 'quic'
+  if (srv && !srv.quic_port) {
+    if (srv.websocket_url) proto = 'ws'
+    else if (srv.ahttp_url) proto = 'ahttp'
+    else if (srv.wrtc_url) proto = 'wrtc'
+    else if (srv.ssh_port) proto = 'ssh'
+  }
   form.value.members.push({
     server_id: serverId,
-    protocol: 'quic',
+    protocol: proto,
     port_or_url: '',
     wrtc_mode: 'media_video',
     weight: 1,
@@ -255,14 +280,38 @@ const close = () => {
                   />
                 </v-col>
                 <v-col cols="12" sm="5">
-                  <v-text-field
+                  <template v-if="member.protocol !== 'imap'">
+                    <div
+                      v-if="!member.port_or_url && !customPortOpen[index] && serverDefaultEndpoint(member.server_id, member.protocol)"
+                      class="d-flex align-center justify-space-between ga-2 px-2 py-1 rounded border"
+                    >
+                      <span class="text-caption text-medium-emphasis text-truncate">
+                        Порт сервера:
+                        <strong class="text-primary">{{ serverDefaultEndpoint(member.server_id, member.protocol) }}</strong>
+                        (авто)
+                      </span>
+                      <v-btn
+                        size="x-small"
+                        variant="text"
+                        @click="customPortOpen[index] = true"
+                      >
+                        Свой
+                      </v-btn>
+                    </div>
+                    <v-text-field
+                      v-else
                       v-model="member.port_or_url"
-                      label="Порт или URL"
-                      :placeholder="member.protocol === 'ahttp' || member.protocol === 'ws' || member.protocol === 'wrtc' ? 'URL (напр. cdn / room / tunnel)' : 'Порт (напр. 443)'"
+                      label="Порт / URL (необязательно)"
+                      :placeholder="serverDefaultEndpoint(member.server_id, member.protocol)
+                        ? `Авто с сервера: ${serverDefaultEndpoint(member.server_id, member.protocol)}`
+                        : (member.protocol === 'ahttp' || member.protocol === 'ws' || member.protocol === 'wrtc' ? 'URL (напр. wss://...)' : 'Порт (напр. 48001)')"
                       density="compact"
                       variant="outlined"
                       hide-details
-                  />
+                      clearable
+                    />
+                  </template>
+                  <span v-else class="text-caption text-medium-emphasis">Ящики выбираются ниже</span>
                 </v-col>
                 <v-col cols="12" sm="3">
                   <v-text-field
@@ -312,7 +361,10 @@ const close = () => {
           <v-select
               v-if="props.servers.length"
               :model-value="null"
-              :items="props.servers.map(server => ({ title: `${server.name} (${server.address})`, value: server.id }))"
+              :items="props.servers.map(server => ({
+                title: `${server.region ? formatRegionBadge(server.region) + ' ' : ''}${server.name} (${server.address}${server.quic_port ? ':' + server.quic_port : ''})`,
+                value: server.id,
+              }))"
               item-title="title"
               item-value="value"
               label="Добавить сервер в группу"
